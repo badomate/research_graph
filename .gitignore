@@ -21,6 +21,5 @@ tmp/
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-Thumbs.db
+# PyVis generated assets (written alongside HTML output at runtime)
+orchestrator/lib/
