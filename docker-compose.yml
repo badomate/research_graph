@@ -1,0 +1,85 @@
+version: "3.9"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# paper_pipeline — Docker Compose orchestration
+#
+# Services
+# --------
+#   orchestrator  Main Python scheduler (APScheduler).  Runs all five modules.
+#   marker-api    Local Marker OCR container (PDF → Markdown + LaTeX).
+#   graph-server  Lightweight FastAPI server that serves the dependency graph.
+#
+# Volumes
+# -------
+#   tmp_storage   Ephemeral scratch space for downloaded PDFs / Markdown files.
+#                 Both orchestrator and marker-api mount it so the PDF can be
+#                 written by the orchestrator and read by marker-api.
+#   graph_static  Persistent volume shared between orchestrator (writer) and
+#                 graph-server (reader) for the generated HTML graph.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── 1. Main orchestrator ──────────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: orchestrator
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Make internal URLs available inside the container
+      MARKER_API_URL: "http://marker-api:8080"
+    volumes:
+      # Scratch space — purged per-job inside the code
+      - tmp_storage:/tmp/pipeline
+      # Shared graph output
+      - graph_static:/app/static
+    depends_on:
+      - marker-api
+    networks:
+      - pipeline_net
+
+  # ── 2. Marker OCR API ─────────────────────────────────────────────────────
+  marker-api:
+    # Official datalab-to/marker image exposes a REST API on port 8080
+    image: ghcr.io/datalab-to/marker:latest
+    container_name: marker-api
+    restart: unless-stopped
+    volumes:
+      - tmp_storage:/tmp/pipeline
+    ports:
+      # Expose for local debugging; internal traffic uses Docker network
+      - "8080:8080"
+    networks:
+      - pipeline_net
+
+  # ── 3. Dependency graph server ────────────────────────────────────────────
+  graph-server:
+    build:
+      context: ./graph-server
+      dockerfile: Dockerfile
+    container_name: graph-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - graph_static:/app/static
+    ports:
+      - "${GRAPH_SERVER_PORT:-8000}:8000"
+    networks:
+      - pipeline_net
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  tmp_storage:
+    driver: local
+  graph_static:
+    driver: local
+
+# ── Internal network ──────────────────────────────────────────────────────────
+networks:
+  pipeline_net:
+    driver: bridge
