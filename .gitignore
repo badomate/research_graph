@@ -1,0 +1,25 @@
+# Environment secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Docker volumes / temp artefacts
+tmp/
+*.pdf
+*.md.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# PyVis generated assets (written alongside HTML output at runtime)
+orchestrator/lib/
