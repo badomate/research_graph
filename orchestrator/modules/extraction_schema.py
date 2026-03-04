@@ -26,9 +26,6 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-# ── Version string ─────────────────────────────────────────────────────────────
-EXTRACTION_VERSION: str = "v3"
-
 # ── Allowed concept types ─────────────────────────────────────────────────────
 ALLOWED_CONCEPT_TYPES: frozenset[str] = frozenset(
     {
@@ -121,28 +118,12 @@ class MathObject(BaseModel):
         le=1.0,
         description="Extraction confidence score in [0, 1].",
     )
-    suggested_hub: str = Field(
-        default="Uncategorized",
-        description="Hub name from ALLOWED_HUBS.",
-    )
-    canonical_keywords: list[str] = Field(
-        default_factory=list,
-        description="5–15 canonical keywords describing what this concept IS.",
-    )
-    prereq_keywords: list[str] = Field(
-        default_factory=list,
-        description="5–15 keywords for concepts this result REQUIRES / builds on.",
-    )
-    downstream_keywords: list[str] = Field(
-        default_factory=list,
-        description="5–15 keywords for concepts this result ENABLES or supports.",
-    )
 
     # ── Extended fields (v3) ───────────────────────────────────────────────────
 
     suggested_hub: str = Field(
-        default="",
-        description="Suggested knowledge hub from ALLOWED_HUBS.",
+        default="Uncategorized",
+        description="Suggested knowledge hub from ALLOWED_HUBS (one of ALLOWED_HUBS + 'Uncategorized').",
     )
     interpretation: str = Field(
         default="",
@@ -172,15 +153,15 @@ class MathObject(BaseModel):
     )
     canonical_keywords: list[str] = Field(
         default_factory=list,
-        description="Primary keywords identifying this concept.",
+        description="5-15 canonical keywords: what this concept IS.",
     )
     prereq_keywords: list[str] = Field(
         default_factory=list,
-        description="Keywords of prerequisite concepts this object builds on.",
+        description="5-15 keywords for concepts this result REQUIRES / builds on.",
     )
     downstream_keywords: list[str] = Field(
         default_factory=list,
-        description="Keywords of concepts this object enables or is used by.",
+        description="5-15 keywords for concepts this result ENABLES or supports.",
     )
     aliases: str = Field(
         default="",

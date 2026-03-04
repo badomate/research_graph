@@ -80,11 +80,13 @@ cp .env.example .env
 | `NOTION_KNOWLEDGE_INBOX_DB_ID` | 32-char hex database ID |
 | `NOTION_SECOND_BRAIN_DB_ID` | 32-char hex database ID |
 | `NOTION_PROJECTS_DB_ID` | 32-char hex database ID |
-| `NOTION_EDGES_DB_ID` | 32-char hex database ID for Edges DB (optional — required for PromotionEngine) |
+| `NOTION_EDGES_DB_ID` | 32-char hex database ID for Edges DB (required — schema in Notion setup) |
 | `OPENAI_API_KEY` | OpenAI API key (`sk-…`) |
 | `KOOFR_USER` | Koofr account email |
 | `KOOFR_APP_PASSWORD` | Koofr WebDAV app password |
 | `KOOFR_PDF_PATH` | Base path in Koofr where zips live (e.g. `/zotero`) |
+| `ZOTERO_USER_ID` | Zotero user ID (numeric) — used to resolve attachment keys via Zotero API |
+| `ZOTERO_API_KEY` | Zotero API key — used to fetch item children for PDF attachment resolution |
 | `ARXIV_KEYWORDS` | Comma-separated keywords for ArXiv Sniper |
 | `ARXIV_RELEVANCE_THRESHOLD` | Min relevance score (1–10) to auto-add ArXiv papers |
 | `MARKER_API_URL` | Internal URL of the marker-api container |
@@ -93,6 +95,7 @@ cp .env.example .env
 | `PIPELINE_DB_PATH` | Path to SQLite job ledger (default `/tmp/pipeline/ingestion_jobs.db`) |
 | `EXTRACTION_VERSION` | Schema version string used for idempotency (default `v3`) |
 | `SB_CONCEPT_LEVEL` | `Note Level` select value used to query Second Brain Concept pages (default `Concept`) |
+| `RETRIEVE_CANDIDATES_K` | Max Second Brain candidates fed to Stage 3 linking LLM (default `30`) |
 
 ### Required Notion Properties
 
@@ -100,8 +103,9 @@ cp .env.example .env
 
 | Property | Type | Notes |
 |----------|------|-------|
-| `Status` | Select | Values: `s0-inbox`, `s1-process-math`, `s1b-waiting-attachment`, `blocked-tags`, `s2-extracted`, `s2b-linked-ai`, `s3-verified` |
-| `Zotero URI` | Rich Text | e.g. `zotero://select/items/XXXXXXXX` |
+| `Status` | **Status** (not Select) | Values: `s0-inbox`, `s1-process-math`, `s1b-waiting-attachment`, `blocked-tags`, `s2-extracted`, `s2b-linked-ai`, `s3-verified` |
+| `Zotero URI` | URL or Rich Text | e.g. `https://www.zotero.org/users/…/items/XXXXXXXX` — parent item key parsed from this |
+| `Zotero Attachment Key` | Rich Text | Written by pipeline after resolving PDF attachment via Zotero API |
 | `Tags` | Multi-select | Must match entries in `tags_registry.yaml` |
 | `primary_pdf_filename` | Rich Text | Optional — filename to prefer when zip contains multiple PDFs |
 | `PDF SHA256` | Rich Text | Written by pipeline after PDF download |
@@ -123,7 +127,7 @@ cp .env.example .env
 | `Type` | Select | Values: `Definition`, `Theorem`, `Lemma`, `Algorithm`, `Assumption`, `Proof` |
 | `Status` | Select | Values: `Inbox`, `Reviewed`, `Promoted`, `Dropped` |
 | `verification_status` | Select | Values: `unverified`, `verified`, `needs-fix` |
-| `graph_link_status` | Select | Values: `needs-review`, `verified-links` — set during LINK stage |
+| `graph_link_status` | Select | Values: `unlinked` (no edges), `linked-ai` (edges written by Stage 3), `promoted` (promoted to Second Brain) |
 | `Source Paper` | Relation → Paper Tracker | Back-link to the source paper |
 | `Source Pages` | Rich Text | Comma-separated page numbers |
 | `Suggested Hub` | Select | Suggested knowledge hub from ALLOWED_HUBS (replaces `Hub Suggestions`) |
@@ -230,7 +234,7 @@ After the pipeline sets a paper to `s2b-linked-ai`, the human workflow is:
 2. For correct concepts: set `verification_status = verified`.
 3. For concepts needing fixes: set `verification_status = needs-fix` and edit.
 4. The **Promotion Engine** runs every 30 minutes and picks up any page where
-   `verification_status = verified` AND `graph_link_status = needs-review`.
+   `verification_status = verified` AND `graph_link_status = linked-ai`.
 
 ### What the Promotion Engine does
 
@@ -240,10 +244,10 @@ For each verified concept:
    `Promotion Target` is already set) — transferring `Interpretation`,
    `Proof Idea`, `Named Tools`, `Aliases`, and `Sources`.
 2. **Creates Edges DB rows** for each entry in the `Edge Suggestions` JSON
-   property, linking `From Concept` → `To Concept` with the recorded
-   `Relation Type`, `Rationale`, and `Confidence`.
+   property — the JSON contains `{"depends_on": ["Title A", …], …}` pairs;
+   target concepts are resolved from the Second Brain by title.
 3. **Updates the Knowledge Inbox page**:
-   `graph_link_status → verified-links`, `Status → Promoted`.
+   `graph_link_status → promoted`.
 
 ### Edges DB
 
@@ -388,7 +392,7 @@ Paper Markdown
 - **Suggestions only:** All `edge_suggestions` are stored as JSON text on the
   Knowledge Inbox page. No live relations are written to the Second Brain.
 - **`graph_link_status`** tracks where each concept sits: `unlinked` → `linked-ai`
-  → `needs-review` (human promotion).
+  → `promoted` (after PromotionEngine runs).
 
 ### Tuning Stage 2 retrieval depth
 
@@ -434,11 +438,16 @@ results in a clean restart from the last completed checkpoint.
 
 ### Missing zip (`s1b-waiting-attachment`)
 
-The pipeline looks for `{ZoteroKey}.zip` at `KOOFR_PDF_PATH/{ZoteroKey}.zip`.
+The pipeline look for `{attachment_key}.zip` at `KOOFR_PDF_PATH/{attachment_key}.zip`.
+The **attachment key** (PDF child item in Zotero) is resolved from the parent key in
+`Zotero URI` via the Zotero API.
 
-1. Check that Zotero exported the attachment and the Koofr sync is up to date.
-2. Verify `Zotero URI` in Notion contains a valid 8-char alphanumeric key.
-3. Once the zip appears on Koofr, reset the paper status to `s1-process-math`.
+1. Check that Zotero exported the attachment (`ZOTERO_USER_ID` / `ZOTERO_API_KEY` correct).
+2. Check the Koofr sync is up to date and the zip has been uploaded.
+3. Verify `Zotero URI` in Notion is a valid URL containing the parent key (8 uppercase alphanumerics).
+4. Once the attachment appears on Koofr, reset the paper status to `s1-process-math`.
+
+The resolved attachment key is written to `Zotero Attachment Key` in Notion for inspection.
 
 ### Multiple PDFs in zip
 

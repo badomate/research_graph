@@ -46,6 +46,7 @@ def _import_modules():
     from modules.conflict_detector import ConflictDetector
     from modules.latex_compiler import LaTeXCompiler
     from modules.dependency_grapher import DependencyGrapher
+    from modules.promotion import PromotionEngine
 
     return (
         IngestionEngine,
@@ -53,6 +54,7 @@ def _import_modules():
         ConflictDetector,
         LaTeXCompiler,
         DependencyGrapher,
+        PromotionEngine,
     )
 
 
@@ -95,10 +97,13 @@ REQUIRED_ENV_VARS = [
     "NOTION_PAPER_TRACKER_DB_ID",
     "NOTION_KNOWLEDGE_INBOX_DB_ID",
     "NOTION_SECOND_BRAIN_DB_ID",
+    "NOTION_EDGES_DB_ID",
     "NOTION_PROJECTS_DB_ID",
     "OPENAI_API_KEY",
     "KOOFR_USER",
     "KOOFR_APP_PASSWORD",
+    "ZOTERO_USER_ID",
+    "ZOTERO_API_KEY",
 ]
 
 

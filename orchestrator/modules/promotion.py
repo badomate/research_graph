@@ -61,6 +61,8 @@ class PromotionEngine:
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
         self.edges_db: str = os.environ.get("NOTION_EDGES_DB_ID", "")
+        # Populated once per run() to support O(1) title lookup.
+        self._sb_title_cache: dict[str, str] = {}
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -84,12 +86,22 @@ class PromotionEngine:
                     },
                     {
                         "property": "graph_link_status",
-                        "select": {"equals": "needs-review"},
+                        "select": {"equals": "linked-ai"},
                     },
                 ]
             },
         )
         logger.info("PromotionEngine: found %d item(s) to promote.", len(items))
+
+        if not items:
+            return
+
+        # Build Second Brain title index for edge target resolution.
+        self._sb_title_cache = self._build_sb_title_cache()
+        logger.info(
+            "PromotionEngine: Second Brain cache has %d concept(s).",
+            len(self._sb_title_cache),
+        )
 
         for item in items:
             try:
@@ -110,13 +122,27 @@ class PromotionEngine:
         source_paper_ids = self._get_relation(props, "Source Paper")
         edge_suggestions_raw = self._get_text(props, "Edge Suggestions")
 
-        # Parse edge suggestions JSON (written by ingestion LINK stage).
-        edge_suggestions: list[dict] = []
+        # Parse edge suggestions JSON (written by Stage 3 of IngestionEngine).
+        # New format: {"depends_on": ["Title A", ...], "enables": [...], ...}
+        # Legacy flat-list format also accepted for backward compatibility.
+        edges: list[tuple[str, str]] = []  # (relation_type, target_title)
         if edge_suggestions_raw:
             try:
                 parsed = json.loads(edge_suggestions_raw)
-                if isinstance(parsed, list):
-                    edge_suggestions = parsed
+                if isinstance(parsed, dict):
+                    for rel_type, targets in parsed.items():
+                        if not isinstance(targets, list):
+                            continue
+                        for target_title in targets:
+                            if isinstance(target_title, str) and target_title.strip():
+                                edges.append((rel_type, target_title.strip()))
+                elif isinstance(parsed, list):
+                    # Legacy flat-list fallback.
+                    for edge in parsed:
+                        rt = edge.get("relation_type", "related")
+                        tn = edge.get("target_name", "")
+                        if tn:
+                            edges.append((rt, tn))
             except json.JSONDecodeError:
                 logger.warning(
                     "PromotionEngine: invalid Edge Suggestions JSON on page %s",
@@ -153,19 +179,30 @@ class PromotionEngine:
                 title,
             )
 
-        # Step 2: Create Edges DB rows from edge suggestions.
+        # Step 2: Create Edges DB rows using title-based target resolution.
         edges_created = 0
-        for edge in edge_suggestions:
-            target_id = edge.get("target_concept_id", "")
+        for rel_type, target_title in edges:
+            target_id = self._sb_title_cache.get(target_title)
             if not target_id:
+                logger.debug(
+                    "PromotionEngine: target '%s' not in Second Brain -- skipping edge.",
+                    target_title,
+                )
                 continue
             try:
-                self._create_edge(sb_page_id, edge, source_paper_ids)
+                self._create_edge(
+                    from_sb_id=sb_page_id,
+                    to_sb_id=target_id,
+                    relation_type=rel_type,
+                    rationale=f"{rel_type}: {target_title}",
+                    source_paper_ids=source_paper_ids,
+                )
                 edges_created += 1
             except Exception:
                 logger.exception(
-                    "PromotionEngine: failed to create edge %s → %s",
+                    "PromotionEngine: failed to create edge %s -[%s]-> %s",
                     sb_page_id,
+                    rel_type,
                     target_id,
                 )
         logger.info(
@@ -176,12 +213,27 @@ class PromotionEngine:
         self.notion.update_page(
             page_id=ki_page_id,
             properties={
-                "graph_link_status": self.notion.select_prop("verified-links"),
-                "Status": self.notion.select_prop("Promoted"),
+                "graph_link_status": self.notion.select_prop("promoted"),
             },
         )
 
     # ── Second Brain helpers ──────────────────────────────────────────────────
+
+    def _build_sb_title_cache(self) -> dict[str, str]:
+        """Return a dict of Second Brain concept title -> page_id."""
+        pages = self.notion.query_database(
+            self.second_brain_db,
+            filter={
+                "property": "Note Level",
+                "select": {"equals": _SB_CONCEPT_LEVEL},
+            },
+        )
+        cache: dict[str, str] = {}
+        for page in pages:
+            t = self._get_page_title(page)
+            if t:
+                cache[t] = page["id"]
+        return cache
 
     def _create_sb_concept(self, ki_item: dict) -> str | None:
         """
@@ -280,24 +332,13 @@ class PromotionEngine:
     def _create_edge(
         self,
         from_sb_id: str,
-        edge: dict,
+        to_sb_id: str,
+        relation_type: str,
+        rationale: str,
         source_paper_ids: list[str],
     ) -> None:
-        """Create a single row in the Edges DB for one edge suggestion."""
-        target_id: str = edge.get("target_concept_id", "")
-        relation_type: str = edge.get("relation_type", "related")
-        rationale: str = edge.get("rationale", "")
-        confidence: float = float(edge.get("confidence", 0.0))
-        target_name: str = edge.get("target_name", "?")
-
-        # Resolve from-concept name for a human-readable edge title.
-        try:
-            from_page = self.notion.get_page(from_sb_id)
-            from_name = self._get_page_title(from_page)
-        except Exception:
-            from_name = "?"
-
-        edge_title = f"{from_name} —{relation_type}→ {target_name}"
+        """Create a single row in the Edges DB."""
+        edge_title = f"{relation_type}: {to_sb_id[:8]}"
 
         edge_properties: dict[str, Any] = {
             "Name": {
@@ -306,11 +347,10 @@ class PromotionEngine:
                 ]
             },
             "From Concept": self.notion.relation_prop([from_sb_id]),
-            "To Concept": self.notion.relation_prop([target_id]),
+            "To Concept": self.notion.relation_prop([to_sb_id]),
             "Relation Type": self.notion.select_prop(relation_type),
             "Created By": self.notion.select_prop("AI-suggested"),
             "Status": self.notion.select_prop("suggested"),
-            "Confidence": {"number": confidence},
         }
 
         if rationale:
