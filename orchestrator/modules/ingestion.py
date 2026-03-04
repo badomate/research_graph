@@ -95,7 +95,7 @@ OPENAI_MODEL = "gpt-5.2"
 
 # -- Notion hard limits ---------------------------------------------------------
 NOTION_BLOCK_MAX_CHARS = 1900
-NOTION_BLOCKS_PER_REQUEST = 100
+NOTION_BLOCKS_PER_REQUEST = 100000
 
 # -- Stage 2 candidate retrieval limit -----------------------------------------
 RETRIEVE_CANDIDATES_K: int = int(os.environ.get("RETRIEVE_CANDIDATES_K", "30"))
@@ -1121,7 +1121,7 @@ class IngestionEngine:
             properties=properties,
         )
         new_page_id: str = new_page["id"]
-        logger.debug(
+        logger.info(
             "Created Knowledge Inbox page %s for concept '%s'.", new_page_id, title
         )
 

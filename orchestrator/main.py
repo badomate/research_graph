@@ -27,6 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
+
 # Load .env file if present (useful for local development outside Docker)
 load_dotenv()
 
@@ -121,9 +122,8 @@ def _check_env() -> None:
 
 def main() -> None:
     _check_env()
-
+    
     scheduler = BlockingScheduler(timezone="UTC")
-
     # ── Module 1: Ingestion Engine — every 5 minutes ─────────────────────────
     scheduler.add_job(
         run_ingestion,
@@ -196,6 +196,7 @@ def main() -> None:
 
     try:
         scheduler.start()
+
     except (KeyboardInterrupt, SystemExit):
         logger.info("Orchestrator shutting down.")
 

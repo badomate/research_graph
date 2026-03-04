@@ -121,6 +121,9 @@ class NotionClientWrapper:
         return self._call(self._client.pages.retrieve, page_id=page_id)
 
     def create_page(self, parent: dict, properties: dict, **kwargs: Any) -> dict:
+        logger.info("CREATE_PAGE payload properties keys: %s", list(properties.keys()))
+        logger.info("CREATE_PAGE full properties: %s", properties)
+    
         return self._call(
             self._client.pages.create,
             parent=parent,
