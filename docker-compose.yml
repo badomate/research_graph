@@ -6,7 +6,7 @@ version: "3.9"
 # Services
 # --------
 #   orchestrator  Main Python scheduler (APScheduler).  Runs all five modules.
-#   marker-api    Local Marker OCR container (PDF → Markdown + LaTeX).
+#   marker-api    Proxy that forwards PDF conversion to the Datalab Marker API.
 #   graph-server  Lightweight FastAPI server that serves the dependency graph.
 #
 # Volumes
@@ -16,9 +16,6 @@ version: "3.9"
 #                   written by the orchestrator and read by marker-api.
 #   graph_static    Persistent volume shared between orchestrator (writer) and
 #                   graph-server (reader) for the generated HTML graph.
-#   marker_models   Persistent cache for HuggingFace / surya / texify model
-#                   weights downloaded by marker-pdf on first startup.
-#                   Survives image rebuilds — models are never re-downloaded.
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -51,35 +48,32 @@ services:
 
   # ── 2. Marker OCR API ─────────────────────────────────────────────────────
   marker-api:
-    # Built locally from marker-pdf (PyPI) — no registry auth required.
+    # Lightweight FastAPI proxy — forwards PDF conversion to the Datalab
+    # Marker API (https://www.datalab.to) and returns the markdown.
     # POST /marker  {"filepath": "<path on the shared tmp_storage volume>"}
     build:
       context: ./marker-api
       dockerfile: Dockerfile
     container_name: marker-api
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      TORCH_DEVICE: "cpu"          # change to "cuda" if you have a GPU
-      # Point all HuggingFace / surya / texify / PyTorch-hub downloads at the
-      # named volume so model weights survive container rebuilds.
-      HF_HOME: "/model_cache"
-      TORCH_HOME: "/model_cache/torch"
-      XDG_CACHE_HOME: "/model_cache/xdg"
+      # Datalab API key — set DATALAB_API_KEY in .env
+      DATALAB_API_KEY: "${DATALAB_API_KEY}"
+      # Conversion mode: fast | balanced | accurate  (default: balanced)
+      MARKER_MODE: "${MARKER_MODE:-balanced}"
     volumes:
       - tmp_storage:/tmp/pipeline
-      - marker_models:/model_cache
     ports:
       # Expose for local debugging; internal traffic uses Docker network
       - "8080:8080"
     healthcheck:
-      # marker_server exposes a root GET endpoint; use it as a liveness probe.
-      # start_period is generous because on first run the container must
-      # download all surya / HuggingFace model weights before binding.
       test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
-      interval: 20s
-      timeout: 10s
-      retries: 6
-      start_period: 180s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     networks:
       - pipeline_net
 
@@ -104,8 +98,6 @@ volumes:
   tmp_storage:
     driver: local
   graph_static:
-    driver: local
-  marker_models:
     driver: local
 
 # ── Internal network ──────────────────────────────────────────────────────────
