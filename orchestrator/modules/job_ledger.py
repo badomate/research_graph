@@ -31,8 +31,20 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DB_PATH = "/tmp/pipeline/ingestion_jobs.db"
 
 # Valid status values — enforce at the Python layer; SQLite has no enum.
+# Pipeline flow: started → marker_done → extract_done → retrieve_done
+#                        → link_done → notion_done
+# openai_done retained for backward compatibility with v2 ledger rows.
 VALID_STATUSES: frozenset[str] = frozenset(
-    {"started", "marker_done", "openai_done", "notion_done", "failed"}
+    {
+        "started",
+        "marker_done",
+        "openai_done",      # v2 legacy; kept for backward compat
+        "extract_done",     # v3: Stage 1 LLM extraction complete
+        "retrieve_done",    # v3: Stage 2 candidate retrieval complete
+        "link_done",        # v3: Stage 3 LLM linking complete
+        "notion_done",
+        "failed",
+    }
 )
 
 _lock = threading.Lock()

@@ -2,10 +2,20 @@
 modules/extraction_schema.py — Pydantic models for OpenAI extraction output
 ────────────────────────────────────────────────────────────────────────────
 Defines the canonical schema that the OpenAI extraction prompt must produce,
-plus validation helpers used by the ingestion engine.
+plus link-stage models and validation helpers.
 
 EXTRACTION_VERSION should be bumped whenever the prompt or schema changes
 so that the job ledger can detect stale extractions and re-run them.
+
+Changelog:
+  v1 — original schema: type, name, content, assumptions, suggested_hub
+  v2 — hardened schema: type, title, statement_latex, assumptions, variables,
+        conclusion, source_pages, source_quotes, confidence; hub_suggestions
+        stored as text only; verification_status added to Knowledge Inbox.
+  v3 — 3-stage pipeline: canonical_keywords, prereq_keywords,
+        downstream_keywords added to MathObject; LinkEdge / ConceptLinkResult /
+        validate_link_result added for Stage 3 graph-linking;
+        ProofTechnique type added.
 """
 
 from __future__ import annotations
@@ -16,33 +26,57 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── Version string ─────────────────────────────────────────────────────────────
-# Bump this whenever the extraction schema or system prompt changes.
-# Changelog:
-#   v1 — original schema: type, name, content, assumptions, suggested_hub
-#   v2 — hardened schema: type, title, statement_latex, assumptions, variables,
-#         conclusion, source_pages, source_quotes, confidence; hub_suggestions
-#         stored as text only; verification_status added to Knowledge Inbox.
-EXTRACTION_VERSION: str = "v2"
+EXTRACTION_VERSION: str = "v3"
+
+# ── Allowed concept types ─────────────────────────────────────────────────────
+ALLOWED_CONCEPT_TYPES: frozenset[str] = frozenset(
+    {
+        "Definition",
+        "Theorem",
+        "Lemma",
+        "Algorithm",
+        "Assumption",
+        "Proof",
+        "ProofTechnique",
+    }
+)
+
+# ── Allowed edge relation types ────────────────────────────────────────────────
+ALLOWED_EDGE_TYPES: frozenset[str] = frozenset(
+    {"depends_on", "enables", "generalizes", "special_case_of", "related"}
+)
+
+# ── Edge caps per concept ──────────────────────────────────────────────────────
+EDGE_CAPS: dict[str, int] = {
+    "depends_on": 3,
+    "enables": 3,
+    "generalizes": 2,
+    "special_case_of": 2,
+    "related": 5,
+}
 
 
-# ── Sub-models ─────────────────────────────────────────────────────────────────
+# ── Stage 1 sub-models ─────────────────────────────────────────────────────────
 
 
 class MathObject(BaseModel):
     """
-    A single extracted mathematical concept from a paper.
+    A single extracted mathematical concept from a paper (Stage 1 output).
 
-    Fields mirror the OpenAI system prompt schema so that JSON deserialization
+    Fields mirror the OpenAI system prompt schema so that JSON deserialisation
     is a direct, lossless mapping.
     """
 
     type: str = Field(
         ...,
-        description="One of: Definition, Theorem, Lemma, Algorithm, Assumption, Proof",
+        description=(
+            "One of: Definition, Theorem, Lemma, Algorithm, "
+            "Assumption, Proof, ProofTechnique"
+        ),
     )
     title: str = Field(
         ...,
-        description="Short label for the concept (name / theorem number).",
+        description="Descriptive canonical concept name (never 'Theorem 1').",
     )
     statement_latex: str = Field(
         ...,
@@ -75,21 +109,29 @@ class MathObject(BaseModel):
         le=1.0,
         description="Extraction confidence score in [0, 1].",
     )
+    suggested_hub: str = Field(
+        default="Uncategorized",
+        description="Hub name from ALLOWED_HUBS.",
+    )
+    canonical_keywords: list[str] = Field(
+        default_factory=list,
+        description="5–15 canonical keywords describing what this concept IS.",
+    )
+    prereq_keywords: list[str] = Field(
+        default_factory=list,
+        description="5–15 keywords for concepts this result REQUIRES / builds on.",
+    )
+    downstream_keywords: list[str] = Field(
+        default_factory=list,
+        description="5–15 keywords for concepts this result ENABLES or supports.",
+    )
 
     @field_validator("type")
     @classmethod
     def validate_type(cls, v: str) -> str:
-        allowed = {
-            "Definition",
-            "Theorem",
-            "Lemma",
-            "Algorithm",
-            "Assumption",
-            "Proof",
-        }
-        if v not in allowed:
+        if v not in ALLOWED_CONCEPT_TYPES:
             raise ValueError(
-                f"type must be one of {sorted(allowed)}, got '{v}'"
+                f"type must be one of {sorted(ALLOWED_CONCEPT_TYPES)}, got {v!r}"
             )
         return v
 
@@ -98,17 +140,15 @@ class MathObject(BaseModel):
     def validate_quote_length(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        word_count = len(v.split())
-        if word_count > 25:
+        words = v.split()
+        if len(words) > 25:
             # Truncate rather than reject — model may overshoot by one word
-            return " ".join(v.split()[:25])
+            return " ".join(words[:25])
         return v
 
 
 class ExtractionResult(BaseModel):
-    """
-    Top-level extraction result returned by the OpenAI extraction call.
-    """
+    """Top-level extraction result returned by Stage 1 (OpenAI extraction call)."""
 
     one_liner: str = Field(
         ...,
@@ -254,3 +294,85 @@ def latex_sanity_check(latex: str) -> list[str]:
         issues.append(f"\\begin{{{env}}} has no matching \\end{{{env}}}.")
 
     return issues
+
+
+# ── Stage 3 sub-models ─────────────────────────────────────────────────────────
+
+
+class LinkEdge(BaseModel):
+    """A single directed edge in the concept graph."""
+
+    target_concept_id: str = Field(
+        ...,
+        description="Notion page ID of the target concept in Second Brain.",
+    )
+    target_title: str = Field(
+        ...,
+        description="Human-readable title of the target concept.",
+    )
+    rationale: str = Field(
+        ...,
+        description="One-sentence explanation of why this edge exists.",
+    )
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class ConceptLinkResult(BaseModel):
+    """
+    Graph edges for a single extracted concept (Stage 3 output).
+
+    Each edge list is capped to EDGE_CAPS at validation time.
+    """
+
+    depends_on: list[LinkEdge] = Field(default_factory=list)
+    enables: list[LinkEdge] = Field(default_factory=list)
+    generalizes: list[LinkEdge] = Field(default_factory=list)
+    special_case_of: list[LinkEdge] = Field(default_factory=list)
+    related: list[LinkEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def enforce_caps(self) -> "ConceptLinkResult":
+        """Silently trim any edge list that exceeds its cap."""
+        self.depends_on = self.depends_on[: EDGE_CAPS["depends_on"]]
+        self.enables = self.enables[: EDGE_CAPS["enables"]]
+        self.generalizes = self.generalizes[: EDGE_CAPS["generalizes"]]
+        self.special_case_of = self.special_case_of[: EDGE_CAPS["special_case_of"]]
+        self.related = self.related[: EDGE_CAPS["related"]]
+        return self
+
+
+# ── Stage 3 validation helpers ─────────────────────────────────────────────────
+
+
+def validate_link_result(raw: dict) -> tuple["ConceptLinkResult", list[str]]:
+    """
+    Attempt to parse *raw* into a :class:`ConceptLinkResult`.
+
+    Returns
+    -------
+    (result, errors)
+        On failure returns an empty ConceptLinkResult so the pipeline can
+        continue in degraded mode (empty edge lists).
+    """
+    from pydantic import ValidationError
+
+    errors: list[str] = []
+    try:
+        return ConceptLinkResult.model_validate(raw), errors
+    except ValidationError as exc:
+        for error in exc.errors():
+            loc = " → ".join(str(x) for x in error["loc"])
+            errors.append(f"{loc}: {error['msg']}")
+
+        # Best-effort: parse each edge list individually.
+        partial: dict = {}
+        for edge_type in EDGE_CAPS:
+            valid_edges: list[LinkEdge] = []
+            for e in raw.get(edge_type, []):
+                try:
+                    valid_edges.append(LinkEdge.model_validate(e))
+                except Exception:
+                    pass
+            partial[edge_type] = valid_edges
+
+        return ConceptLinkResult(**partial), errors

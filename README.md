@@ -90,7 +90,9 @@ cp .env.example .env
 | `GRAPH_SERVER_PORT` | Port for the dependency graph server (default `8000`) |
 | `TAGS_REGISTRY_PATH` | Path to `tags_registry.yaml` (default `../tags_registry.yaml`) |
 | `PIPELINE_DB_PATH` | Path to SQLite job ledger (default `/tmp/pipeline/ingestion_jobs.db`) |
-| `EXTRACTION_VERSION` | Schema version string used for idempotency (default `v2`) |
+| `EXTRACTION_VERSION` | Schema version string used for idempotency (default `v3`) |
+| `RETRIEVE_CANDIDATES_K` | How many Second Brain candidates to retrieve per concept in Stage 2 (default `30`) |
+| `PIPELINE_TMP_DIR` | Scratch directory for temporary PDF/MD files (default `/tmp/pipeline`) |
 
 ### Required Notion Properties
 
@@ -113,12 +115,18 @@ cp .env.example .env
 | Property | Type | Notes |
 |----------|------|-------|
 | `Name` | Title | Set to `[Type] Title` |
-| `Type` | Select | Values: `Definition`, `Theorem`, `Lemma`, `Algorithm`, `Assumption`, `Proof` |
+| `Type` | Select | Values: `Definition`, `Theorem`, `Lemma`, `Algorithm`, `Assumption`, `Proof`, `ProofTechnique` |
 | `Status` | Select | Initial value: `Inbox` |
 | `verification_status` | Select | Values: `unverified`, `verified`, `rejected` |
+| `graph_link_status` | Select | Values: `unlinked`, `linked-ai`, `needs-review` — written by Stage 3 |
 | `Source Paper` | Relation → Paper Tracker | Back-link to the source paper |
 | `Source Pages` | Rich Text | Comma-separated page numbers |
 | `Hub Suggestions` | Rich Text | JSON string `{"suggested_hub": "…"}` — text only, no live relation |
+| `canonical_keywords` | Rich Text | Comma-separated list: what this concept IS |
+| `prereq_keywords` | Rich Text | Comma-separated list: what this concept requires |
+| `downstream_keywords` | Rich Text | Comma-separated list: what this concept enables |
+| `candidate_matches` | Rich Text | JSON array of top-K Second Brain candidate records (Stage 2) |
+| `edge_suggestions` | Rich Text | JSON dict of proposed graph edges per type (Stage 3); text only, no live relations |
 
 ---
 
@@ -251,6 +259,98 @@ To reset a stuck job (e.g. after fixing a bug):
 sqlite3 /tmp/pipeline/ingestion_jobs.db \
   "UPDATE ingestion_jobs SET status='failed' WHERE zotero_key='XXXXXXXX' AND status='started';"
 ```
+
+---
+
+## 3-Stage Concept-Graph Pipeline
+
+As of **schema v3**, ingestion runs three distinct stages per paper.
+
+```
+Paper Markdown
+     │
+     ▼
+┌─────────────────────────────────────────────┐
+│  STAGE 1 — EXTRACT  (LLM)                  │
+│  Input : full paper Markdown                │
+│  Output: list of MathObject concepts,       │
+│           each with title, statement_latex, │
+│           canonical_keywords (5–15),        │
+│           prereq_keywords (5–15),           │
+│           downstream_keywords (5–15),       │
+│           suggested_hub, confidence         │
+│  Prompt: EXTRACTION_SYSTEM_PROMPT_V2        │
+│  LLM calls: 1 (+ 1 repair if needed)        │
+└──────────────────┬──────────────────────────┘
+                   │  K concepts
+                   ▼
+┌─────────────────────────────────────────────┐
+│  STAGE 2 — RETRIEVE  (deterministic)        │
+│  Input : one concept + Second Brain index   │
+│  Output: top-K candidate concepts           │
+│  Method: TF-IDF token overlap + hub bonus   │
+│  LLM calls: 0  (no LLM involved)            │
+└──────────────────┬──────────────────────────┘
+                   │  K candidates / concept
+                   ▼
+┌─────────────────────────────────────────────┐
+│  STAGE 3 — LINK  (LLM)                     │
+│  Input : one concept + its K candidates     │
+│  Output: ConceptLinkResult (edge_suggestions│
+│           per type, capped by EDGE_CAPS)    │
+│  Prompt: LINKING_SYSTEM_PROMPT_V1           │
+│  LLM calls: 1 (+ 1 repair if needed)        │
+└─────────────────────────────────────────────┘
+```
+
+### Design constraints
+
+- **No blind LLM context:** Stage 3 only ever receives the top-K *retrieved*
+  candidates for the concept being linked — never the entire Second Brain.
+- **No co-occurrence linking:** Concepts extracted from the same paper are not
+  automatically linked to each other.
+- **Suggestions only:** All `edge_suggestions` are stored as JSON text on the
+  Knowledge Inbox page. No live relations are written to the Second Brain.
+- **`graph_link_status`** tracks where each concept sits: `unlinked` → `linked-ai`
+  → `needs-review` (human promotion).
+
+### Tuning Stage 2 retrieval depth
+
+Control how many candidates are retrieved for each concept via the env var:
+
+```bash
+RETRIEVE_CANDIDATES_K=20   # fewer, faster, higher precision
+RETRIEVE_CANDIDATES_K=50   # more recall, larger Stage 3 context
+```
+
+Default is **30**. Values in the 20–50 range work well for a Second Brain
+with up to ~5 000 atomic concepts.
+
+### Edge caps
+
+Stage 3 enforces hard limits on the number of edges per type
+(defined in `extraction_schema.EDGE_CAPS`):
+
+| Edge type | Max edges |
+|-----------|-----------|
+| `depends_on` | 3 |
+| `enables` | 3 |
+| `generalizes` | 2 |
+| `special_case_of` | 2 |
+| `related` | 5 |
+
+### JobLedger checkpoints (v3)
+
+| Checkpoint | Stage completed |
+|------------|-----------------|
+| `marker_done` | PDF → Markdown conversion |
+| `extract_done` | Stage 1 LLM extraction |
+| `retrieve_done` | Stage 2 candidate retrieval |
+| `link_done` | Stage 3 LLM linking |
+| `notion_done` | Final Notion writes complete |
+
+Each checkpoint is written immediately, so a crash anywhere in the pipeline
+results in a clean restart from the last completed checkpoint.
 
 ---
 
