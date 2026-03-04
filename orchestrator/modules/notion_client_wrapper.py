@@ -162,7 +162,17 @@ class NotionClientWrapper:
             start_cursor = response.get("next_cursor")
 
         return results
+    
+    def get_database(self, database_id: str) -> dict:
+        return self._call(self._client.databases.retrieve, database_id=database_id)
 
+    def get_title_property_name(self, database_id: str) -> str:
+        db = self.get_database(database_id)
+        props = db.get("properties", {})
+        for prop_name, prop in props.items():
+            if prop.get("type") == "title":
+                return prop_name
+        raise RuntimeError(f"No title property found in database {database_id}")
     # ── Property helpers ──────────────────────────────────────────────────
 
     @staticmethod

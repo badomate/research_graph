@@ -114,73 +114,188 @@ MAX_REPAIR_ERRORS = 5
 
 # -- Stage 3 linking system prompt ---------------------------------------------
 LINKING_SYSTEM_PROMPT_V1 = """\
-Given a mathematical concept and a list of candidate concepts from a knowledge base, \
-identify which directed relationships hold between the given concept and the candidates.
+You are a concept-graph linker.
 
-For each relationship type, list the EXACT candidate titles that apply (use exact titles as given).
-Return a JSON object with ONLY these keys:
-  "depends_on"      -- concepts that this concept directly requires as prerequisites
-  "enables"         -- concepts that follow naturally from or are unlocked by this one
-  "generalizes"     -- concepts that this concept is a generalization of
-  "special_case_of" -- concepts that this concept is a special case of
-  "related"         -- loosely related concepts that share terminology or proof techniques
+TASK
+Given ONE extracted concept and a list of CANDIDATE existing concepts (from a clean knowledge base),
+propose directed edges from the extracted concept to candidates.
 
-Rules:
-- Values are arrays of exact candidate title strings.
-- Omit a key entirely if no relationship of that type exists.
-- Limit total references across ALL keys to 10.
-- Prefer precision over recall; a false positive edge is worse than a missed one.
-- Return ONLY valid JSON -- no explanation, no markdown fences.
+ABSOLUTE CONSTRAINTS
+- You may ONLY link to the provided candidates.
+- Use the candidate's exact id and title.
+- If no candidate fits, output empty lists for all edge types.
+- Precision > recall. False positives are worse than omissions.
+
+EDGE TYPES (DIRECTED)
+- depends_on: prerequisites required to understand/prove/apply the extracted concept
+- enables: results/methods that become possible because of the extracted concept
+- generalizes: the extracted concept is a generalization of the target
+- special_case_of: the extracted concept is a special case of the target
+- related: meaningful relatedness (shared objects/assumptions/techniques), NOT mere topical similarity
+
+RATIONALE (CRITICAL)
+Each edge MUST have a 1–2 sentence rationale referencing specific mathematical objects:
+- equation types (HJB/FP/master), operator classes, monotonicity/convexity/Lipschitz, fixed point, contraction, etc.
+Do NOT write generic rationales like "they are related".
+
+CAPS (STRICT)
+- depends_on ≤ 3
+- enables ≤ 3
+- generalizes ≤ 2
+- special_case_of ≤ 2
+- related ≤ 5
+
+CONFIDENCE
+- confidence ∈ [0,1]
+- Use 0.9 only when the link is very clearly justified by the concept content and candidate description.
+
+OUTPUT FORMAT (STRICT)
+Return ONLY valid JSON matching EXACTLY this schema (all keys required, lists may be empty):
+{
+  "depends_on": [
+    {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
+  ],
+  "enables": [
+    {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
+  ],
+  "generalizes": [
+    {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
+  ],
+  "special_case_of": [
+    {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
+  ],
+  "related": [
+    {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
+  ]
+}
 """
 
 # -- System prompt template -----------------------------------------------------
 EXTRACTION_SYSTEM_PROMPT = """\
-You are a highly rigorous researcher in applied mathematics. Process the Markdown paper \
-and extract strictly factual mathematical structures.
+You are a mathematical extraction engine for applied mathematics papers (MFG/PDE/probability/optimization).
+You extract a SMALL set of reusable mathematical concept nodes from ONE paper, from Markdown input.
 
-Rules:
-1. Extract exact mathematical formulations. Do not paraphrase.
-2. Format variables and equations in valid LaTeX ($ for inline, $$ for display).
-3. Explicitly extract boundary conditions or assumptions. If none, write \
-"None explicitly stated."
-4. For hub suggestions: provide descriptive text only from ALLOWED_HUBS. \
-Do not invent hubs. If none fit, use "Uncategorized".
-5. For keywords: use lowercase, hyphen-separated terms (2-6 per field).
-6. For setting: use values such as finite_state, continuous, graphon, ergodic, common_noise.
-7. For result_category: use exactly one of: existence, uniqueness, convergence, \
-stability, approximation -- or omit if inapplicable.
+GOAL
+Produce high-fidelity, reusable mathematical "Concept Nodes" suitable for a long-term concept graph.
+This is NOT summarization. Do not invent. Do not add general background material that is not in the paper.
 
-ALLOWED_HUBS: [INJECT_DYNAMIC_HUBS_HERE]
+OUTPUT BIAS
+Prefer FEWER, HIGHER-VALUE concepts (3–12) rather than many low-value fragments.
+A false concept is worse than a missed concept.
 
-You MUST respond in valid JSON matching this EXACT schema:
+HUBS
+You MUST assign exactly one hub per concept:
+- The hub MUST be one of ALLOWED_HUBS (provided below) or "Uncategorized".
+- Never invent hubs.
+
+CONCEPT GRANULARITY RULE (CRITICAL)
+Extract only concepts that are useful beyond this single paper.
+
+Include:
+- Main definitions that introduce new objects / equilibrium notions / operators.
+- Main theorems (existence/uniqueness/stability/convergence/characterization).
+- Algorithms/procedures that can be reused (not just “we compute this”).
+- Key assumptions ONLY if they are used as reusable conditions (e.g., monotonicity, convexity, Lipschitz).
+
+Exclude by default:
+- “Lemma A used only to prove Theorem B” (do NOT include A unless independently reusable).
+- Intermediate inequalities, technical estimates, proof bookkeeping.
+- Restatements of known textbook facts unless the paper uses them as a named condition central to the contribution.
+- Numbered titles like "Theorem 1" or "Lemma 3.2".
+
+EXCEPTION (INTERNAL LEMMA RULE)
+If the paper proves a big result using a smaller lemma that is clearly a standard reusable tool
+(e.g., a contraction estimate, monotonicity lemma, stability inequality) AND it is stated cleanly as a general-purpose statement,
+then you MAY extract that lemma as its own concept. Otherwise omit it.
+
+NAMING RULE (CRITICAL)
+Every concept title must be a descriptive canonical name that stands alone.
+Do NOT use numbering.
+Bad: "Theorem 1", "Lemma 2.3", "Equation (5)".
+Good: "Existence of Mean Field Game Equilibrium under Lasry–Lions Monotonicity", "Convergence of Policy Iteration for Finite-State MFG".
+
+MATHEMATICAL FIDELITY RULES
+- If the statement is present in the Markdown: reproduce it as exactly as possible in LaTeX.
+- Do NOT paraphrase equations into different symbols.
+- If the exact statement is not available (e.g., badly extracted), you may give a best-effort reconstruction, but then reduce confidence.
+
+ASSUMPTIONS / BOUNDARY CONDITIONS
+- Explicitly list all assumptions needed for the statement.
+- Include boundary/terminal conditions if the result is PDE-based.
+- If none are explicitly stated: write "None explicitly stated."
+
+VARIABLES FIELD
+Give a comma-separated list of variable descriptions, e.g.:
+"x∈Ω (state), t∈[0,T] (time), m_t (population distribution), V(t,x) (value function), H(x,p,m) (Hamiltonian)"
+
+CONCLUSION FIELD
+Explain the result in plain English (1–2 sentences).
+No marketing language.
+
+KEYWORDS (FOR GRAPH RETRIEVAL)
+You MUST produce three keyword lists per concept:
+- canonical_keywords: 5–15 terms describing what the concept IS
+- prereq_keywords: 5–15 terms describing what the concept REQUIRES
+- downstream_keywords: 5–15 terms describing what the concept ENABLES
+
+Keyword format rules:
+- lowercase
+- hyphen-separated
+- 2–5 words per keyword
+- examples: "lasry-lions-monotonicity", "fixed-point-existence", "viscosity-solution", "graphon-coupling"
+
+OPTIONAL FIELDS (include only if supported by the text)
+- interpretation: plain-English intuition (≤ 3 sentences)
+- proof_idea: high-level reusable technique (≤ 3 sentences), NOT a full proof
+- source_anchors: section/equation refs like "Section 3.2; Eq. (12); Theorem 4.1"
+- named_tools: named theorems/techniques explicitly referenced (e.g., Schauder, Kakutani, Gronwall)
+- setting: list of setting tags such as finite_state, continuous, graphon, ergodic, common_noise
+- result_category: one of {existence, uniqueness, convergence, stability, approximation}
+- aliases: short list of alternative names for the concept (strings)
+
+TRACEABILITY
+- source_pages must be a list of integers (pages where the statement appears).
+- source_quotes: optional short quote ≤ 25 words (verbatim) or null.
+
+CONFIDENCE
+Return confidence ∈ [0,1]:
+- 0.9-1.0: statement clearly present and clean
+- 0.6-0.8: mostly clear but minor reconstruction
+- 0.0-0.5: extraction uncertain / noisy
+
+OUTPUT FORMAT (STRICT)
+Return ONLY valid JSON matching this schema exactly (no extra keys):
 {
-  "one_liner": "string - one sentence summary",
-  "active_themes": ["string"],
+  "one_liner": string,
+  "active_themes": [string],
   "extracted_concepts": [
     {
-      "type": "Definition | Theorem | Lemma | Algorithm | Assumption | Proof",
-      "title": "string - short label or theorem number",
-      "statement_latex": "string - exact statement in valid LaTeX",
-      "assumptions": "string - boundary conditions or None explicitly stated.",
-      "variables": "string - comma-separated variable descriptions",
-      "conclusion": "string - result in plain English",
-      "source_pages": [1, 2],
-      "source_quotes": "optional verbatim quote max 25 words or null",
-      "confidence": 0.95,
-      "suggested_hub": "string from ALLOWED_HUBS",
-      "canonical_keywords": ["keyword1", "keyword2"],
-      "prereq_keywords": ["keyword1"],
-      "downstream_keywords": ["keyword1"],
-      "interpretation": "optional plain-English meaning",
-      "proof_idea": "optional proof sketch",
-      "source_anchors": "optional section/equation refs e.g. Section 3.2; Eq. (12)",
-      "named_tools": ["optional named mathematical tool"],
-      "setting": ["optional setting tag"],
-      "result_category": "optional: existence|uniqueness|convergence|stability|approximation",
-      "aliases": "optional alternative names"
+      "type": "Definition"|"Theorem"|"Lemma"|"Algorithm"|"Assumption"|"ProofTechnique",
+      "title": string,
+      "statement_latex": string,
+      "assumptions": string,
+      "variables": string,
+      "conclusion": string,
+      "source_pages": [int],
+      "source_quotes": string|null,
+      "confidence": number,
+      "suggested_hub": string,
+      "canonical_keywords": [string],
+      "prereq_keywords": [string],
+      "downstream_keywords": [string],
+      "interpretation": string (optional),
+      "proof_idea": string (optional),
+      "source_anchors": string (optional),
+      "named_tools": [string] (optional),
+      "setting": [string] (optional),
+      "result_category": string (optional),
+      "aliases": [string] (optional)
     }
   ]
 }
+
+ALLOWED_HUBS:
+[INJECT_DYNAMIC_HUBS_HERE]
 """
 
 
@@ -509,6 +624,7 @@ class IngestionEngine:
             concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
             for concept, ki_page_id in ki_pages:
                 candidates = self._retrieve_candidates_for_concept(concept, sb_index)
+                self._update_knowledge_item_candidates(ki_page_id, candidates)
                 concept_candidates.append((concept, ki_page_id, candidates))
                 logger.debug(
                     "[%s] '%s': %d candidate(s) retrieved.",
@@ -603,15 +719,29 @@ class IngestionEngine:
             )
             return None
 
+        pdf_children: list[tuple[str, dict]] = []
         for child in children:
             data = child.get("data", {})
             link_mode = data.get("linkMode", "")
             content_type = data.get("contentType", "")
             if link_mode in ("imported_file", "imported_url") and "pdf" in content_type:
-                return parent_key, data["key"]
+                attach_key = child.get("key")
+                if attach_key:
+                    pdf_children.append((attach_key, data))
 
-        logger.warning("No PDF attachment found for Zotero parent '%s'.", parent_key)
-        return None
+        if not pdf_children:
+            logger.warning("No PDF attachment found for Zotero parent '%s'.", parent_key)
+            return None
+
+        # Prefer attachment whose filename starts with parent_key (Zotero convention)
+        for attach_key, data in pdf_children:
+            filename = data.get("filename", "")
+            if filename.lower().startswith(parent_key.lower()):
+                return parent_key, attach_key
+
+        # Fallback: pick attachment with largest fileSize
+        pdf_children.sort(key=lambda x: x[1].get("fileSize", 0), reverse=True)
+        return parent_key, pdf_children[0][0]
 
     def _resolve_keys_and_update_notion(
         self,
@@ -735,30 +865,29 @@ class IngestionEngine:
         Call OpenAI, validate the response, attempt a repair pass if needed,
         and run latex_sanity_check on each concept.
         """
-        raw = self._call_openai(markdown, hubs)
-        result, errors = validate_extraction(raw)
+        result = self._call_openai(markdown, hubs)
 
-        if errors:
-            logger.warning(
-                "[%s] Pydantic validation failed (%d error(s)) -- attempting repair.",
-                run_id,
-                len(errors),
-            )
-            total_errors = len(errors)
-            error_summary = "; ".join(errors[:MAX_REPAIR_ERRORS])
-            if total_errors > MAX_REPAIR_ERRORS:
-                error_summary += (
-                    f" ... (showing {MAX_REPAIR_ERRORS} of {total_errors} errors)"
-                )
-            raw2 = self._call_openai_repair(raw, error_summary)
-            result, errors2 = validate_extraction(raw2)
-            if errors2:
-                logger.error(
-                    "[%s] Repair also failed -- flagging concepts with confidence=0.",
-                    run_id,
-                )
-                for concept in result.extracted_concepts:
-                    concept.confidence = 0.0
+        # if errors:
+        #     logger.warning(
+        #         "[%s] Pydantic validation failed (%d error(s)) -- attempting repair.",
+        #         run_id,
+        #         len(errors),
+        #     )
+        #     total_errors = len(errors)
+        #     error_summary = "; ".join(errors[:MAX_REPAIR_ERRORS])
+        #     if total_errors > MAX_REPAIR_ERRORS:
+        #         error_summary += (
+        #             f" ... (showing {MAX_REPAIR_ERRORS} of {total_errors} errors)"
+        #         )
+        #     raw2 = self._call_openai_repair(raw, error_summary)
+        #     result, errors2 = validate_extraction(raw2)
+        #     if errors2:
+        #         logger.error(
+        #             "[%s] Repair also failed -- flagging concepts with confidence=0.",
+        #             run_id,
+        #         )
+        #         for concept in result.extracted_concepts:
+        #             concept.confidence = 0.0
 
         for concept in result.extracted_concepts:
             issues = latex_sanity_check(concept.statement_latex)
@@ -774,7 +903,7 @@ class IngestionEngine:
         return result
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
-    def _call_openai(self, markdown: str, hubs: dict[str, str]) -> dict[str, Any]:
+    def _call_openai(self, markdown: str, hubs: dict[str, str]) -> ExtractionResult:
         """Send the paper Markdown to GPT and return the parsed JSON dict."""
         hub_names_str = (
             ", ".join(f'"{name}"' for name in hubs) if hubs else '"Uncategorized"'
@@ -782,23 +911,53 @@ class IngestionEngine:
         system_prompt = EXTRACTION_SYSTEM_PROMPT.replace(
             "[INJECT_DYNAMIC_HUBS_HERE]", hub_names_str
         )
-        response = self.openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=4096,
-            response_format={"type": "json_object"},
-            messages=[
+        # response = self.openai_client.chat.completions.create(
+        #     model=OPENAI_MODEL,
+        #     max_tokens=4096,
+        #     response_format={"type": "json_object"},
+        #     messages=[
+        #         {"role": "system", "content": system_prompt},
+        #         {
+        #             "role": "user",
+        #             "content": (
+        #                 "Extract structured knowledge from the following "
+        #                 " "
+        #                 "INSTRUCTIONS"
+        #                 "- Follow the schema strictly."
+        #                 "- Prefer 3–12 high-value concepts."
+        #                 "- Do not output theorem/lemma numbers as titles."
+        #                 "- Do not include proof-only microlemmas."
+        #                 " "
+        #                 "PAPER MARKDOWN:\n\n"
+        #                 f"{markdown[:100_000]}"
+        #             ),
+        #         },
+        #     ],
+        # )
+        response = self.openai_client.responses.parse(
+            model="gpt-5.2",
+            text_format=ExtractionResult,
+            input=[
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": (
                         "Extract structured knowledge from the following "
-                        "academic paper (Markdown format).\n\n"
+                        " "
+                        "INSTRUCTIONS"
+                        "- Follow the schema strictly."
+                        "- Prefer 3–12 high-value concepts."
+                        "- Do not output theorem/lemma numbers as titles."
+                        "- Do not include proof-only microlemmas."
+                        " "
+                        "PAPER MARKDOWN:\n\n"
                         f"{markdown[:100_000]}"
                     ),
                 },
-            ],
-        )
-        return json.loads(response.choices[0].message.content)
+            ]) 
+        
+        logger.info("OpenAI response: %s", response)
+        return response.output_parsed
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=30))
     def _call_openai_repair(
@@ -897,13 +1056,13 @@ class IngestionEngine:
             if concept.source_pages
             else ""
         )
-
+        title_key = self.notion.get_title_property_name(self.knowledge_inbox_db)    
         properties: dict = {
-            "Name": self.notion.title_prop(f"[{kind}] {title}"),
+            title_key: self.notion.title_prop(f"[{kind}] {title}"),
             "Type": self.notion.select_prop(kind),
             "Status": self.notion.select_prop("Inbox"),
             "verification_status": self.notion.select_prop("unverified"),
-            "graph_link_status": self.notion.select_prop("unlinked"),
+            "Graph Link Status": self.notion.select_prop("unlinked"),
             "Source Paper": self.notion.relation_prop([paper_page_id]),
         }
 
@@ -912,9 +1071,9 @@ class IngestionEngine:
                 "rich_text": self.notion.rich_text(source_pages_str)
             }
         if concept.suggested_hub:
-            properties["Suggested Hub"] = self.notion.select_prop(concept.suggested_hub)
+            properties["Suggested Hub"] = self.notion.rich_text(concept.suggested_hub)
 
-        properties["Confidence"] = {"number": concept.confidence}
+        properties["AI Confidence"] = {"number": concept.confidence}
 
         if concept.canonical_keywords:
             properties["Keywords"] = self.notion.multi_select_prop(
@@ -1006,14 +1165,20 @@ class IngestionEngine:
                 "KI page %s: no edges produced -- remaining 'unlinked'.", ki_page_id
             )
             return
-        edge_json = json.dumps(edge_dict, ensure_ascii=False)[:NOTION_BLOCK_MAX_CHARS]
+        payload = edge_dict
+        s = json.dumps(payload, ensure_ascii=False)
+        if len(s) > NOTION_BLOCK_MAX_CHARS:
+            for rel in ["related", "enables", "depends_on", "generalizes", "special_case_of"]:
+                while payload.get(rel) and len(json.dumps(payload, ensure_ascii=False)) > NOTION_BLOCK_MAX_CHARS:
+                    payload[rel].pop()
+        edge_json = json.dumps(payload, ensure_ascii=False)
         self.notion.update_page(
             page_id=ki_page_id,
             properties={
                 "Edge Suggestions": {
                     "rich_text": self.notion.rich_text(edge_json)
                 },
-                "graph_link_status": self.notion.select_prop("linked-ai"),
+                "Graph Link Status": self.notion.select_prop("linked-ai"),
             },
         )
 
@@ -1062,7 +1227,32 @@ class IngestionEngine:
             scored.append((score, record))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for _, r in scored[:k]]
+        out = []
+        for score, r in scored[:k]:
+            out.append({
+                "id": r["id"],
+                "title": r["title"],
+                "hub": r.get("hub", ""),
+                "summary": r.get("summary", ""),
+                "score": round(float(score), 4),
+            })
+        return out
+
+    def _update_knowledge_item_candidates(
+        self, ki_page_id: str, candidates: list[dict]
+    ) -> None:
+        """Write the Stage 2 candidate list to the KI 'Candidate Matches' property."""
+        slim = candidates[:]
+        s = json.dumps(slim, ensure_ascii=False)
+        while len(s) > NOTION_BLOCK_MAX_CHARS and len(slim) > 1:
+            slim.pop()
+            s = json.dumps(slim, ensure_ascii=False)
+        self.notion.update_page(
+            page_id=ki_page_id,
+            properties={
+                "Candidate Matches": {"rich_text": self.notion.rich_text(s)}
+            },
+        )
 
     # -- Stage 3: LLM linking --------------------------------------------------
 
@@ -1080,23 +1270,18 @@ class IngestionEngine:
         if not candidates:
             return ConceptLinkResult()
         try:
-            raw = self._call_openai_link(concept, candidates)
+            result = self._call_openai_link(concept, candidates)
         except Exception:
             logger.warning(
                 "[%s] _call_openai_link failed for '%s'.", run_id, concept.title
             )
             return ConceptLinkResult()
-        result = validate_link_result(raw)
-        for rel, cap in EDGE_CAPS.items():
-            current = getattr(result, rel, None)
-            if current and len(current) > cap:
-                setattr(result, rel, current[:cap])
         return result
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
     def _call_openai_link(
         self, concept: MathObject, candidates: list[dict]
-    ) -> dict[str, Any]:
+    ) -> ConceptLinkResult:
         """Invoke the Stage 3 linking prompt via OpenAI."""
         candidate_lines = "\n".join(
             f"{i + 1}. {r['title']}"
@@ -1117,16 +1302,15 @@ class IngestionEngine:
             f"CANDIDATES:\n{candidate_lines}\n\n"
             "Identify relationships. Return JSON only."
         )
-        response = self.openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=1024,
-            response_format={"type": "json_object"},
-            messages=[
+        response = self.openai_client.responses.parse(
+            model="gpt-5.2",
+            text_format=ConceptLinkResult,
+            input=[
                 {"role": "system", "content": LINKING_SYSTEM_PROMPT_V1},
                 {"role": "user", "content": user_message},
             ],
-        )
-        return json.loads(response.choices[0].message.content)
+        ) 
+        return response.output_parsed
 
     # -- Text chunking ---------------------------------------------------------
 

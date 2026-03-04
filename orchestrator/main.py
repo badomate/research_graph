@@ -124,10 +124,10 @@ def main() -> None:
 
     scheduler = BlockingScheduler(timezone="UTC")
 
-    # ── Module 1: Ingestion Engine — every 10 minutes ─────────────────────────
+    # ── Module 1: Ingestion Engine — every 5 minutes ─────────────────────────
     scheduler.add_job(
         run_ingestion,
-        trigger=IntervalTrigger(minutes=10),
+        trigger=IntervalTrigger(minutes=1),
         id="ingestion",
         name="Core Ingestion Engine",
         max_instances=1,
