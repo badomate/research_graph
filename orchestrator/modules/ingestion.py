@@ -82,6 +82,10 @@ NOTION_BLOCK_MAX_CHARS = 1900
 NOTION_BLOCKS_PER_REQUEST = 100
 
 # ── Zotero key regex ───────────────────────────────────────────────────────────
+# Matches exactly 8 uppercase alphanumeric characters that are NOT surrounded
+# by other uppercase-alphanumeric characters (i.e. not part of a longer token).
+# Negative lookbehind/lookahead on [A-Z0-9] acts as a word-boundary for this
+# character class since \b treats digits and uppercase as word chars.
 # Maximum number of validation errors to include in the repair prompt.
 MAX_REPAIR_ERRORS = 5
 
@@ -466,7 +470,12 @@ class IngestionEngine:
                 run_id,
                 len(errors),
             )
+            total_errors = len(errors)
             error_summary = "; ".join(errors[:MAX_REPAIR_ERRORS])
+            if total_errors > MAX_REPAIR_ERRORS:
+                error_summary += (
+                    f" … (showing {MAX_REPAIR_ERRORS} of {total_errors} errors)"
+                )
             raw2 = self._call_openai_repair(raw, error_summary)
             result, errors2 = validate_extraction(raw2)
             if errors2:

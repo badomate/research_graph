@@ -212,12 +212,7 @@ tags:
 3. Add your entry following the format above.
 4. Verify the file is valid:
    ```bash
-   python -c "
-   import sys; sys.path.insert(0, 'orchestrator')
-   from modules.tag_linter import TagRegistry
-   r = TagRegistry()
-   print(f'Loaded {len(r)} tags successfully.')
-   "
+   python -c "import sys; sys.path.insert(0, 'orchestrator'); from modules.tag_linter import TagRegistry; r = TagRegistry(); print(f'Loaded {len(r)} tags successfully.')"
    ```
 5. Set `TAGS_REGISTRY_PATH` in `.env` if using a non-default location.
 

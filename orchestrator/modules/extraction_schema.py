@@ -17,6 +17,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── Version string ─────────────────────────────────────────────────────────────
 # Bump this whenever the extraction schema or system prompt changes.
+# Changelog:
+#   v1 — original schema: type, name, content, assumptions, suggested_hub
+#   v2 — hardened schema: type, title, statement_latex, assumptions, variables,
+#         conclusion, source_pages, source_quotes, confidence; hub_suggestions
+#         stored as text only; verification_status added to Knowledge Inbox.
 EXTRACTION_VERSION: str = "v2"
 
 
@@ -237,8 +242,9 @@ def latex_sanity_check(latex: str) -> list[str]:
                         f"\\end{{{env}}} closes out of order "
                         f"(expected \\end{{{env_stack[-1] if env_stack else '?'}}})."
                     )
-                    # Remove it from wherever it is in the stack
-                    env_stack.remove(env)
+                    # Remove the specific occurrence using its index so that
+                    # duplicate environment names are handled correctly.
+                    env_stack.pop(env_stack.index(env))
                 else:
                     issues.append(
                         f"\\end{{{env}}} has no matching \\begin{{{env}}}."
