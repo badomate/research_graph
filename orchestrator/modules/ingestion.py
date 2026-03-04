@@ -43,6 +43,7 @@ import os
 import re
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,10 @@ Rules:
 "None explicitly stated."
 4. For hub suggestions: provide descriptive text only from ALLOWED_HUBS. \
 Do not invent hubs. If none fit, use "Uncategorized".
+5. For keywords: use lowercase, hyphen-separated terms (2–6 per field).
+6. For setting: use values such as finite_state, continuous, graphon, ergodic, common_noise.
+7. For result_category: use exactly one of: existence, uniqueness, convergence, \
+stability, approximation — or omit if inapplicable.
 
 ALLOWED_HUBS: [INJECT_DYNAMIC_HUBS_HERE]
 
@@ -122,7 +127,17 @@ You MUST respond in valid JSON matching this EXACT schema:
       "source_pages": [1, 2],
       "source_quotes": "optional verbatim quote max 25 words or null",
       "confidence": 0.95,
-      "suggested_hub": "string from ALLOWED_HUBS"
+      "suggested_hub": "string from ALLOWED_HUBS",
+      "canonical_keywords": ["keyword1", "keyword2"],
+      "prereq_keywords": ["keyword1"],
+      "downstream_keywords": ["keyword1"],
+      "interpretation": "optional plain-English meaning",
+      "proof_idea": "optional proof sketch",
+      "source_anchors": "optional section/equation refs e.g. Section 3.2; Eq. (12)",
+      "named_tools": ["optional named mathematical tool"],
+      "setting": ["optional setting tag"],
+      "result_category": "optional: existence|uniqueness|convergence|stability|approximation",
+      "aliases": "optional alternative names"
     }
   ]
 }
@@ -162,8 +177,9 @@ class IngestionEngine:
         Poll 'Paper Tracker' for s1-process-math papers and run the full
         ingestion pipeline on each one.
 
-        Hubs are fetched once per run() invocation so that every paper in the
-        same batch uses a consistent hub snapshot.
+        Hubs and the Second Brain keyword index are fetched once per run()
+        invocation so that every paper in the same batch uses a consistent
+        snapshot.
         """
         logger.info("Ingestion: polling for s1-process-math papers ...")
         pages = self.notion.query_database(
@@ -179,15 +195,16 @@ class IngestionEngine:
             return
 
         hubs: dict[str, str] = self._fetch_allowed_hubs()
+        sb_index: dict[str, list[dict]] = self._build_second_brain_index()
         logger.info(
-            "Ingestion: loaded %d hub(s) from Second Brain: %s",
+            "Ingestion: loaded %d hub(s), %d Second Brain keyword(s).",
             len(hubs),
-            list(hubs.keys()),
+            len(sb_index),
         )
 
         for page in pages:
             try:
-                self._process_paper(page, hubs)
+                self._process_paper(page, hubs, sb_index)
             except Exception:
                 logger.exception("Failed to process page %s", page["id"])
 
@@ -216,9 +233,67 @@ class IngestionEngine:
                 hubs[name] = page["id"]
         return hubs
 
+    def _build_second_brain_index(self) -> dict[str, list[dict]]:
+        """
+        Query the Second Brain DB for Concept pages and build a keyword → page
+        index used during the LINK stage to generate edge suggestions.
+
+        The ``Note Level`` value to filter on is controlled by the
+        ``SB_CONCEPT_LEVEL`` environment variable (default: ``"Concept"``).
+
+        Returns
+        -------
+        dict mapping lowercase keyword string → list of
+        ``{"page_id": str, "name": str}`` dicts.
+        """
+        concept_level = os.environ.get("SB_CONCEPT_LEVEL", "Concept")
+        logger.debug(
+            "Ingestion: building Second Brain index (Note Level='%s') ...",
+            concept_level,
+        )
+        pages = self.notion.query_database(
+            self.second_brain_db,
+            filter={
+                "property": "Note Level",
+                "select": {"equals": concept_level},
+            },
+        )
+        index: dict[str, list[dict]] = {}
+        for page in pages:
+            name = self._get_page_title(page)
+            if not name:
+                continue
+            # "Keywords" multi-select (new property name per spec)
+            keywords = self._get_multi_select_prop(page["properties"], "Keywords")
+            if not keywords:
+                # Fallback: use the page name itself as a keyword.
+                # Log at debug so operators can identify pages missing Keywords.
+                logger.debug(
+                    "SB index: page '%s' has no Keywords property — using title as fallback.",
+                    name,
+                )
+                keywords = [name]
+            for kw in keywords:
+                key = kw.lower().strip()
+                if key:
+                    index.setdefault(key, []).append(
+                        {"page_id": page["id"], "name": name}
+                    )
+        logger.debug(
+            "Ingestion: Second Brain index built — %d keyword(s) across %d page(s).",
+            len(index),
+            len(pages),
+        )
+        return index
+
     # ── Per-paper pipeline ─────────────────────────────────────────────────────
 
-    def _process_paper(self, page: dict, hubs: dict[str, str]) -> None:
+    def _process_paper(
+        self,
+        page: dict,
+        hubs: dict[str, str],
+        sb_index: dict[str, list[dict]],
+    ) -> None:
         """
         Full ingestion pipeline for a single paper.
 
@@ -241,7 +316,6 @@ class IngestionEngine:
         # Short unique ID for log correlation and temp-file naming.
         run_id = uuid.uuid4().hex[:8]
         local_pdf: Path | None = None
-        local_md: Path | None = None
         job_id: int | None = None
 
         try:
@@ -260,7 +334,6 @@ class IngestionEngine:
             TMP_DIR.mkdir(parents=True, exist_ok=True)
             local_zip = TMP_DIR / f"{run_id}.zip"
             local_pdf = TMP_DIR / f"{run_id}.pdf"
-            local_md = TMP_DIR / f"{run_id}.md"
 
             self._download_koofr(zip_remote, local_zip)
 
@@ -281,11 +354,11 @@ class IngestionEngine:
             # ── Preflight gate 5: Idempotency check ───────────────────────────
             if self._ledger.is_already_done(zotero_key, pdf_sha256, EXTRACTION_VERSION):
                 logger.info(
-                    "[%s] Already processed (ledger hit) -- marking s2-extracted.", run_id
+                    "[%s] Already processed (ledger hit) -- marking s2b-linked-ai.", run_id
                 )
                 self.notion.update_page(
                     page_id=page_id,
-                    properties={"Status": self.notion.select_prop("s2-extracted")},
+                    properties={"Status": self.notion.select_prop("s2b-linked-ai")},
                 )
                 return
 
@@ -322,35 +395,40 @@ class IngestionEngine:
             job_id = self._ledger.start_job(zotero_key, pdf_sha256, EXTRACTION_VERSION)
             logger.info("[%s] JobLedger job_id=%d", run_id, job_id)
 
-            # ── Step 1: Convert PDF to Markdown ───────────────────────────────
+            # ── Stage 1 / Step 1: Convert PDF to Markdown ─────────────────────
             logger.info("[%s] Converting PDF to Markdown ...", run_id)
             markdown_text = self._pdf_to_markdown(local_pdf)
-            local_md.write_text(markdown_text, encoding="utf-8")
             self._ledger.update_status(job_id, "marker_done")
 
-            # ── Step 2: Extract via OpenAI ────────────────────────────────────
+            # ── Stage 1 / Step 2: Extract via OpenAI ─────────────────────────
             logger.info("[%s] Extracting knowledge via OpenAI GPT-4o ...", run_id)
             extraction = self._extract_and_validate(markdown_text, hubs, run_id)
             self._ledger.update_status(job_id, "openai_done")
 
-            # ── Step 3: Patch Paper Tracker ───────────────────────────────────
-            logger.info("[%s] Patching Notion paper row ...", run_id)
-            self._patch_notion_page(page_id, extraction)
+            # ── Stage 1 / Step 3: Patch Paper Tracker → s2-extracted ──────────
+            logger.info("[%s] Patching Notion paper row (s2-extracted) ...", run_id)
+            self._patch_notion_page(page_id, extraction, run_id)
 
-            # ── Step 4: Create Knowledge Inbox entries ────────────────────────
+            # ── Stage 1 / Step 4: Create Knowledge Inbox entries with edges ───
             concepts = extraction.extracted_concepts
             logger.info(
                 "[%s] Creating %d Knowledge Inbox page(s) ...", run_id, len(concepts)
             )
+            ki_created = 0
             for concept in concepts:
                 try:
-                    self._create_knowledge_item(page_id, concept, hubs)
+                    self._create_knowledge_item(page_id, concept, sb_index)
+                    ki_created += 1
                 except Exception:
                     logger.exception(
                         "[%s] Failed to create knowledge item '%s'",
                         run_id,
                         concept.title,
                     )
+            logger.info("[%s] Created %d Knowledge Inbox page(s).", run_id, ki_created)
+
+            # ── Stage 3 / Step 5: Patch Paper Tracker → s2b-linked-ai ─────────
+            self._patch_notion_paper_post_linking(page_id, run_id)
 
             self._ledger.update_status(job_id, "notion_done")
             self._ledger.finish_job(job_id)
@@ -360,12 +438,26 @@ class IngestionEngine:
             logger.exception("[%s] Pipeline failed: %s", run_id, exc)
             if job_id is not None:
                 self._ledger.update_status(job_id, "failed", error=str(exc))
+            # Best-effort: write error context to Paper Tracker
+            try:
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Last Error": {
+                            "rich_text": self.notion.rich_text(str(exc)[:2000])
+                        },
+                        "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] Could not write error context to Notion Paper Tracker.", run_id
+                )
             raise
 
         finally:
-            for tmp_file in filter(None, [local_pdf, local_md]):
-                if tmp_file.exists():
-                    tmp_file.unlink()
+            if local_pdf is not None and local_pdf.exists():
+                local_pdf.unlink()
 
     # ── Koofr helpers ──────────────────────────────────────────────────────────
 
@@ -561,13 +653,19 @@ class IngestionEngine:
 
     # ── Patch Paper Tracker row ────────────────────────────────────────────────
 
-    def _patch_notion_page(self, page_id: str, result: ExtractionResult) -> None:
+    def _patch_notion_page(
+        self, page_id: str, result: ExtractionResult, run_id: str
+    ) -> None:
         """
-        Update the Paper Tracker page after a successful extraction:
-          Status       -> s2-extracted
-          AI Status    -> Unverified-AI
-          One Liner    -> result.one_liner
-          Active Themes -> result.active_themes
+        Update the Paper Tracker page after a successful extraction (s2-extracted):
+          Status            -> s2-extracted
+          AI Status         -> Unverified-AI
+          One Liner         -> result.one_liner
+          Active Themes     -> result.active_themes
+          Extraction Version -> EXTRACTION_VERSION
+          Processed At      -> current UTC timestamp
+          Last Run ID       -> run_id
+          Last Error        -> "" (cleared)
         """
         self.notion.update_page(
             page_id=page_id,
@@ -576,6 +674,30 @@ class IngestionEngine:
                 "AI Status": self.notion.select_prop("Unverified-AI"),
                 "One Liner": {"rich_text": self.notion.rich_text(result.one_liner)},
                 "Active Themes": self.notion.multi_select_prop(result.active_themes),
+                "Extraction Version": {
+                    "rich_text": self.notion.rich_text(EXTRACTION_VERSION)
+                },
+                "Processed At": {
+                    "date": {
+                        "start": datetime.now(tz=timezone.utc).isoformat()
+                    }
+                },
+                "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
+                "Last Error": {"rich_text": self.notion.rich_text("")},
+            },
+        )
+
+    def _patch_notion_paper_post_linking(self, page_id: str, run_id: str) -> None:
+        """
+        Update the Paper Tracker page after the LINK stage completes:
+          Status       -> s2b-linked-ai
+          Last Run ID  -> run_id
+        """
+        self.notion.update_page(
+            page_id=page_id,
+            properties={
+                "Status": self.notion.select_prop("s2b-linked-ai"),
+                "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
             },
         )
 
@@ -585,16 +707,24 @@ class IngestionEngine:
         self,
         paper_page_id: str,
         concept: MathObject,
-        hubs: dict[str, str],
+        sb_index: dict[str, list[dict]],
     ) -> None:
         """
         Materialise a single MathObject as a Knowledge Inbox Notion page.
 
-        Properties (metadata only):
+        Properties (metadata):
           - Name, Type, Status, verification_status
           - Source Paper (relation)
           - Source Pages (rich_text)
-          - Hub Suggestions (rich_text -- JSON text, not a live relation)
+          - Suggested Hub (select — spec name, replaces "Hub Suggestions" JSON)
+          - Confidence (number)
+          - Keywords / Prereq Keywords / Downstream Keywords (multi-select)
+          - Source Anchors, Interpretation, Proof Idea, Aliases (rich_text)
+          - Named Tools, Setting (multi-select)
+          - Result Category (select)
+          - Source Quote (rich_text)
+          - Edge Suggestions (rich_text JSON — generated from SB index)
+          - graph_link_status (select = "needs-review" when edge suggestions present)
 
         Page body:
           - heading_2("Assumptions") + paragraphs
@@ -602,17 +732,12 @@ class IngestionEngine:
           - heading_2("Variables") + paragraphs (if present)
           - heading_2("Conclusion") + paragraphs (if present)
           - heading_2("Source Quote") + paragraphs (if present)
+          - heading_2("Interpretation") + paragraphs (if present)
+          - heading_2("Proof Idea") + paragraphs (if present)
+          - heading_2("Edge Suggestions") + paragraphs (if any)
         """
         kind = concept.type
         title = concept.title
-
-        # Hub suggestion stored as JSON text -- never set a live relation.
-        suggested_hub = getattr(concept, "suggested_hub", "")
-        hub_suggestion_text = (
-            json.dumps({"suggested_hub": suggested_hub}, ensure_ascii=False)
-            if suggested_hub
-            else ""
-        )
 
         # Source pages as comma-separated string.
         source_pages_str = (
@@ -621,6 +746,20 @@ class IngestionEngine:
             else ""
         )
 
+        # Generate edge suggestions from Second Brain index (LINK stage).
+        edge_suggestions = self._generate_edge_suggestions(concept, sb_index)
+        edge_suggestions_json = ""
+        if edge_suggestions:
+            # Trim the list until the serialized JSON fits within Notion's limit.
+            # This preserves valid JSON rather than truncating mid-string.
+            for cutoff in range(len(edge_suggestions), 0, -1):
+                candidate = json.dumps(
+                    edge_suggestions[:cutoff], ensure_ascii=False
+                )
+                if len(candidate) <= NOTION_BLOCK_MAX_CHARS:
+                    edge_suggestions_json = candidate
+                    break
+
         properties: dict = {
             "Name": self.notion.title_prop(f"[{kind}] {title}"),
             "Type": self.notion.select_prop(kind),
@@ -628,14 +767,73 @@ class IngestionEngine:
             "verification_status": self.notion.select_prop("unverified"),
             "Source Paper": self.notion.relation_prop([paper_page_id]),
         }
+
         if source_pages_str:
             properties["Source Pages"] = {
                 "rich_text": self.notion.rich_text(source_pages_str)
             }
-        if hub_suggestion_text:
-            properties["Hub Suggestions"] = {
-                "rich_text": self.notion.rich_text(hub_suggestion_text)
+
+        # Suggested Hub — select (spec name replaces "Hub Suggestions" rich_text JSON).
+        if concept.suggested_hub:
+            properties["Suggested Hub"] = self.notion.select_prop(concept.suggested_hub)
+
+        # Confidence — number.
+        properties["Confidence"] = {"number": concept.confidence}
+
+        # Keyword multi-selects.
+        if concept.canonical_keywords:
+            properties["Keywords"] = self.notion.multi_select_prop(
+                concept.canonical_keywords
+            )
+        if concept.prereq_keywords:
+            properties["Prereq Keywords"] = self.notion.multi_select_prop(
+                concept.prereq_keywords
+            )
+        if concept.downstream_keywords:
+            properties["Downstream Keywords"] = self.notion.multi_select_prop(
+                concept.downstream_keywords
+            )
+
+        # Optional rich_text fields.
+        if concept.source_anchors:
+            properties["Source Anchors"] = {
+                "rich_text": self.notion.rich_text(concept.source_anchors)
             }
+        if concept.interpretation:
+            properties["Interpretation"] = {
+                "rich_text": self.notion.rich_text(concept.interpretation)
+            }
+        if concept.proof_idea:
+            properties["Proof Idea"] = {
+                "rich_text": self.notion.rich_text(concept.proof_idea)
+            }
+        if concept.aliases:
+            properties["Aliases"] = {
+                "rich_text": self.notion.rich_text(concept.aliases)
+            }
+        if concept.source_quotes:
+            properties["Source Quote"] = {
+                "rich_text": self.notion.rich_text(concept.source_quotes)
+            }
+
+        # Optional multi-select fields.
+        if concept.named_tools:
+            properties["Named Tools"] = self.notion.multi_select_prop(concept.named_tools)
+        if concept.setting:
+            properties["Setting"] = self.notion.multi_select_prop(concept.setting)
+
+        # Optional select fields.
+        if concept.result_category:
+            properties["Result Category"] = self.notion.select_prop(
+                concept.result_category
+            )
+
+        # Edge suggestions JSON + graph_link_status.
+        if edge_suggestions_json:
+            properties["Edge Suggestions"] = {
+                "rich_text": self.notion.rich_text(edge_suggestions_json)
+            }
+            properties["graph_link_status"] = self.notion.select_prop("needs-review")
 
         new_page = self.notion.create_page(
             parent={"database_id": self.knowledge_inbox_db},
@@ -667,7 +865,70 @@ class IngestionEngine:
             body_blocks.append(self._heading_block("Source Quote"))
             body_blocks.extend(self._paragraph_blocks(concept.source_quotes))
 
+        if concept.interpretation:
+            body_blocks.append(self._heading_block("Interpretation"))
+            body_blocks.extend(self._paragraph_blocks(concept.interpretation))
+
+        if concept.proof_idea:
+            body_blocks.append(self._heading_block("Proof Idea"))
+            body_blocks.extend(self._paragraph_blocks(concept.proof_idea))
+
+        if edge_suggestions:
+            edge_lines = "\n".join(
+                f"• {s['relation_type']}: {s['target_name']}"
+                f" (conf {s['confidence']:.2f}) — {s['rationale']}"
+                for s in edge_suggestions
+            )
+            body_blocks.append(self._heading_block("Edge Suggestions"))
+            body_blocks.extend(self._paragraph_blocks(edge_lines))
+
         self._append_blocks_in_batches(new_page_id, body_blocks)
+
+    # ── Edge suggestion generation (LINK stage) ────────────────────────────────
+
+    def _generate_edge_suggestions(
+        self,
+        concept: MathObject,
+        sb_index: dict[str, list[dict]],
+    ) -> list[dict]:
+        """
+        Match concept keywords against the Second Brain index to produce a list
+        of edge suggestion dicts.
+
+        Each dict has keys: target_concept_id, target_name, relation_type,
+        rationale, confidence.
+
+        Returns at most 10 suggestions to keep the JSON within Notion limits.
+        """
+        suggestions: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()  # (target_page_id, relation_type)
+
+        keyword_edge_map: list[tuple[list[str], str, float]] = [
+            (concept.prereq_keywords, "depends_on", 0.7),
+            (concept.downstream_keywords, "enables", 0.7),
+            (concept.canonical_keywords, "related", 0.5),
+        ]
+
+        for keywords, relation_type, base_confidence in keyword_edge_map:
+            for kw in keywords:
+                for match in sb_index.get(kw.lower(), []):
+                    pair = (match["page_id"], relation_type)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    suggestions.append(
+                        {
+                            "target_concept_id": match["page_id"],
+                            "target_name": match["name"],
+                            "relation_type": relation_type,
+                            "rationale": f"Keyword match: '{kw}'",
+                            "confidence": base_confidence,
+                        }
+                    )
+                    if len(suggestions) >= 10:
+                        return suggestions
+
+        return suggestions
 
     # ── Text chunking ──────────────────────────────────────────────────────────
 
