@@ -80,6 +80,7 @@ cp .env.example .env
 | `NOTION_KNOWLEDGE_INBOX_DB_ID` | 32-char hex database ID |
 | `NOTION_SECOND_BRAIN_DB_ID` | 32-char hex database ID |
 | `NOTION_PROJECTS_DB_ID` | 32-char hex database ID |
+| `NOTION_EDGES_DB_ID` | 32-char hex database ID for Edges DB (optional — required for PromotionEngine) |
 | `OPENAI_API_KEY` | OpenAI API key (`sk-…`) |
 | `KOOFR_USER` | Koofr account email |
 | `KOOFR_APP_PASSWORD` | Koofr WebDAV app password |
@@ -91,8 +92,7 @@ cp .env.example .env
 | `TAGS_REGISTRY_PATH` | Path to `tags_registry.yaml` (default `../tags_registry.yaml`) |
 | `PIPELINE_DB_PATH` | Path to SQLite job ledger (default `/tmp/pipeline/ingestion_jobs.db`) |
 | `EXTRACTION_VERSION` | Schema version string used for idempotency (default `v3`) |
-| `RETRIEVE_CANDIDATES_K` | How many Second Brain candidates to retrieve per concept in Stage 2 (default `30`) |
-| `PIPELINE_TMP_DIR` | Scratch directory for temporary PDF/MD files (default `/tmp/pipeline`) |
+| `SB_CONCEPT_LEVEL` | `Note Level` select value used to query Second Brain Concept pages (default `Concept`) |
 
 ### Required Notion Properties
 
@@ -100,7 +100,7 @@ cp .env.example .env
 
 | Property | Type | Notes |
 |----------|------|-------|
-| `Status` | Select | Values: `s0-inbox`, `s1-process-math`, `s1b-waiting-attachment`, `blocked-tags`, `s2-extracted`, `s3-verified` |
+| `Status` | Select | Values: `s0-inbox`, `s1-process-math`, `s1b-waiting-attachment`, `blocked-tags`, `s2-extracted`, `s2b-linked-ai`, `s3-verified` |
 | `Zotero URI` | Rich Text | e.g. `zotero://select/items/XXXXXXXX` |
 | `Tags` | Multi-select | Must match entries in `tags_registry.yaml` |
 | `primary_pdf_filename` | Rich Text | Optional — filename to prefer when zip contains multiple PDFs |
@@ -109,24 +109,52 @@ cp .env.example .env
 | `One Liner` | Rich Text | Written by pipeline after extraction |
 | `Active Themes` | Multi-select | Written by pipeline after extraction |
 | `AI Status` | Select | Written by pipeline; value: `Unverified-AI` |
+| `Extraction Version` | Rich Text | e.g. `v3` — schema version used for this extraction |
+| `Processed At` | Date | UTC timestamp of last successful pipeline run |
+| `Last Run ID` | Rich Text | 8-char hex run ID for log correlation |
+| `Last Error` | Rich Text | Cleared on success; set to error message on failure |
+| `Knowledge Items` | Relation → Knowledge Inbox | Optional back-link |
 
 #### Knowledge Inbox DB
 
 | Property | Type | Notes |
 |----------|------|-------|
 | `Name` | Title | Set to `[Type] Title` |
-| `Type` | Select | Values: `Definition`, `Theorem`, `Lemma`, `Algorithm`, `Assumption`, `Proof`, `ProofTechnique` |
-| `Status` | Select | Initial value: `Inbox` |
-| `verification_status` | Select | Values: `unverified`, `verified`, `rejected` |
-| `graph_link_status` | Select | Values: `unlinked`, `linked-ai`, `needs-review` — written by Stage 3 |
+| `Type` | Select | Values: `Definition`, `Theorem`, `Lemma`, `Algorithm`, `Assumption`, `Proof` |
+| `Status` | Select | Values: `Inbox`, `Reviewed`, `Promoted`, `Dropped` |
+| `verification_status` | Select | Values: `unverified`, `verified`, `needs-fix` |
+| `graph_link_status` | Select | Values: `needs-review`, `verified-links` — set during LINK stage |
 | `Source Paper` | Relation → Paper Tracker | Back-link to the source paper |
 | `Source Pages` | Rich Text | Comma-separated page numbers |
-| `Hub Suggestions` | Rich Text | JSON string `{"suggested_hub": "…"}` — text only, no live relation |
-| `canonical_keywords` | Rich Text | Comma-separated list: what this concept IS |
-| `prereq_keywords` | Rich Text | Comma-separated list: what this concept requires |
-| `downstream_keywords` | Rich Text | Comma-separated list: what this concept enables |
-| `candidate_matches` | Rich Text | JSON array of top-K Second Brain candidate records (Stage 2) |
-| `edge_suggestions` | Rich Text | JSON dict of proposed graph edges per type (Stage 3); text only, no live relations |
+| `Suggested Hub` | Select | Suggested knowledge hub from ALLOWED_HUBS (replaces `Hub Suggestions`) |
+| `Confidence` | Number | Extraction confidence 0–1 |
+| `Keywords` | Multi-select | Primary keywords identifying this concept |
+| `Prereq Keywords` | Multi-select | Keywords of prerequisite concepts |
+| `Downstream Keywords` | Multi-select | Keywords of concepts this enables |
+| `Source Anchors` | Rich Text | Section/equation refs, e.g. `Section 3.2; Eq. (12)` |
+| `Interpretation` | Rich Text | Plain-English meaning |
+| `Proof Idea` | Rich Text | Optional proof sketch |
+| `Aliases` | Rich Text | Alternative names for this concept |
+| `Named Tools` | Multi-select | Named tools used, e.g. `Banach fixed-point` |
+| `Setting` | Multi-select | e.g. `finite_state`, `continuous`, `graphon`, `ergodic`, `common_noise` |
+| `Result Category` | Select | `existence`, `uniqueness`, `convergence`, `stability`, `approximation` |
+| `Source Quote` | Rich Text | Verbatim quote ≤ 25 words |
+| `Edge Suggestions` | Rich Text | JSON array of AI-suggested edges; read by PromotionEngine |
+| `Promotion Target` | Relation → Second Brain | Set by PromotionEngine when concept is promoted |
+
+#### Edges DB (create manually, then set `NOTION_EDGES_DB_ID`)
+
+| Property | Type | Notes |
+|----------|------|-------|
+| `Name` | Title | Auto: `"A —depends_on→ B"` |
+| `From Concept` | Relation → Second Brain | |
+| `To Concept` | Relation → Second Brain | |
+| `Relation Type` | Select | `depends_on`, `enables`, `generalizes`, `special_case_of`, `related` |
+| `Rationale` | Rich Text | |
+| `Confidence` | Number | |
+| `Source Papers` | Relation → Paper Tracker | |
+| `Created By` | Select | `AI-suggested`, `Human-verified` |
+| `Status` | Select | `suggested`, `verified`, `rejected` |
 
 ---
 
@@ -173,7 +201,10 @@ s1-process-math   ◄── Trigger: set this manually or via Notero webhook
     │
     ├─► blocked-tags             (no valid tags — human must fix tags)
     │
-    └─► s2-extracted             (pipeline completed successfully)
+    └─► s2-extracted             (concepts extracted and written to Knowledge Inbox)
+            │
+            ▼
+        s2b-linked-ai            (edge suggestions written; awaiting human review)
             │
             ▼
         s3-verified              (human has reviewed the extracted concepts)
@@ -186,7 +217,52 @@ s1-process-math   ◄── Trigger: set this manually or via Notero webhook
 | `s1b-waiting-attachment` | Pipeline | Zip file not found on Koofr; will retry |
 | `blocked-tags` | Pipeline | No valid tags; human must add tags and reset to `s1-process-math` |
 | `s2-extracted` | Pipeline | All concepts extracted and written to Knowledge Inbox |
+| `s2b-linked-ai` | Pipeline | Edge suggestions written to Knowledge Inbox; awaiting human review |
 | `s3-verified` | Human | Extracted concepts have been reviewed |
+
+---
+
+## Human Verification & Promotion
+
+After the pipeline sets a paper to `s2b-linked-ai`, the human workflow is:
+
+1. Open the **Knowledge Inbox** database and review each concept page.
+2. For correct concepts: set `verification_status = verified`.
+3. For concepts needing fixes: set `verification_status = needs-fix` and edit.
+4. The **Promotion Engine** runs every 30 minutes and picks up any page where
+   `verification_status = verified` AND `graph_link_status = needs-review`.
+
+### What the Promotion Engine does
+
+For each verified concept:
+
+1. **Creates a Second Brain `Concept` page** (or patches an existing one if
+   `Promotion Target` is already set) — transferring `Interpretation`,
+   `Proof Idea`, `Named Tools`, `Aliases`, and `Sources`.
+2. **Creates Edges DB rows** for each entry in the `Edge Suggestions` JSON
+   property, linking `From Concept` → `To Concept` with the recorded
+   `Relation Type`, `Rationale`, and `Confidence`.
+3. **Updates the Knowledge Inbox page**:
+   `graph_link_status → verified-links`, `Status → Promoted`.
+
+### Edges DB
+
+The Edges DB stores directed semantic edges between Second Brain concepts.
+Each row captures:
+
+| Field | Value |
+|-------|-------|
+| `From Concept` | Source Second Brain page |
+| `To Concept` | Target Second Brain page |
+| `Relation Type` | `depends_on`, `enables`, `generalizes`, `special_case_of`, `related` |
+| `Rationale` | Keyword match or human note |
+| `Confidence` | 0–1 (AI-suggested start at 0.5–0.7) |
+| `Created By` | `AI-suggested` or `Human-verified` |
+| `Status` | `suggested` → `verified` (human approves) or `rejected` |
+
+To enable the Promotion Engine, create the Edges DB in Notion manually
+(schema in "Required Notion Properties" above) and add its database ID to
+`.env` as `NOTION_EDGES_DB_ID`.
 
 ---
 

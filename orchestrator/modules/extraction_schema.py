@@ -20,6 +20,7 @@ Changelog:
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
@@ -54,6 +55,17 @@ EDGE_CAPS: dict[str, int] = {
     "special_case_of": 2,
     "related": 5,
 }
+# Bump this whenever the extraction schema or system prompt changes.
+# Can be overridden via the EXTRACTION_VERSION environment variable.
+# Changelog:
+#   v1 — original schema: type, name, content, assumptions, suggested_hub
+#   v2 — hardened schema: type, title, statement_latex, assumptions, variables,
+#         conclusion, source_pages, source_quotes, confidence; hub_suggestions
+#         stored as text only; verification_status added to Knowledge Inbox.
+#   v3 — extended schema: suggested_hub (proper field), interpretation, proof_idea,
+#         source_anchors, named_tools, setting, result_category,
+#         canonical_keywords, prereq_keywords, downstream_keywords, aliases.
+EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
 
 
 # ── Stage 1 sub-models ─────────────────────────────────────────────────────────
@@ -124,6 +136,55 @@ class MathObject(BaseModel):
     downstream_keywords: list[str] = Field(
         default_factory=list,
         description="5–15 keywords for concepts this result ENABLES or supports.",
+    )
+
+    # ── Extended fields (v3) ───────────────────────────────────────────────────
+
+    suggested_hub: str = Field(
+        default="",
+        description="Suggested knowledge hub from ALLOWED_HUBS.",
+    )
+    interpretation: str = Field(
+        default="",
+        description="Plain-English meaning of this mathematical object.",
+    )
+    proof_idea: str = Field(
+        default="",
+        description="Brief sketch of the proof technique (if applicable).",
+    )
+    source_anchors: str = Field(
+        default="",
+        description="Section/equation references, e.g. 'Section 3.2; Eq. (12)'.",
+    )
+    named_tools: list[str] = Field(
+        default_factory=list,
+        description="Named mathematical tools used, e.g. 'Banach fixed-point'.",
+    )
+    setting: list[str] = Field(
+        default_factory=list,
+        description="Mathematical setting tags, e.g. 'finite_state', 'continuous'.",
+    )
+    result_category: str = Field(
+        default="",
+        description=(
+            "One of: existence, uniqueness, convergence, stability, approximation."
+        ),
+    )
+    canonical_keywords: list[str] = Field(
+        default_factory=list,
+        description="Primary keywords identifying this concept.",
+    )
+    prereq_keywords: list[str] = Field(
+        default_factory=list,
+        description="Keywords of prerequisite concepts this object builds on.",
+    )
+    downstream_keywords: list[str] = Field(
+        default_factory=list,
+        description="Keywords of concepts this object enables or is used by.",
+    )
+    aliases: str = Field(
+        default="",
+        description="Alternative names for this concept.",
     )
 
     @field_validator("type")
