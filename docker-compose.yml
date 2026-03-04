@@ -11,11 +11,14 @@ version: "3.9"
 #
 # Volumes
 # -------
-#   tmp_storage   Ephemeral scratch space for downloaded PDFs / Markdown files.
-#                 Both orchestrator and marker-api mount it so the PDF can be
-#                 written by the orchestrator and read by marker-api.
-#   graph_static  Persistent volume shared between orchestrator (writer) and
-#                 graph-server (reader) for the generated HTML graph.
+#   tmp_storage     Ephemeral scratch space for downloaded PDFs / Markdown files.
+#                   Both orchestrator and marker-api mount it so the PDF can be
+#                   written by the orchestrator and read by marker-api.
+#   graph_static    Persistent volume shared between orchestrator (writer) and
+#                   graph-server (reader) for the generated HTML graph.
+#   marker_models   Persistent cache for HuggingFace / surya / texify model
+#                   weights downloaded by marker-pdf on first startup.
+#                   Survives image rebuilds — models are never re-downloaded.
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -44,12 +47,21 @@ services:
 
   # ── 2. Marker OCR API ─────────────────────────────────────────────────────
   marker-api:
-    # Official datalab-to/marker image exposes a REST API on port 8080
-    image: ghcr.io/datalab-to/marker:latest
+    # Built locally from marker-pdf (PyPI) — no registry auth required.
+    # POST /marker  {"filepath": "<path on the shared tmp_storage volume>"}
+    build:
+      context: ./marker-api
+      dockerfile: Dockerfile
     container_name: marker-api
     restart: unless-stopped
+    environment:
+      TORCH_DEVICE: "cpu"          # change to "cuda" if you have a GPU
+      # Point all HuggingFace / surya / texify downloads at the named volume
+      # so model weights survive container rebuilds.
+      HF_HOME: "/model_cache"
     volumes:
       - tmp_storage:/tmp/pipeline
+      - marker_models:/model_cache
     ports:
       # Expose for local debugging; internal traffic uses Docker network
       - "8080:8080"
@@ -77,6 +89,8 @@ volumes:
   tmp_storage:
     driver: local
   graph_static:
+    driver: local
+  marker_models:
     driver: local
 
 # ── Internal network ──────────────────────────────────────────────────────────

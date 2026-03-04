@@ -4,7 +4,7 @@ modules/arxiv_sniper.py — Module 2: ArXiv Sniper
 Daily job (06:00) that:
 
   1. Queries export.arxiv.org for configurable mathematical keywords.
-  2. Sends each abstract to Claude 3.5 Sonnet for a relevance score (1–10).
+  2. Sends each abstract to ChatGPT (gpt-4o) for a relevance score (1–10).
   3. Creates a Notion "Paper Tracker" row (Status = s0-inbox, Tag = Automated-Radar)
      for every paper scoring >= threshold (default 8).
 
@@ -21,13 +21,13 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree
 
-import anthropic
+import openai
 
 from .notion_client_wrapper import NotionClientWrapper
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+OPENAI_MODEL = "gpt-4o"
 
 # ── Relevance scoring prompt ──────────────────────────────────────────────────
 RELEVANCE_SYSTEM_PROMPT = """You are a research relevance scorer for a PhD student specialising in Mean Field Games, McKean-Vlasov stochastic control, Hamilton-Jacobi-Bellman PDEs, and related applied mathematics.
@@ -56,7 +56,7 @@ class ArXivSniper:
 
     def __init__(self) -> None:
         self.notion = NotionClientWrapper()
-        self.claude = anthropic.Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
+        self.openai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self.paper_tracker_db = os.environ["NOTION_PAPER_TRACKER_DB_ID"]
 
         raw_keywords = os.environ.get(
@@ -166,22 +166,22 @@ class ArXivSniper:
         logger.info("ArXiv: score >= %d — creating Notion row …", self.threshold)
         self._create_notion_row(entry, score, justification)
 
-    # ── Claude scoring ────────────────────────────────────────────────────────
+    # ── OpenAI scoring ────────────────────────────────────────────────────────
 
     def _score_relevance(self, title: str, abstract: str) -> tuple[int, str]:
-        """Ask Claude to score relevance; return (score, justification)."""
-        message = self.claude.messages.create(
-            model=CLAUDE_MODEL,
+        """Ask ChatGPT to score relevance; return (score, justification)."""
+        response = self.openai.chat.completions.create(
+            model=OPENAI_MODEL,
             max_tokens=256,
-            system=RELEVANCE_SYSTEM_PROMPT,
             messages=[
+                {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"Title: {title}\n\nAbstract: {abstract}",
-                }
+                },
             ],
         )
-        raw = message.content[0].text.strip()
+        raw = response.choices[0].message.content.strip()
 
         # Strip accidental markdown fences
         if raw.startswith("```"):

@@ -4,8 +4,10 @@ APScheduler==3.10.4
 # ── Notion API ────────────────────────────────────────────────────────────────
 notion-client==2.2.1
 
-# ── Anthropic (Claude) ────────────────────────────────────────────────────────
-anthropic==0.25.1
+# ── OpenAI (ChatGPT) ─────────────────────────────────────────────────────────
+# 1.52.0+ is required — earlier versions pass `proxies` to httpx which was
+# removed in httpx 0.28.0, causing a TypeError on client instantiation.
+openai==1.65.2
 
 # ── WebDAV (Koofr) ───────────────────────────────────────────────────────────
 webdavclient3==3.14.6

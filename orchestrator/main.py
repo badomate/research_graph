@@ -91,7 +91,7 @@ REQUIRED_ENV_VARS = [
     "NOTION_KNOWLEDGE_INBOX_DB_ID",
     "NOTION_SECOND_BRAIN_DB_ID",
     "NOTION_PROJECTS_DB_ID",
-    "CLAUDE_API_KEY",
+    "OPENAI_API_KEY",
     "KOOFR_USER",
     "KOOFR_APP_PASSWORD",
 ]
@@ -117,7 +117,7 @@ def main() -> None:
     # ── Module 1: Ingestion Engine — every 10 minutes ─────────────────────────
     scheduler.add_job(
         run_ingestion,
-        trigger=IntervalTrigger(minutes=10),
+        trigger=IntervalTrigger(minutes=1),
         id="ingestion",
         name="Core Ingestion Engine",
         max_instances=1,

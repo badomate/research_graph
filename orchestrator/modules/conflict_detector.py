@@ -5,7 +5,7 @@ Polls the "Knowledge Inbox" for theorems that have been manually approved
 to the "Second Brain" DB.  For each newly approved theorem:
 
   1. Fetch all existing theorems in the Second Brain linked to the same topic.
-  2. Send the new theorem + existing theorems to Claude to detect mathematical
+  2. Send the new theorem + existing theorems to ChatGPT to detect mathematical
      contradictions or relaxations of assumptions.
   3. If a conflict is found, append a warning callout block to the Notion page.
 """
@@ -16,13 +16,13 @@ import json
 import logging
 import os
 
-import anthropic
+import openai
 
 from .notion_client_wrapper import NotionClientWrapper
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+OPENAI_MODEL = "gpt-4o"
 
 # ── Conflict detection prompt ─────────────────────────────────────────────────
 CONFLICT_SYSTEM_PROMPT = """You are a rigorous mathematical consistency checker for a PhD researcher in applied mathematics.
@@ -49,7 +49,7 @@ class ConflictDetector:
 
     def __init__(self) -> None:
         self.notion = NotionClientWrapper()
-        self.claude = anthropic.Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
+        self.openai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
 
@@ -132,7 +132,7 @@ class ConflictDetector:
             result.append({"label": label, "content": content})
         return result
 
-    # ── Claude conflict detection ─────────────────────────────────────────────
+    # ── OpenAI conflict detection ─────────────────────────────────────────────
 
     def _detect_conflict(
         self,
@@ -147,13 +147,15 @@ class ConflictDetector:
             f"NEW ITEM:\n[{new_label}]\n{new_content}\n\n"
             f"EXISTING ITEMS:\n{existing_text}"
         )
-        message = self.claude.messages.create(
-            model=CLAUDE_MODEL,
+        response = self.openai.chat.completions.create(
+            model=OPENAI_MODEL,
             max_tokens=1024,
-            system=CONFLICT_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[
+                {"role": "system", "content": CONFLICT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
         )
-        raw = message.content[0].text.strip()
+        raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
