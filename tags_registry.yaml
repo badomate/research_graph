@@ -1,0 +1,219 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# tags_registry.yaml — Machine-readable tag registry for the paper pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# FORMAT
+# ------
+# Each tag entry has the following fields:
+#
+#   id                  (required) Canonical tag identifier, e.g. "d-mfg"
+#                       Must match pattern: ^(d|m|k)-[a-z0-9-]+$
+#                       Prefix meanings:
+#                         d = domain       (research domain / subject area)
+#                         m = method       (mathematical or computational method)
+#                         k = knowledge    (knowledge-type or epistemic category)
+#
+#   prefix              (required) One of: d, m, k
+#
+#   name                (required) Short human-readable label, e.g. "Mean Field Games"
+#
+#   definition          (required) One to three sentence precise definition.
+#
+#   inclusion_criteria  (required) What content should receive this tag.
+#
+#   exclusion_criteria  (required) What content should NOT receive this tag.
+#
+#   deprecated          (optional, default false) If true, the tag is retired.
+#                       Use synonym_mappings to redirect to a replacement.
+#
+#   synonyms            (optional) List of alternate strings that map to this id.
+#                       The linter will auto-correct these to the canonical id.
+#
+# HOW TO ADD A TAG
+# ----------------
+#   1. Choose the appropriate prefix (d/m/k).
+#   2. Pick a short, hyphen-separated id (all lowercase, digits, hyphens).
+#   3. Fill in all required fields.
+#   4. Add any known synonyms.
+#   5. Run `python -c "from orchestrator.modules.tag_linter import TagRegistry; TagRegistry()"` 
+#      to validate the file loads without errors.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+tags:
+
+  # ── Domain tags (d-) ────────────────────────────────────────────────────────
+
+  - id: d-mfg
+    prefix: d
+    name: Mean Field Games
+    definition: >
+      The study of strategic decision-making in large populations of
+      interacting agents, where each agent optimises against the statistical
+      distribution of the rest of the population (the "mean field").
+    inclusion_criteria: >
+      Papers that explicitly formulate or analyse a mean field game equilibrium,
+      including finite-player approximations and applications.
+    exclusion_criteria: >
+      Papers on single-agent optimal control without population interaction;
+      general game theory without mean field limit.
+    synonyms:
+      - MFG
+      - mean-field games
+      - mean field game
+
+  - id: d-mkv
+    prefix: d
+    name: McKean-Vlasov Processes
+    definition: >
+      Stochastic differential equations whose drift and diffusion coefficients
+      depend on the law (marginal distribution) of the solution process itself.
+    inclusion_criteria: >
+      Papers studying McKean-Vlasov SDEs, propagation of chaos, or
+      distribution-dependent SDEs in any dimension.
+    exclusion_criteria: >
+      Standard Itô SDEs with no distributional dependence; pure mean field
+      game papers without an explicit McKean-Vlasov SDE.
+    synonyms:
+      - McKean Vlasov
+      - distribution-dependent SDE
+      - dd-SDE
+
+  - id: d-stochastic-control
+    prefix: d
+    name: Stochastic Control
+    definition: >
+      Optimisation problems where a decision-maker controls a stochastic
+      dynamical system to minimise or maximise an expected cost/reward functional.
+    inclusion_criteria: >
+      Papers on stochastic optimal control, LQG control, risk-sensitive control,
+      or related Hamilton-Jacobi-Bellman analysis.
+    exclusion_criteria: >
+      Deterministic optimal control without stochastic perturbations;
+      reinforcement learning papers without explicit stochastic control formulation.
+    synonyms:
+      - optimal stochastic control
+      - stochastic optimisation
+
+  - id: d-pde-analysis
+    prefix: d
+    name: PDE Analysis
+    definition: >
+      Mathematical analysis of partial differential equations, including
+      existence, uniqueness, regularity, and qualitative properties of solutions.
+    inclusion_criteria: >
+      Papers whose primary contribution is proving analytical properties of PDEs
+      (elliptic, parabolic, Hamilton-Jacobi, Fokker-Planck, etc.).
+    exclusion_criteria: >
+      Purely numerical PDE papers; ODEs without distributional or multi-variable
+      structure.
+    synonyms:
+      - partial differential equations
+      - PDEs
+
+  # ── Method tags (m-) ─────────────────────────────────────────────────────────
+
+  - id: m-hjb
+    prefix: m
+    name: Hamilton-Jacobi-Bellman Equation
+    definition: >
+      The second-order nonlinear PDE that characterises the value function of
+      an optimal control problem via the dynamic programming principle.
+    inclusion_criteria: >
+      Papers that derive, analyse, or numerically solve an HJB equation as a
+      core technical contribution.
+    exclusion_criteria: >
+      Papers that only mention HJB in passing as background; purely stochastic
+      process papers without a control component.
+    synonyms:
+      - HJB
+      - HJB equation
+      - Hamilton Jacobi Bellman
+
+  - m-fp:
+    prefix: m
+    id: m-fp
+    name: Fokker-Planck Equation
+    definition: >
+      The parabolic PDE governing the time evolution of the probability density
+      of a diffusion process; the forward Kolmogorov equation.
+    inclusion_criteria: >
+      Papers where the Fokker-Planck (or Kolmogorov forward) equation appears
+      as a key equation describing population or particle evolution.
+    exclusion_criteria: >
+      Papers using only the backward Kolmogorov equation; purely statistical
+      papers without a diffusion process model.
+    synonyms:
+      - Fokker Planck
+      - FP equation
+      - Kolmogorov forward equation
+
+  - id: m-monotone-schemes
+    prefix: m
+    name: Monotone Numerical Schemes
+    definition: >
+      Finite-difference or finite-element discretisation methods that preserve
+      the monotonicity of the continuous operator, guaranteeing convergence to
+      the viscosity solution.
+    inclusion_criteria: >
+      Papers constructing or analysing monotone, consistent, stable
+      approximation schemes for nonlinear PDEs.
+    exclusion_criteria: >
+      High-order spectral methods or machine-learning-based PDE solvers that
+      do not rely on monotonicity arguments.
+    synonyms:
+      - monotone scheme
+      - monotone finite difference
+
+  # ── Knowledge-type tags (k-) ─────────────────────────────────────────────────
+
+  - id: k-existence-uniqueness
+    prefix: k
+    name: Existence and Uniqueness Results
+    definition: >
+      Mathematical results that establish that a given equation or problem has
+      at least one solution (existence) and that this solution is the only one
+      satisfying the given conditions (uniqueness).
+    inclusion_criteria: >
+      Papers whose main theorems assert well-posedness: existence, uniqueness,
+      or both, for PDEs, SDEs, or equilibrium problems.
+    exclusion_criteria: >
+      Purely numerical papers; papers focused on regularity rather than
+      well-posedness.
+    synonyms:
+      - well-posedness
+      - wellposedness
+      - existence uniqueness
+
+  - id: k-regularity
+    prefix: k
+    name: Regularity Theory
+    definition: >
+      The study of smoothness properties of solutions to differential equations,
+      including Sobolev, Hölder, and classical regularity estimates.
+    inclusion_criteria: >
+      Papers proving regularity estimates (gradient bounds, Schauder estimates,
+      Sobolev embeddings) for solutions of PDEs or SDEs.
+    exclusion_criteria: >
+      Papers where regularity is assumed rather than proved;
+      purely numerical or algorithmic papers.
+    synonyms:
+      - regularity estimates
+      - smoothness
+
+  - id: k-convergence
+    prefix: k
+    name: Convergence Results
+    definition: >
+      Mathematical results establishing that a sequence of approximations,
+      iterates, or discretisations converges to a target object in a specified
+      norm or topology.
+    inclusion_criteria: >
+      Papers proving convergence rates or qualitative convergence for numerical
+      schemes, mean field limits, or iterative algorithms.
+    exclusion_criteria: >
+      Papers that only conjecture convergence without proof; experimental
+      convergence plots without theoretical guarantees.
+    synonyms:
+      - convergence rate
+      - convergence analysis

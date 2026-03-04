@@ -1,80 +1,124 @@
 """
-modules/ingestion.py — Module 1: Core Ingestion Engine
-───────────────────────────────────────────────────────
-Pipeline for each paper in the 'Paper Tracker' Notion DB with Status == 's0-inbox':
+modules/ingestion.py - Module 1: Core Ingestion Engine
+-------------------------------------------------------
+Pipeline for each paper in the 'Paper Tracker' Notion DB with Status == 's1-process-math':
 
-  1. Download the PDF from Koofr via WebDAV.
-  2. Send the PDF to the local marker-api container (PDF → Markdown + LaTeX).
-  3. Dynamically fetch "Hub" pages from the Second Brain DB.
-  4. Send the Markdown + Hub list to GPT-4o (strict JSON mode) to extract
-     structured metadata and mathematical concepts.
-  5. Patch the Paper Tracker Notion row to status 's1-skim'.
-  6. For each extracted concept, create a page in the "Knowledge Inbox" DB
-     with metadata-only properties, then append the heavy LaTeX content and
-     assumptions as page-body blocks (respecting Notion's 2000-char limit).
+  PREFLIGHT GATES
+  ---------------
+  1. Parse Zotero item key from "Zotero URI" rich_text property.
+  2. Check Koofr zip exists ({key}.zip); if missing set status "s1b-waiting-attachment".
+  3. Download the zip, extract the largest PDF (or "primary_pdf_filename" if set).
+  4. Compute pdf_sha256; store in "PDF SHA256" property.
+  5. Idempotency check via JobLedger; if already done set status "s2-extracted" and skip.
 
-Design constraints honoured:
+  TAG COMPLETENESS GATE
+  ---------------------
+  6. Read "Tags" multi-select; run TagLinter.
+  7. If no valid tags: set status "blocked-tags", store lint report, return.
+
+  EXTRACTION
+  ----------
+  8. Convert PDF to Markdown via marker-api (tenacity retry).
+  9. Extract structured knowledge via GPT-4o (new schema with type, title,
+     statement_latex, assumptions, variables, conclusion, source_pages,
+     source_quotes, confidence).
+  10. Validate with Pydantic; attempt one repair pass on failure.
+  11. Run latex_sanity_check; downgrade confidence on failure.
+  12. Patch Paper Tracker row to status "s2-extracted".
+  13. Create Knowledge Inbox pages with verification_status and hub_suggestions.
+
+Design constraints:
   - Notion text blocks are hard-capped at 1900 chars (safe margin below 2000).
-  - 'content' and 'assumptions' are NEVER stored as Notion page properties.
-  - Hub suggestions are validated against live Second Brain data every run.
-  - OpenAI is called with response_format={"type": "json_object"} for
-    guaranteed valid JSON — no fence-stripping hacks required.
-  - Notion's 100-block-per-append limit is respected via batched writes.
+  - Hub suggestions stored as text only - never set Parent Hub relation automatically.
+  - JobLedger tracks milestones for idempotency and restart safety.
+  - All Koofr / Marker / OpenAI calls wrapped with tenacity exponential backoff.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import openai
 import requests
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+)
 from webdav3.client import Client as WebDAVClient
 
+from .extraction_schema import (
+    EXTRACTION_VERSION,
+    ExtractionResult,
+    MathObject,
+    latex_sanity_check,
+    validate_extraction,
+)
+from .job_ledger import JobLedger
 from .notion_client_wrapper import NotionClientWrapper
+from .tag_linter import TagLinter, lint_report_to_text
 
 logger = logging.getLogger(__name__)
 
-# ── Scratch directory inside the Docker volume ────────────────────────────────
+# ── Scratch directory inside the Docker volume ─────────────────────────────────
 TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
 
-# ── OpenAI model ──────────────────────────────────────────────────────────────
+# ── OpenAI model ───────────────────────────────────────────────────────────────
 OPENAI_MODEL = "gpt-4o"
 
-# ── Notion hard limits ────────────────────────────────────────────────────────
+# ── Notion hard limits ─────────────────────────────────────────────────────────
 # Notion's API rejects any rich_text content exceeding 2000 characters.
 # We use 1900 as our safe ceiling to avoid off-by-one edge cases.
 NOTION_BLOCK_MAX_CHARS = 1900
 # Notion allows at most 100 child blocks per append_block_children call.
 NOTION_BLOCKS_PER_REQUEST = 100
 
-# ── System prompt template ────────────────────────────────────────────────────
-# [INJECT_DYNAMIC_HUBS_HERE] is replaced at runtime with the live hub list
-# fetched from the Second Brain DB before every OpenAI call.
+# ── Zotero key regex ───────────────────────────────────────────────────────────
+# Maximum number of validation errors to include in the repair prompt.
+MAX_REPAIR_ERRORS = 5
+
+_ZOTERO_KEY_RE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{8})(?![A-Z0-9])")
+
+# ── System prompt template ─────────────────────────────────────────────────────
+# [INJECT_DYNAMIC_HUBS_HERE] is replaced at runtime with the live hub list.
 EXTRACTION_SYSTEM_PROMPT = """\
-You are a highly rigorous researcher in applied mathematics. Process the Markdown paper and extract strictly factual mathematical structures.
+You are a highly rigorous researcher in applied mathematics. Process the Markdown paper \
+and extract strictly factual mathematical structures.
+
+Rules:
 1. Extract exact mathematical formulations. Do not paraphrase.
 2. Format variables and equations in valid LaTeX ($ for inline, $$ for display).
-3. Explicitly extract boundary conditions or assumptions. If none, write "None explicitly stated."
-4. Assign a `suggested_hub` from the ALLOWED_HUBS list. Do not invent hubs. If none fit, use "Uncategorized".
+3. Explicitly extract boundary conditions or assumptions. If none, write \
+"None explicitly stated."
+4. For hub suggestions: provide descriptive text only from ALLOWED_HUBS. \
+Do not invent hubs. If none fit, use "Uncategorized".
 
 ALLOWED_HUBS: [INJECT_DYNAMIC_HUBS_HERE]
 
-You must respond in valid JSON matching this exact schema:
+You MUST respond in valid JSON matching this EXACT schema:
 {
-  "one_liner": "string",
+  "one_liner": "string - one sentence summary",
   "active_themes": ["string"],
   "extracted_concepts": [
     {
-      "type": "Definition | Theorem | Assumption | Lemma | Algorithm | Proof",
-      "name": "string",
-      "content": "string (valid LaTeX)",
-      "assumptions": "string",
-      "suggested_hub": "string (must match ALLOWED_HUBS)"
+      "type": "Definition | Theorem | Lemma | Algorithm | Assumption | Proof",
+      "title": "string - short label or theorem number",
+      "statement_latex": "string - exact statement in valid LaTeX",
+      "assumptions": "string - boundary conditions or None explicitly stated.",
+      "variables": "string - comma-separated variable descriptions",
+      "conclusion": "string - result in plain English",
+      "source_pages": [1, 2],
+      "source_quotes": "optional verbatim quote max 25 words or null",
+      "confidence": 0.95,
+      "suggested_hub": "string from ALLOWED_HUBS"
     }
   ]
 }
@@ -82,7 +126,7 @@ You must respond in valid JSON matching this exact schema:
 
 
 class IngestionEngine:
-    """Module 1: Core Ingestion Engine (Notion → WebDAV → Marker → OpenAI → Notion)."""
+    """Module 1: Core Ingestion Engine (Notion -> WebDAV -> Marker -> OpenAI -> Notion)."""
 
     def __init__(self) -> None:
         self.notion = NotionClientWrapper()
@@ -93,8 +137,10 @@ class IngestionEngine:
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
         self.koofr_base = os.environ.get("KOOFR_PDF_PATH", "/zotero")
+        self._ledger = JobLedger()
+        self._tag_linter = TagLinter()
 
-    # ── WebDAV client factory ─────────────────────────────────────────────────
+    # ── WebDAV client factory ──────────────────────────────────────────────────
 
     @staticmethod
     def _build_webdav_client() -> WebDAVClient:
@@ -105,23 +151,22 @@ class IngestionEngine:
         }
         return WebDAVClient(options)
 
-    # ── Entry point ───────────────────────────────────────────────────────────
+    # ── Entry point ────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         """
-        Poll 'Paper Tracker' for s0-inbox papers and run the full ingestion
-        pipeline on each one.
+        Poll 'Paper Tracker' for s1-process-math papers and run the full
+        ingestion pipeline on each one.
 
-        Hubs are fetched once per run() invocation so that:
-          (a) Every paper in the same batch uses a consistent hub snapshot.
-          (b) We avoid a redundant Notion API call for every single concept.
+        Hubs are fetched once per run() invocation so that every paper in the
+        same batch uses a consistent hub snapshot.
         """
-        logger.info("Ingestion: polling for s0-inbox papers …")
+        logger.info("Ingestion: polling for s1-process-math papers ...")
         pages = self.notion.query_database(
             self.paper_tracker_db,
             filter={
                 "property": "Status",
-                "status": {"equals": "s0-inbox"},
+                "status": {"equals": "s1-process-math"},
             },
         )
         logger.info("Ingestion: found %d paper(s) to process.", len(pages))
@@ -129,7 +174,6 @@ class IngestionEngine:
         if not pages:
             return
 
-        # Fetch the live hub registry once for all papers in this batch.
         hubs: dict[str, str] = self._fetch_allowed_hubs()
         logger.info(
             "Ingestion: loaded %d hub(s) from Second Brain: %s",
@@ -143,23 +187,17 @@ class IngestionEngine:
             except Exception:
                 logger.exception("Failed to process page %s", page["id"])
 
-    # ── Hub fetching ──────────────────────────────────────────────────────────
+    # ── Hub fetching ───────────────────────────────────────────────────────────
 
     def _fetch_allowed_hubs(self) -> dict[str, str]:
         """
-        Query the Second Brain DB for all pages where the 'Note Level' Select
-        property equals 'Hub'.
+        Query the Second Brain DB for Hub pages.
 
-        Returns:
-            dict mapping hub name (str) → Notion page ID (str).
-
-        This dict serves two purposes:
-          1. Injecting hub names into the OpenAI system prompt so the model
-             can pick from real, user-defined categories.
-          2. Resolving a concept's suggested_hub string back to a page ID
-             for the 'Parent Hub' Relation property.
+        Returns
+        -------
+        dict mapping hub name -> Notion page ID.
         """
-        logger.debug("Ingestion: fetching Hub pages from Second Brain …")
+        logger.debug("Ingestion: fetching Hub pages from Second Brain ...")
         pages = self.notion.query_database(
             self.second_brain_db,
             filter={
@@ -167,67 +205,138 @@ class IngestionEngine:
                 "select": {"equals": "Hub"},
             },
         )
-
         hubs: dict[str, str] = {}
         for page in pages:
             name = self._get_page_title(page)
             if name:
                 hubs[name] = page["id"]
-
         return hubs
 
-    # ── Per-paper pipeline ────────────────────────────────────────────────────
+    # ── Per-paper pipeline ─────────────────────────────────────────────────────
 
     def _process_paper(self, page: dict, hubs: dict[str, str]) -> None:
         """
-        Full ingestion pipeline for a single paper page:
-          1. Download PDF from Koofr via WebDAV.
-          2. Convert PDF → Markdown via marker-api.
-          3. Extract structured concepts via OpenAI GPT-4o (strict JSON mode).
-          4. Patch the Paper Tracker Notion row with summary metadata.
-          5. Create a Knowledge Inbox page for every extracted concept.
+        Full ingestion pipeline for a single paper.
+
+        Implements all preflight gates, tag completeness gate, extraction,
+        validation, and Notion write-back.
         """
         page_id = page["id"]
         props = page["properties"]
 
-        # Prefer an explicit "File Name" property; fall back to Title + ".pdf".
-        pdf_filename = self._get_text_prop(props, "File Name") or (
-            self._get_title_prop(props) + ".pdf"
-        )
-        remote_path = f"{self.koofr_base}/{pdf_filename}"
+        # ── Preflight gate 1: Parse Zotero key ────────────────────────────────
+        zotero_uri = self._get_text_prop(props, "Zotero URI")
+        match = _ZOTERO_KEY_RE.search(zotero_uri)
+        if not match:
+            logger.warning(
+                "[%s] Missing or invalid Zotero URI: '%s' -- skipping.", page_id, zotero_uri
+            )
+            return
+        zotero_key = match.group(1)
 
-        # Short unique ID used for log correlation and temp-file naming.
-        job_id = uuid.uuid4().hex[:8]
-        local_pdf = TMP_DIR / f"{job_id}.pdf"
-        local_md = TMP_DIR / f"{job_id}.md"
+        # Short unique ID for log correlation and temp-file naming.
+        run_id = uuid.uuid4().hex[:8]
+        local_pdf: Path | None = None
+        local_md: Path | None = None
+        job_id: int | None = None
 
         try:
-            # ── Step 1: Download PDF from Koofr ───────────────────────────────
-            logger.info("[%s] Downloading %s …", job_id, remote_path)
+            # ── Preflight gate 2: Check zip exists ────────────────────────────
+            zip_remote = f"{self.koofr_base}/{zotero_key}.zip"
+            logger.info("[%s] Checking Koofr zip: %s", run_id, zip_remote)
+            if not self._koofr_exists(zip_remote):
+                logger.warning("[%s] Zip not found -- setting s1b-waiting-attachment.", run_id)
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={"Status": self.notion.select_prop("s1b-waiting-attachment")},
+                )
+                return
+
+            # ── Preflight gate 3: Download zip and extract PDF ────────────────
             TMP_DIR.mkdir(parents=True, exist_ok=True)
-            self._webdav.download_sync(
-                remote_path=remote_path, local_path=str(local_pdf)
+            local_zip = TMP_DIR / f"{run_id}.zip"
+            local_pdf = TMP_DIR / f"{run_id}.pdf"
+            local_md = TMP_DIR / f"{run_id}.md"
+
+            self._download_koofr(zip_remote, local_zip)
+
+            primary_filename = self._get_text_prop(props, "primary_pdf_filename")
+            self._extract_pdf_from_zip(
+                local_zip, local_pdf, preferred=primary_filename or None
+            )
+            local_zip.unlink(missing_ok=True)
+
+            # ── Preflight gate 4: Compute SHA256 ──────────────────────────────
+            pdf_sha256 = self._sha256(local_pdf)
+            logger.info("[%s] PDF SHA256: %s", run_id, pdf_sha256)
+            self.notion.update_page(
+                page_id=page_id,
+                properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
             )
 
-            # ── Step 2: Convert PDF → Markdown via marker-api ─────────────────
-            logger.info("[%s] Converting PDF to Markdown …", job_id)
+            # ── Preflight gate 5: Idempotency check ───────────────────────────
+            if self._ledger.is_already_done(zotero_key, pdf_sha256, EXTRACTION_VERSION):
+                logger.info(
+                    "[%s] Already processed (ledger hit) -- marking s2-extracted.", run_id
+                )
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={"Status": self.notion.select_prop("s2-extracted")},
+                )
+                return
+
+            # ── Tag completeness gate ─────────────────────────────────────────
+            tags = self._get_multi_select_prop(props, "Tags")
+            lint_report = self._tag_linter.lint(tags)
+            if not lint_report.valid_tags:
+                report_text = lint_report_to_text(lint_report)
+                logger.warning("[%s] Tag gate failed -- blocking.", run_id)
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Status": self.notion.select_prop("blocked-tags"),
+                        "tag_lint_report": {
+                            "rich_text": self.notion.rich_text(report_text)
+                        },
+                    },
+                )
+                return
+
+            if lint_report.errors:
+                # Has valid tags but also has issues -- store report for awareness.
+                report_text = lint_report_to_text(lint_report)
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "tag_lint_report": {
+                            "rich_text": self.notion.rich_text(report_text)
+                        }
+                    },
+                )
+
+            # ── Start job ledger ──────────────────────────────────────────────
+            job_id = self._ledger.start_job(zotero_key, pdf_sha256, EXTRACTION_VERSION)
+            logger.info("[%s] JobLedger job_id=%d", run_id, job_id)
+
+            # ── Step 1: Convert PDF to Markdown ───────────────────────────────
+            logger.info("[%s] Converting PDF to Markdown ...", run_id)
             markdown_text = self._pdf_to_markdown(local_pdf)
             local_md.write_text(markdown_text, encoding="utf-8")
+            self._ledger.update_status(job_id, "marker_done")
 
-            # ── Step 3: Extract structured knowledge via OpenAI ───────────────
-            logger.info("[%s] Extracting knowledge via OpenAI GPT-4o …", job_id)
-            extracted = self._extract_knowledge(markdown_text, hubs)
+            # ── Step 2: Extract via OpenAI ────────────────────────────────────
+            logger.info("[%s] Extracting knowledge via OpenAI GPT-4o ...", run_id)
+            extraction = self._extract_and_validate(markdown_text, hubs, run_id)
+            self._ledger.update_status(job_id, "openai_done")
 
-            # ── Step 4: Patch the Paper Tracker Notion row ────────────────────
-            logger.info("[%s] Patching Notion paper row …", job_id)
-            self._patch_notion_page(page_id, extracted)
+            # ── Step 3: Patch Paper Tracker ───────────────────────────────────
+            logger.info("[%s] Patching Notion paper row ...", run_id)
+            self._patch_notion_page(page_id, extraction)
 
-            # ── Step 5: Create Knowledge Inbox entries ────────────────────────
-            concepts = extracted.get("extracted_concepts", [])
+            # ── Step 4: Create Knowledge Inbox entries ────────────────────────
+            concepts = extraction.extracted_concepts
             logger.info(
-                "[%s] Creating %d Knowledge Inbox page(s) …",
-                job_id,
-                len(concepts),
+                "[%s] Creating %d Knowledge Inbox page(s) ...", run_id, len(concepts)
             )
             for concept in concepts:
                 try:
@@ -235,32 +344,94 @@ class IngestionEngine:
                 except Exception:
                     logger.exception(
                         "[%s] Failed to create knowledge item '%s'",
-                        job_id,
-                        concept.get("name", "?"),
+                        run_id,
+                        concept.title,
                     )
 
-            logger.info("[%s] Done.", job_id)
+            self._ledger.update_status(job_id, "notion_done")
+            self._ledger.finish_job(job_id)
+            logger.info("[%s] Done.", run_id)
+
+        except Exception as exc:
+            logger.exception("[%s] Pipeline failed: %s", run_id, exc)
+            if job_id is not None:
+                self._ledger.update_status(job_id, "failed", error=str(exc))
+            raise
 
         finally:
-            # Always clean up temp files, even on failure.
-            for tmp_file in (local_pdf, local_md):
+            for tmp_file in filter(None, [local_pdf, local_md]):
                 if tmp_file.exists():
                     tmp_file.unlink()
 
-    # ── Step 2: Marker API ────────────────────────────────────────────────────
+    # ── Koofr helpers ──────────────────────────────────────────────────────────
 
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=2, max=30))
+    def _koofr_exists(self, remote_path: str) -> bool:
+        """Return True if *remote_path* exists on Koofr."""
+        try:
+            return self._webdav.check(remote_path)
+        except Exception:
+            return False
+
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=2, max=30))
+    def _download_koofr(self, remote_path: str, local_path: Path) -> None:
+        """Download *remote_path* from Koofr to *local_path*."""
+        self._webdav.download_sync(remote_path=remote_path, local_path=str(local_path))
+
+    @staticmethod
+    def _extract_pdf_from_zip(
+        zip_path: Path, output_path: Path, preferred: str | None = None
+    ) -> None:
+        """
+        Extract a PDF from *zip_path* to *output_path*.
+
+        If *preferred* is set and found in the archive, use that file.
+        Otherwise, extract the largest PDF in the archive.
+        """
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            pdf_entries = [
+                e for e in zf.infolist() if e.filename.lower().endswith(".pdf")
+            ]
+            if not pdf_entries:
+                raise FileNotFoundError(f"No PDF found inside {zip_path}")
+
+            if preferred:
+                match = next(
+                    (e for e in pdf_entries if Path(e.filename).name == preferred),
+                    None,
+                )
+                if match:
+                    data = zf.read(match.filename)
+                    output_path.write_bytes(data)
+                    return
+                logger.warning(
+                    "primary_pdf_filename '%s' not found in zip; using largest PDF.",
+                    preferred,
+                )
+
+            # Select the largest PDF by uncompressed size.
+            largest = max(pdf_entries, key=lambda e: e.file_size)
+            data = zf.read(largest.filename)
+            output_path.write_bytes(data)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        """Compute the hex SHA-256 digest of a file."""
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # ── Marker API ─────────────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=60))
     def _pdf_to_markdown(self, pdf_path: Path) -> str:
         """
         Ask the local marker-api container to convert the PDF and return
         the resulting Markdown string.
 
-        Protocol (marker_server from marker-pdf PyPI package):
-          POST /marker
-          Content-Type: application/json
-          Body: {"filepath": "<absolute path accessible inside the container>"}
-
-        Both the orchestrator and marker-api mount tmp_storage at
-        /tmp/pipeline, so the same path is valid in both containers.
+        Protocol: POST /marker  {"filepath": "<absolute path in container>"}
         Response shape: {"markdown": "...", "metadata": {...}, ...}
         """
         response = requests.post(
@@ -270,43 +441,71 @@ class IngestionEngine:
         )
         response.raise_for_status()
         data = response.json()
-        # marker_server wraps the rendered output; for markdown format the
-        # key is "markdown". Fall back to "output" / "text" defensively.
-        return data.get("markdown") or data.get("output") or data.get("text") or response.text
-
-    # ── Step 3: OpenAI extraction ─────────────────────────────────────────────
-
-    def _extract_knowledge(
-        self, markdown: str, hubs: dict[str, str]
-    ) -> dict[str, Any]:
-        """
-        Send the paper Markdown to GPT-4o and return the parsed JSON dict.
-
-        Key design decisions:
-          - response_format={"type": "json_object"} enforces valid JSON output
-            at the API level — no fence-stripping or error-prone post-processing.
-          - Hub names are injected into the system prompt at call time so the
-            model chooses from real, user-defined categories.
-          - Input is truncated to ~100k chars (~25k tokens) to stay comfortably
-            within GPT-4o's context window while leaving space for the response.
-        """
-        # Build a JSON-array-style string of hub names for the prompt.
-        hub_names_str = (
-            ", ".join(f'"{name}"' for name in hubs)
-            if hubs
-            else '"Uncategorized"'
+        return (
+            data.get("markdown")
+            or data.get("output")
+            or data.get("text")
+            or response.text
         )
-        # Inject live hub names into the prompt template.
+
+    # ── OpenAI extraction ──────────────────────────────────────────────────────
+
+    def _extract_and_validate(
+        self, markdown: str, hubs: dict[str, str], run_id: str
+    ) -> ExtractionResult:
+        """
+        Call OpenAI, validate the response, attempt a repair pass if needed,
+        and run latex_sanity_check on each concept.
+        """
+        raw = self._call_openai(markdown, hubs)
+        result, errors = validate_extraction(raw)
+
+        if errors:
+            logger.warning(
+                "[%s] Pydantic validation failed (%d error(s)) -- attempting repair.",
+                run_id,
+                len(errors),
+            )
+            error_summary = "; ".join(errors[:MAX_REPAIR_ERRORS])
+            raw2 = self._call_openai_repair(raw, error_summary)
+            result, errors2 = validate_extraction(raw2)
+            if errors2:
+                logger.error(
+                    "[%s] Repair also failed -- flagging concepts with confidence=0.",
+                    run_id,
+                )
+                for concept in result.extracted_concepts:
+                    concept.confidence = 0.0
+
+        # LaTeX sanity check on each concept's statement.
+        for concept in result.extracted_concepts:
+            issues = latex_sanity_check(concept.statement_latex)
+            if issues:
+                logger.warning(
+                    "[%s] LaTeX issues in concept '%s': %s",
+                    run_id,
+                    concept.title,
+                    issues,
+                )
+                concept.confidence = min(concept.confidence, 0.5)
+
+        return result
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
+    def _call_openai(self, markdown: str, hubs: dict[str, str]) -> dict[str, Any]:
+        """Send the paper Markdown to GPT-4o and return the parsed JSON dict."""
+        hub_names_str = (
+            ", ".join(f'"{name}"' for name in hubs) if hubs else '"Uncategorized"'
+        )
         system_prompt = EXTRACTION_SYSTEM_PROMPT.replace(
             "[INJECT_DYNAMIC_HUBS_HERE]", hub_names_str
         )
-
         truncated_markdown = markdown[:100_000]
 
         response = self.openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             max_tokens=4096,
-            response_format={"type": "json_object"},  # guaranteed valid JSON
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -319,132 +518,154 @@ class IngestionEngine:
                 },
             ],
         )
-
-        # With json_object mode the response is always valid JSON — parse directly.
         return json.loads(response.choices[0].message.content)
 
-    # ── Step 4: Patch Paper Tracker row ──────────────────────────────────────
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=30))
+    def _call_openai_repair(
+        self, invalid_output: dict[str, Any], error_summary: str
+    ) -> dict[str, Any]:
+        """Send the invalid output back to OpenAI with a repair instruction."""
+        response = self.openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a JSON repair assistant. Fix the following JSON to match "
+                        "the required schema. Return only valid JSON, no explanation."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"The following JSON failed validation with these errors:\n"
+                        f"{error_summary}\n\n"
+                        f"Invalid JSON:\n{json.dumps(invalid_output, indent=2)}\n\n"
+                        "Return the corrected JSON."
+                    ),
+                },
+            ],
+        )
+        return json.loads(response.choices[0].message.content)
 
-    def _patch_notion_page(self, page_id: str, extracted: dict) -> None:
-        """
-        Update the Paper Tracker page after a successful extraction run:
-          - Status:       s0-inbox  → s1-skim
-          - AI Status:    Unverified-AI
-          - One Liner:    single-sentence summary from the model
-          - Active Themes: multi-select keyword tags
-        """
-        one_liner = extracted.get("one_liner", "")
-        themes = extracted.get("active_themes", [])
+    # ── Patch Paper Tracker row ────────────────────────────────────────────────
 
+    def _patch_notion_page(self, page_id: str, result: ExtractionResult) -> None:
+        """
+        Update the Paper Tracker page after a successful extraction:
+          Status       -> s2-extracted
+          AI Status    -> Unverified-AI
+          One Liner    -> result.one_liner
+          Active Themes -> result.active_themes
+        """
         self.notion.update_page(
             page_id=page_id,
             properties={
-                "Status": self.notion.select_prop("s1-skim"),
+                "Status": self.notion.select_prop("s2-extracted"),
                 "AI Status": self.notion.select_prop("Unverified-AI"),
-                "One Liner": {"rich_text": self.notion.rich_text(one_liner)},
-                "Active Themes": self.notion.multi_select_prop(themes),
+                "One Liner": {"rich_text": self.notion.rich_text(result.one_liner)},
+                "Active Themes": self.notion.multi_select_prop(result.active_themes),
             },
         )
 
-    # ── Step 5: Create Knowledge Inbox entry ─────────────────────────────────
+    # ── Create Knowledge Inbox entry ───────────────────────────────────────────
 
     def _create_knowledge_item(
         self,
         paper_page_id: str,
-        concept: dict,
+        concept: MathObject,
         hubs: dict[str, str],
     ) -> None:
         """
-        Materialise a single extracted concept as a Knowledge Inbox Notion page.
+        Materialise a single MathObject as a Knowledge Inbox Notion page.
 
-        Architecture — why properties vs. body blocks:
-          Notion database properties have a hard 2000-character limit and are
-          not suitable for LaTeX proofs or lengthy assumption paragraphs.
-          We therefore separate concerns strictly:
-            • PROPERTIES  — lightweight metadata only (name, type, status,
-                            relations). Fast to query, safe to index.
-            • PAGE BODY   — heavy LaTeX content and assumptions, written as
-                            block children after page creation. No size issues.
+        Properties (metadata only):
+          - Name, Type, Status, verification_status
+          - Source Paper (relation)
+          - Source Pages (rich_text)
+          - Hub Suggestions (rich_text -- JSON text, not a live relation)
 
-        Steps:
-          1. Build metadata properties dict, including the optional Parent Hub
-             relation resolved from the live hub registry.
-          2. Create the Notion page (metadata only — no content yet).
-          3. Append heading_2 + chunked paragraph blocks for "Assumptions"
-             and "Mathematical Formulation" to the new page's body.
+        Page body:
+          - heading_2("Assumptions") + paragraphs
+          - heading_2("Statement") + paragraphs with LaTeX
+          - heading_2("Variables") + paragraphs (if present)
+          - heading_2("Conclusion") + paragraphs (if present)
+          - heading_2("Source Quote") + paragraphs (if present)
         """
-        name: str = concept.get("name", "Untitled")
-        kind: str = concept.get("type", "Theorem")
-        content: str = concept.get("content", "")
-        assumptions: str = concept.get("assumptions", "None explicitly stated.")
-        suggested_hub: str = concept.get("suggested_hub", "")
+        kind = concept.type
+        title = concept.title
 
-        # ── Step 1: Build metadata-only properties ────────────────────────────
+        # Hub suggestion stored as JSON text -- never set a live relation.
+        suggested_hub = getattr(concept, "suggested_hub", "")
+        hub_suggestion_text = (
+            json.dumps({"suggested_hub": suggested_hub}, ensure_ascii=False)
+            if suggested_hub
+            else ""
+        )
+
+        # Source pages as comma-separated string.
+        source_pages_str = (
+            ", ".join(str(p) for p in concept.source_pages)
+            if concept.source_pages
+            else ""
+        )
+
         properties: dict = {
-            "Name": self.notion.title_prop(f"[{kind}] {name}"),
+            "Name": self.notion.title_prop(f"[{kind}] {title}"),
             "Type": self.notion.select_prop(kind),
             "Status": self.notion.select_prop("Inbox"),
+            "verification_status": self.notion.select_prop("unverified"),
             "Source Paper": self.notion.relation_prop([paper_page_id]),
         }
+        if source_pages_str:
+            properties["Source Pages"] = {
+                "rich_text": self.notion.rich_text(source_pages_str)
+            }
+        if hub_suggestion_text:
+            properties["Hub Suggestions"] = {
+                "rich_text": self.notion.rich_text(hub_suggestion_text)
+            }
 
-        # Attempt to resolve the suggested_hub to a live Notion page ID.
-        # If the model hallucinated a hub name not in the registry, skip
-        # gracefully — never create a broken relation or raise an error.
-        hub_page_id = hubs.get(suggested_hub)
-        if hub_page_id:
-            properties["Parent Hub"] = self.notion.relation_prop([hub_page_id])
-        else:
-            logger.debug(
-                "Hub '%s' not found in registry; skipping Parent Hub relation.",
-                suggested_hub,
-            )
-
-        # ── Step 2: Create the page (metadata only) ───────────────────────────
         new_page = self.notion.create_page(
             parent={"database_id": self.knowledge_inbox_db},
             properties=properties,
         )
         new_page_id: str = new_page["id"]
         logger.debug(
-            "Created Knowledge Inbox page %s for concept '%s'.", new_page_id, name
+            "Created Knowledge Inbox page %s for concept '%s'.", new_page_id, title
         )
 
-        # ── Steps 3 & 4: Append body blocks ──────────────────────────────────
-        # Build an ordered list of blocks:
-        #   heading_2("Assumptions") → paragraph(s) for assumptions text
-        #   heading_2("Mathematical Formulation") → paragraph(s) for LaTeX content
+        # Build page body blocks.
         body_blocks: list[dict] = []
 
         body_blocks.append(self._heading_block("Assumptions"))
-        body_blocks.extend(self._paragraph_blocks(assumptions))
+        body_blocks.extend(self._paragraph_blocks(concept.assumptions))
 
-        body_blocks.append(self._heading_block("Mathematical Formulation"))
-        body_blocks.extend(self._paragraph_blocks(content))
+        body_blocks.append(self._heading_block("Statement"))
+        body_blocks.extend(self._paragraph_blocks(concept.statement_latex))
 
-        # Write blocks in batches of 100 to respect the Notion API limit.
+        if concept.variables:
+            body_blocks.append(self._heading_block("Variables"))
+            body_blocks.extend(self._paragraph_blocks(concept.variables))
+
+        if concept.conclusion:
+            body_blocks.append(self._heading_block("Conclusion"))
+            body_blocks.extend(self._paragraph_blocks(concept.conclusion))
+
+        if concept.source_quotes:
+            body_blocks.append(self._heading_block("Source Quote"))
+            body_blocks.extend(self._paragraph_blocks(concept.source_quotes))
+
         self._append_blocks_in_batches(new_page_id, body_blocks)
 
-    # ── Text chunking ─────────────────────────────────────────────────────────
+    # ── Text chunking ──────────────────────────────────────────────────────────
 
     def _chunk_text(self, text: str, max_len: int = NOTION_BLOCK_MAX_CHARS) -> list[str]:
         """
         Split `text` into a list of strings each no longer than `max_len`
         characters, preferring newline split points to preserve LaTeX structure.
-
-        Algorithm:
-          1. If the text fits in one chunk, return it as-is.
-          2. Otherwise, find the last newline within the allowed window and
-             split there, keeping LaTeX display blocks intact.
-          3. If no newline exists within the window, fall back to a hard
-             character split (rare for well-formatted LaTeX).
-          4. Repeat on the remainder until exhausted.
-
-        Args:
-            text:    The input string to chunk (will be stripped first).
-            max_len: Maximum characters per chunk (default: NOTION_BLOCK_MAX_CHARS).
-
-        Returns:
-            A list of non-empty, stripped string chunks.
         """
         text = text.strip()
         if not text:
@@ -460,37 +681,27 @@ class IngestionEngine:
                 chunks.append(remaining)
                 break
 
-            # Look for the last newline within the allowed window.
             split_pos = remaining.rfind("\n", 0, max_len)
-
             if split_pos <= 0:
-                # No suitable newline — hard-split at the character limit.
                 split_pos = max_len
                 chunks.append(remaining[:split_pos])
                 remaining = remaining[split_pos:]
             else:
                 chunks.append(remaining[:split_pos])
-                # Advance past the newline character itself.
                 remaining = remaining[split_pos + 1:]
 
         return [c for c in chunks if c.strip()]
 
-    # ── Notion block builders ─────────────────────────────────────────────────
+    # ── Notion block builders ──────────────────────────────────────────────────
 
     def _paragraph_blocks(self, text: str) -> list[dict]:
-        """
-        Convert a (potentially long) string into a list of Notion paragraph
-        block dicts, each within the NOTION_BLOCK_MAX_CHARS safe limit.
-        Uses _chunk_text internally.
-        """
+        """Convert a long string into a list of Notion paragraph block dicts."""
         return [
             {
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {
-                    "rich_text": [
-                        {"type": "text", "text": {"content": chunk}}
-                    ],
+                    "rich_text": [{"type": "text", "text": {"content": chunk}}],
                 },
             }
             for chunk in self._chunk_text(text)
@@ -507,20 +718,13 @@ class IngestionEngine:
             },
         }
 
-    def _append_blocks_in_batches(
-        self, page_id: str, blocks: list[dict]
-    ) -> None:
-        """
-        Append blocks to a Notion page in batches of NOTION_BLOCKS_PER_REQUEST
-        (100) to respect the Notion API's per-call block limit.
-        Each batch is a separate API call managed by NotionClientWrapper
-        (which handles rate limiting and retries automatically).
-        """
+    def _append_blocks_in_batches(self, page_id: str, blocks: list[dict]) -> None:
+        """Append blocks in batches of 100 to respect the Notion API limit."""
         for i in range(0, len(blocks), NOTION_BLOCKS_PER_REQUEST):
             batch = blocks[i : i + NOTION_BLOCKS_PER_REQUEST]
             self.notion.append_block_children(block_id=page_id, children=batch)
 
-    # ── Property / page title helpers ─────────────────────────────────────────
+    # ── Property / page title helpers ──────────────────────────────────────────
 
     @staticmethod
     def _get_page_title(page: dict) -> str:
@@ -551,3 +755,11 @@ class IngestionEngine:
                 except (KeyError, IndexError):
                     return "unknown"
         return "unknown"
+
+    @staticmethod
+    def _get_multi_select_prop(props: dict, key: str) -> list[str]:
+        """Extract option names from a Notion multi_select property."""
+        try:
+            return [opt["name"] for opt in props[key]["multi_select"]]
+        except (KeyError, TypeError):
+            return []
