@@ -175,6 +175,11 @@ class NotionClientWrapper:
         return {"select": {"name": name}}
 
     @staticmethod
+    def status_prop(name: str) -> dict:
+        """Build a Notion status property value (distinct from select)."""
+        return {"status": {"name": name}}
+
+    @staticmethod
     def multi_select_prop(names: list[str]) -> dict:
         return {"multi_select": [{"name": n} for n in names]}
 

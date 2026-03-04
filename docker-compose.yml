@@ -40,8 +40,12 @@ services:
       - tmp_storage:/tmp/pipeline
       # Shared graph output
       - graph_static:/app/static
+      # Tag registry — bind-mount from project root so it's available
+      # at the path the default TagRegistry path resolution expects.
+      - ./tags_registry.yaml:/tags_registry.yaml:ro
     depends_on:
-      - marker-api
+      marker-api:
+        condition: service_healthy
     networks:
       - pipeline_net
 
@@ -56,15 +60,26 @@ services:
     restart: unless-stopped
     environment:
       TORCH_DEVICE: "cpu"          # change to "cuda" if you have a GPU
-      # Point all HuggingFace / surya / texify downloads at the named volume
-      # so model weights survive container rebuilds.
+      # Point all HuggingFace / surya / texify / PyTorch-hub downloads at the
+      # named volume so model weights survive container rebuilds.
       HF_HOME: "/model_cache"
+      TORCH_HOME: "/model_cache/torch"
+      XDG_CACHE_HOME: "/model_cache/xdg"
     volumes:
       - tmp_storage:/tmp/pipeline
       - marker_models:/model_cache
     ports:
       # Expose for local debugging; internal traffic uses Docker network
       - "8080:8080"
+    healthcheck:
+      # marker_server exposes a root GET endpoint; use it as a liveness probe.
+      # start_period is generous because on first run the container must
+      # download all surya / HuggingFace model weights before binding.
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 180s
     networks:
       - pipeline_net
 

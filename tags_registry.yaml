@@ -48,172 +48,968 @@ tags:
     prefix: d
     name: Mean Field Games
     definition: >
-      The study of strategic decision-making in large populations of
-      interacting agents, where each agent optimises against the statistical
-      distribution of the rest of the population (the "mean field").
+      Strategic decision-making in large populations where each agent optimizes
+      against the population distribution (mean field), seeking a Nash equilibrium
+      in the limit of infinitely many agents.
     inclusion_criteria: >
-      Papers that explicitly formulate or analyse a mean field game equilibrium,
-      including finite-player approximations and applications.
+      Explicit MFG equilibrium formulations (PDE, probabilistic, finite-state) or
+      finite-player limits presented as MFGs.
     exclusion_criteria: >
-      Papers on single-agent optimal control without population interaction;
-      general game theory without mean field limit.
+      Central-planner mean field control (use d-mfc) or single-agent control/RL
+      without strategic interaction via the population distribution.
     synonyms:
       - MFG
-      - mean-field games
-      - mean field game
+      - mean-field game
+      - mean field games
+      - Nash certainty equivalence
 
-  - id: d-mkv
+  - id: d-mfc
     prefix: d
-    name: McKean-Vlasov Processes
+    name: Mean Field Control
     definition: >
-      Stochastic differential equations whose drift and diffusion coefficients
-      depend on the law (marginal distribution) of the solution process itself.
+      Mean-field (McKean–Vlasov) control / planning where a central objective is
+      optimized over a population distribution, not a Nash equilibrium.
     inclusion_criteria: >
-      Papers studying McKean-Vlasov SDEs, propagation of chaos, or
-      distribution-dependent SDEs in any dimension.
+      Central planner formulations; social optimum over distribution-dependent
+      dynamics/cost; “mean field type control”.
     exclusion_criteria: >
-      Standard Itô SDEs with no distributional dependence; pure mean field
-      game papers without an explicit McKean-Vlasov SDE.
+      Nash equilibrium problems with representative-agent best response (use d-mfg).
     synonyms:
+      - MFC
+      - mean field control
+      - mean-field control
+      - mean field type control
+      - McKean-Vlasov control
+
+  - id: d-gmfg
+    prefix: d
+    name: Graph / Graphon Mean Field Games
+    definition: >
+      Mean field games with interactions structured by a graph or graphon,
+      typically introducing agent “types/labels” that index heterogeneous coupling.
+    inclusion_criteria: >
+      Graphon-MFG, graph-based mean field limits, or MFGs parameterized by a
+      network position/type that affects coupling.
+    exclusion_criteria: >
+      Standard homogeneous MFGs without graph-structured interaction (use d-mfg),
+      or generic network games without mean field limit.
+    synonyms:
+      - GMFG
+      - graph mean field game
+      - graphon MFG
+      - network mean field game
+
+  - id: d-mfrl
+    prefix: d
+    name: Mean-Field Reinforcement Learning
+    definition: >
+      Reinforcement learning methods for mean-field interactions (MFG/MFC),
+      learning policies/value functions under population-coupled dynamics.
+    inclusion_criteria: >
+      RL algorithms explicitly formulated for mean-field settings, including
+      mean-field Q-learning, actor–critic, or MF-MARL variants.
+    exclusion_criteria: >
+      Standard MARL without mean-field limit assumptions; pure theory without RL.
+    synonyms:
+      - MFRL
+      - mean field RL
+      - mean-field reinforcement learning
+      - mean field MARL
+      - MF-RL
+
+  - id: d-pde-hjb-fp
+    prefix: d
+    name: PDE HJB–FP Formulation
+    definition: >
+      PDE formulation of MFG/MFC via a backward Hamilton–Jacobi–Bellman equation
+      coupled to a forward Fokker–Planck (Kolmogorov) equation.
+    inclusion_criteria: >
+      Core contribution uses the coupled HJB–FP PDE system (existence, numerics,
+      structure, or analysis).
+    exclusion_criteria: >
+      Purely probabilistic/BSDE formulations without PDE focus (use d-prob-mkv + k-bsde-fbsde).
+    synonyms:
+      - HJB-FP
+      - HJB/FP
+      - HJB–Fokker–Planck
+      - PDE formulation
+
+  - id: d-prob-mkv
+    prefix: d
+    name: Probabilistic McKean–Vlasov Formulation
+    definition: >
+      Stochastic-process formulation using McKean–Vlasov SDEs / interacting particle
+      systems where coefficients depend on the law of the process.
+    inclusion_criteria: >
+      MKV SDEs, weak/strong solutions for distribution-dependent SDEs, particle
+      limits, probabilistic MFG/MFC representations.
+    exclusion_criteria: >
+      PDE-only analyses with no MKV/process focus (use d-pde-hjb-fp).
+    synonyms:
+      - MKV
       - McKean Vlasov
+      - McKean–Vlasov SDE
       - distribution-dependent SDE
-      - dd-SDE
+      - mean-field SDE
 
-  - id: d-stochastic-control
+  - id: d-master-equation
     prefix: d
-    name: Stochastic Control
+    name: Master Equation
     definition: >
-      Optimisation problems where a decision-maker controls a stochastic
-      dynamical system to minimise or maximise an expected cost/reward functional.
+      The (typically infinite-dimensional) PDE on the space of probability measures
+      characterizing MFG equilibria/value functions for all initial distributions.
     inclusion_criteria: >
-      Papers on stochastic optimal control, LQG control, risk-sensitive control,
-      or related Hamilton-Jacobi-Bellman analysis.
+      Lions master equation, finite-state master equations, monotone solutions,
+      well-posedness or numerics aimed at the master PDE.
     exclusion_criteria: >
-      Deterministic optimal control without stochastic perturbations;
-      reinforcement learning papers without explicit stochastic control formulation.
+      Fixed-initial HJB–FP systems without the master-equation viewpoint.
     synonyms:
-      - optimal stochastic control
-      - stochastic optimisation
+      - master PDE
+      - Lions master equation
+      - master equation for MFG
+      - master equation
 
-  - id: d-pde-analysis
+  - id: d-finite-state
     prefix: d
-    name: PDE Analysis
+    name: Finite-State / Discrete-State Models
     definition: >
-      Mathematical analysis of partial differential equations, including
-      existence, uniqueness, regularity, and qualitative properties of solutions.
+      MFG/MFC on a finite state space (Markov chains), typically evolving on a simplex
+      of distributions over discrete states.
     inclusion_criteria: >
-      Papers whose primary contribution is proving analytical properties of PDEs
-      (elliptic, parabolic, Hamilton-Jacobi, Fokker-Planck, etc.).
+      Finite-state MFG/MFC, Markov chain formulations, discrete-state master equations.
     exclusion_criteria: >
-      Purely numerical PDE papers; ODEs without distributional or multi-variable
-      structure.
+      Continuous-state PDE formulations unless the paper’s main model is finite-state.
     synonyms:
-      - partial differential equations
-      - PDEs
+      - finite state MFG
+      - finite-state
+      - Markov chain MFG
+      - discrete-state
 
-  # ── Method tags (m-) ─────────────────────────────────────────────────────────
+  - id: d-discrete-time
+    prefix: d
+    name: Discrete-Time Models
+    definition: >
+      Mean-field games/control formulated in discrete time with Bellman-style
+      dynamic programming and time-stepped population updates.
+    inclusion_criteria: >
+      Discrete-time MFG/MFC, time-discretized equilibrium definitions as the primary model.
+    exclusion_criteria: >
+      Pure continuous-time models where discretization is only a numerical detail.
+    synonyms:
+      - discrete time MFG
+      - discrete-time
+      - time-stepped MFG
+      - Bellman formulation
 
-  - id: m-hjb
+  - id: d-ergodic
+    prefix: d
+    name: Ergodic / Stationary Regime
+    definition: >
+      Long-run average-cost or stationary formulations of MFG/MFC, typically leading
+      to ergodic HJB and invariant-measure (stationary FP) equations.
+    inclusion_criteria: >
+      Ergodic MFG/MFC, stationary equilibria, average-cost limits, invariant distributions.
+    exclusion_criteria: >
+      Finite-horizon problems unless the ergodic limit/stationary regime is central.
+    synonyms:
+      - stationary MFG
+      - ergodic MFG
+      - long-run average
+      - invariant measure
+
+  - id: d-network
+    prefix: d
+    name: Network / Graph-Based Models
+    definition: >
+      Models where agent interaction is mediated by an explicit network/graph
+      structure (finite or growing graphs), not necessarily via a graphon limit.
+    inclusion_criteria: >
+      Mean-field or large-population games/control on graphs, network interactions,
+      adjacency-based coupling.
+    exclusion_criteria: >
+      Pure graphon-limit formulations where the graphon is the central object (use d-graphon/d-gmfg).
+    synonyms:
+      - graph-based
+      - network games
+      - games on graphs
+      - MFG on networks
+
+  - id: d-graphon
+    prefix: d
+    name: Graphon / Dense Graph Limits
+    definition: >
+      Graphon-based limit objects for dense graphs used to model heterogeneous
+      interactions and to define continuum network limits.
+    inclusion_criteria: >
+      Papers that define/use graphons explicitly (W, kernel limits), graph limit
+      theory used for mean-field interaction modeling.
+    exclusion_criteria: >
+      Generic “graph” interaction without graphon/limit language.
+    synonyms:
+      - graphon
+      - dense graph limit
+      - graph limit kernel
+      - W-graphon
+
+  - id: d-local-interaction
+    prefix: d
+    name: Local Interaction / Local Mean Field
+    definition: >
+      Mean-field-type models where coupling is local (in space, neighborhood, or
+      a local kernel) rather than purely global dependence on the full distribution.
+    inclusion_criteria: >
+      Local coupling kernels, neighborhood interactions, spatially local mean-field terms.
+    exclusion_criteria: >
+      Purely global distribution coupling with no locality structure emphasized.
+    synonyms:
+      - local mean field
+      - neighborhood coupling
+      - spatial local interaction
+      - local coupling
+
+  # ── Mechanism tags (m-) ─────────────────────────────────────────────────────
+
+  - id: m-distribution-coupling
     prefix: m
-    name: Hamilton-Jacobi-Bellman Equation
+    name: Distribution Coupling
     definition: >
-      The second-order nonlinear PDE that characterises the value function of
-      an optimal control problem via the dynamic programming principle.
+      The dynamics and/or costs depend explicitly on the population distribution
+      (density, measure, empirical distribution), creating mean-field interaction.
     inclusion_criteria: >
-      Papers that derive, analyse, or numerically solve an HJB equation as a
-      core technical contribution.
+      Any model where m enters drift/diffusion, costs, constraints, or payoffs.
     exclusion_criteria: >
-      Papers that only mention HJB in passing as background; purely stochastic
-      process papers without a control component.
+      Independent-agent models where the population distribution is irrelevant.
     synonyms:
-      - HJB
-      - HJB equation
-      - Hamilton Jacobi Bellman
+      - coupling via m
+      - mean-field coupling
+      - distribution-dependent coupling
 
-  - m-fp:
+  - id: m-congestion
     prefix: m
-    id: m-fp
-    name: Fokker-Planck Equation
+    name: Congestion Effects
     definition: >
-      The parabolic PDE governing the time evolution of the probability density
-      of a diffusion process; the forward Kolmogorov equation.
+      Costs (or constraints) penalize high density/occupancy, modeling crowding or
+      competition for space/resources.
     inclusion_criteria: >
-      Papers where the Fokker-Planck (or Kolmogorov forward) equation appears
-      as a key equation describing population or particle evolution.
+      Terms like f(x, m(x)) increasing in m(x) (or similar) interpreted as congestion.
     exclusion_criteria: >
-      Papers using only the backward Kolmogorov equation; purely statistical
-      papers without a diffusion process model.
+      Coupling that is not density/crowding-like (e.g., price clearing without density penalty).
     synonyms:
-      - Fokker Planck
-      - FP equation
-      - Kolmogorov forward equation
+      - crowding
+      - density penalty
+      - congestion cost
 
-  - id: m-monotone-schemes
+  - id: m-price-market
     prefix: m
-    name: Monotone Numerical Schemes
+    name: Price / Market Clearing Coupling
     definition: >
-      Finite-difference or finite-element discretisation methods that preserve
-      the monotonicity of the continuous operator, guaranteeing convergence to
-      the viscosity solution.
+      Coupling is mediated by endogenous prices or market-clearing conditions
+      (e.g., supply-demand balance) affecting agent costs/dynamics.
     inclusion_criteria: >
-      Papers constructing or analysing monotone, consistent, stable
-      approximation schemes for nonlinear PDEs.
+      Explicit price variables, equilibrium prices, market clearing constraints, mean-field through prices.
     exclusion_criteria: >
-      High-order spectral methods or machine-learning-based PDE solvers that
-      do not rely on monotonicity arguments.
+      Pure congestion or generic distribution coupling without price/market variables.
     synonyms:
-      - monotone scheme
-      - monotone finite difference
+      - market clearing
+      - endogenous price
+      - mean-field via price
 
-  # ── Knowledge-type tags (k-) ─────────────────────────────────────────────────
+  - id: m-major-minor
+    prefix: m
+    name: Major–Minor Structure
+    definition: >
+      A small number of major agents interact with (and influence) a large population
+      of minor agents, yielding coupled major/minor best-response structures.
+    inclusion_criteria: >
+      Explicit “major agent” (or common agent) interacting with mean field of minors.
+    exclusion_criteria: >
+      Homogeneous populations with no distinguished major player.
+    synonyms:
+      - major-minor MFG
+      - major player
+      - dominant agent
 
-  - id: k-existence-uniqueness
+  - id: m-multi-population
+    prefix: m
+    name: Multi-Population / Multi-Type Coupling
+    definition: >
+      Multiple interacting sub-populations/types with separate distributions that
+      couple through costs/dynamics or cross-population interactions.
+    inclusion_criteria: >
+      Models with m^1, m^2, … (or type-indexed distributions) and cross-coupling.
+    exclusion_criteria: >
+      Single-population models with only one distribution.
+    synonyms:
+      - multi-population
+      - multi-type
+      - heterogeneous populations
+      - multi-class MFG
+
+  - id: m-mean-field-games-with-common-noise
+    prefix: m
+    name: Common Noise
+    definition: >
+      A shared stochastic source affects all agents, making the mean field itself
+      random (often requiring conditional distributions/measure-valued processes).
+    inclusion_criteria: >
+      Explicit common Brownian motion or common shocks; conditional law formulations.
+    exclusion_criteria: >
+      Pure idiosyncratic noise only (independent across agents).
+    synonyms:
+      - common noise
+      - common Brownian motion
+      - stochastic flow of measures
+      - conditional law
+
+  - id: m-coupling-via-ranking-exposure
+    prefix: m
+    name: Ranking / Exposure-Based Coupling
+    definition: >
+      Interaction depends on rank, exposure, or algorithmic allocation (e.g., attention
+      or visibility determined by sorting/competition).
+    inclusion_criteria: >
+      Payoffs/dynamics depend on rank statistics, exposure probabilities, or leaderboard-type coupling.
+    exclusion_criteria: >
+      Standard coupling via density or averages without ranking/exposure.
+    synonyms:
+      - rank-based coupling
+      - exposure coupling
+      - leaderboard effects
+      - positional effects
+
+  - id: m-attention-budget
+    prefix: m
+    name: Attention Budget
+    definition: >
+      Agents face a limited attention/processing budget that constrains what they
+      can observe, communicate, or act upon.
+    inclusion_criteria: >
+      Explicit attention constraints/costs, limited observation capacity, sparse focus mechanisms.
+    exclusion_criteria: >
+      Generic control constraints not tied to attention/information processing.
+    synonyms:
+      - limited attention
+      - attention constraint
+      - attention cost
+
+  - id: m-local-interaction
+    prefix: m
+    name: Local Interaction Mechanism
+    definition: >
+      Coupling uses local neighborhoods or kernels (spatial locality or adjacency),
+      rather than dependence on the full global distribution only.
+    inclusion_criteria: >
+      Local kernels, neighborhood averages, graph adjacency coupling emphasized as the mechanism.
+    exclusion_criteria: >
+      Pure global mean-field coupling with no locality structure.
+    synonyms:
+      - neighborhood interaction
+      - local coupling kernel
+      - adjacency coupling
+
+  - id: m-partial-observation
+    prefix: m
+    name: Partial Observation
+    definition: >
+      Agents do not directly observe the full state and/or mean field; instead they
+      receive noisy, delayed, or incomplete signals.
+    inclusion_criteria: >
+      POMDP-style observation models, noisy measurements, incomplete state information.
+    exclusion_criteria: >
+      Full-information models where states and mean field are directly observed.
+    synonyms:
+      - partial information
+      - noisy observation
+      - incomplete observation
+      - POMDP
+
+  - id: m-belief-state
+    prefix: m
+    name: Belief-State Augmentation
+    definition: >
+      The effective state includes a belief (posterior distribution) over hidden
+      variables or states, typically arising from filtering under partial observation.
+    inclusion_criteria: >
+      Explicit belief/posterior dynamics; filtering equations; separation principle usage.
+    exclusion_criteria: >
+      Partial observation without belief-state formulation (use m-partial-observation only).
+    synonyms:
+      - belief state
+      - information state
+      - filtering state
+      - posterior state
+
+  - id: m-information-constraints
+    prefix: m
+    name: Information Constraints
+    definition: >
+      Explicit constraints on information acquisition/usage, often formulated via
+      mutual information bounds, channel capacity, or constrained signaling.
+    inclusion_criteria: >
+      Mutual information constraints, capacity limits, constrained observation channels.
+    exclusion_criteria: >
+      Simple observation noise without explicit information constraints.
+    synonyms:
+      - info constraints
+      - channel capacity constraint
+      - mutual information constraint
+      - limited information
+
+  - id: m-communication-cost
+    prefix: m
+    name: Communication Cost
+    definition: >
+      Communication (sending signals/messages) incurs an explicit cost, creating a
+      tradeoff between coordination benefits and messaging expense.
+    inclusion_criteria: >
+      Cost terms tied to signaling frequency, rate, length, or message content.
+    exclusion_criteria: >
+      Cheap-talk models with no cost (use m-messaging without m-communication-cost).
+    synonyms:
+      - priced communication
+      - signaling cost
+      - messaging cost
+
+  - id: m-messaging
+    prefix: m
+    name: Messaging / Signaling
+    definition: >
+      Agents can send messages/signals (cheap talk or costly) that affect beliefs,
+      actions, or dynamics, enabling coordination beyond state evolution alone.
+    inclusion_criteria: >
+      Explicit message variables, signaling channels, communication actions, sender–receiver structure.
+    exclusion_criteria: >
+      Purely implicit interaction through distribution without explicit messages.
+    synonyms:
+      - signaling
+      - communication channel
+      - cheap talk
+      - message passing (economic/game)
+
+  - id: m-variable-rate
+    prefix: m
+    name: Variable-Rate Communication
+    definition: >
+      Agents choose the communication rate/bit-budget (possibly state-dependent),
+      rather than using a fixed-rate channel.
+    inclusion_criteria: >
+      Adaptive bitrate, variable message length, rate allocation decisions.
+    exclusion_criteria: >
+      Communication present but at fixed rate/format with no rate decision.
+    synonyms:
+      - adaptive rate
+      - variable bitrate
+      - rate control
+      - variable-length messages
+
+  - id: m-talk-vs-silence
+    prefix: m
+    name: Talk vs Silence Option
+    definition: >
+      Communication includes an explicit abstain/silence action, enabling sparse or
+      event-triggered messaging policies.
+    inclusion_criteria: >
+      Models where “no message” is a deliberate action with strategic consequences.
+    exclusion_criteria: >
+      Always-on messaging or purely exogenous missing data.
+    synonyms:
+      - silence option
+      - abstain action
+      - event-triggered communication
+      - sparse messaging
+
+  - id: m-state-aggregation
+    prefix: m
+    name: State Aggregation
+    definition: >
+      The model or solver uses aggregated/coarse states (partitions/quotients) to
+      reduce dimensionality while approximating population dynamics/equilibria.
+    inclusion_criteria: >
+      Explicit lumping/aggregation/quotienting of states in the formulation or algorithm.
+    exclusion_criteria: >
+      Generic discretization refinement without explicit aggregation concept.
+    synonyms:
+      - lumping
+      - state lumping
+      - quotient states
+      - coarse state space
+
+  - id: m-clustering
+    prefix: m
+    name: Clustering
+    definition: >
+      States/agents/trajectories are grouped by a clustering rule (k-means, hierarchical,
+      spectral, etc.) to define structure, compression, or reduced models.
+    inclusion_criteria: >
+      Clustering is a named component of the method/model (not just informal grouping).
+    exclusion_criteria: >
+      Purely continuous parametrizations with no discrete clustering step.
+    synonyms:
+      - k-means
+      - hierarchical clustering
+      - spectral clustering
+      - clustering-based reduction
+
+  - id: m-coarse-to-fine-refinement
+    prefix: m
+    name: Coarse-to-Fine Refinement
+    definition: >
+      A multiresolution strategy that starts from a coarse representation and refines
+      adaptively (states, grid, partition) guided by error/diagnostics.
+    inclusion_criteria: >
+      Adaptive refinement loops; multilevel/coarse-to-fine schemes; partition splitting/merging.
+    exclusion_criteria: >
+      One-shot fixed discretization without refinement logic.
+    synonyms:
+      - multiresolution
+      - adaptive refinement
+      - multilevel refinement
+      - coarse-to-fine
+
+  - id: m-equilibrium-sensitivity
+    prefix: m
+    name: Equilibrium Sensitivity Mechanism
+    definition: >
+      The formulation/analysis explicitly centers how the equilibrium responds to
+      parameter or model perturbations (sensitivities, influence, comparative statics).
+    inclusion_criteria: >
+      Sensitivity/influence terms are a first-class object (not just a byproduct),
+      e.g., calibration gradients, influence signatures, equilibrium response maps.
+    exclusion_criteria: >
+      Standard equilibrium computation with no explicit sensitivity focus.
+    synonyms:
+      - comparative statics
+      - equilibrium sensitivity
+      - influence analysis
+      - equilibrium response
+
+  - id: m-state-constraints
+    prefix: m
+    name: State Constraints
+    definition: >
+      Constraints restricting admissible states or trajectories (hard constraints,
+      boundary conditions, forbidden regions) beyond standard dynamics.
+    inclusion_criteria: >
+      State constraints in control/game, constrained domains with reflecting/absorbing constraints,
+      viability constraints.
+    exclusion_criteria: >
+      Purely control/action constraints without state restrictions.
+    synonyms:
+      - constrained state space
+      - viability constraints
+      - state-space constraints
+
+  - id: m-control-constraints
+    prefix: m
+    name: Control Constraints
+    definition: >
+      Constraints restricting admissible controls/actions (bounds, discrete sets,
+      mixed constraints), impacting optimality conditions and HJB structure.
+    inclusion_criteria: >
+      Bounded controls, control set constraints, action feasibility constraints are explicit.
+    exclusion_criteria: >
+      Unconstrained control where the action set is effectively all of R^d.
+    synonyms:
+      - action constraints
+      - bounded controls
+      - admissible control set
+
+  - id: m-welfare-objective
+    prefix: m
+    name: Welfare / Social Objective
+    definition: >
+      Objectives defined at the population level (social welfare, planner’s objective),
+      distinct from (or in addition to) individual agent costs.
+    inclusion_criteria: >
+      Social planner/welfare maximization, system-optimal criteria, aggregate utility objectives.
+    exclusion_criteria: >
+      Pure Nash objectives without any welfare/planner layer.
+    synonyms:
+      - social welfare
+      - planner objective
+      - system optimum
+      - utilitarian objective
+
+  - id: m-fairness-constraints
+    prefix: m
+    name: Fairness Constraints
+    definition: >
+      Explicit fairness notions imposed as constraints/objectives (parity, group fairness,
+      equitable allocation) that shape equilibrium/control outcomes.
+    inclusion_criteria: >
+      Formal fairness constraints/regularizers stated as part of the model.
+    exclusion_criteria: >
+      Vague discussion of fairness with no explicit constraint/objective.
+    synonyms:
+      - equity constraints
+      - fairness regularization
+      - group fairness
+      - parity constraint
+
+  # ── Method tags (k-) ────────────────────────────────────────────────────────
+
+  - id: k-fixed-point
     prefix: k
-    name: Existence and Uniqueness Results
+    name: Fixed-Point Methods
     definition: >
-      Mathematical results that establish that a given equation or problem has
-      at least one solution (existence) and that this solution is the only one
-      satisfying the given conditions (uniqueness).
+      Methods that compute equilibria by iterating a map (best-response or equilibrium
+      operator) to find a fixed point.
     inclusion_criteria: >
-      Papers whose main theorems assert well-posedness: existence, uniqueness,
-      or both, for PDEs, SDEs, or equilibrium problems.
+      Picard/Banach-style fixed-point iteration or contraction-based equilibrium computation is explicit.
     exclusion_criteria: >
-      Purely numerical papers; papers focused on regularity rather than
-      well-posedness.
+      Pure variational/KKT solvers with no fixed-point framing.
     synonyms:
-      - well-posedness
-      - wellposedness
-      - existence uniqueness
+      - Picard iteration
+      - Banach fixed point
+      - fixed-point iteration
+      - equilibrium operator iteration
 
-  - id: k-regularity
+  - id: k-best-response-iteration
     prefix: k
-    name: Regularity Theory
+    name: Best-Response Iteration
     definition: >
-      The study of smoothness properties of solutions to differential equations,
-      including Sobolev, Hölder, and classical regularity estimates.
+      Alternating scheme: given a mean field (or belief), solve the agent problem to
+      compute a best response, then update the mean field forward.
     inclusion_criteria: >
-      Papers proving regularity estimates (gradient bounds, Schauder estimates,
-      Sobolev embeddings) for solutions of PDEs or SDEs.
+      Explicit BR map u*(m) and forward update m' = F(u*, m) iterated.
     exclusion_criteria: >
-      Papers where regularity is assumed rather than proved;
-      purely numerical or algorithmic papers.
+      Fictitious play (use k-fictitious-play) or Newton-type simultaneous solves.
     synonyms:
-      - regularity estimates
-      - smoothness
+      - BR iteration
+      - best response dynamics
+      - iterated best response
+      - response mapping
 
-  - id: k-convergence
+  - id: k-fictitious-play
     prefix: k
-    name: Convergence Results
+    name: Fictitious Play
     definition: >
-      Mathematical results establishing that a sequence of approximations,
-      iterates, or discretisations converges to a target object in a specified
-      norm or topology.
+      Learning/iteration where agents best-respond to an empirical average of past
+      population behavior rather than the latest iterate only.
     inclusion_criteria: >
-      Papers proving convergence rates or qualitative convergence for numerical
-      schemes, mean field limits, or iterative algorithms.
+      Averaging/empirical belief updates over iterates, explicitly called fictitious play.
     exclusion_criteria: >
-      Papers that only conjecture convergence without proof; experimental
-      convergence plots without theoretical guarantees.
+      Plain best-response iteration without averaging.
     synonyms:
-      - convergence rate
-      - convergence analysis
+      - FP
+      - fictitious play
+      - averaged best response
+      - belief averaging
+
+  - id: k-policy-iteration
+    prefix: k
+    name: Policy Iteration (Howard)
+    definition: >
+      Iterative method alternating policy evaluation and policy improvement to solve
+      control/HJB problems (and often used inside MFG solvers).
+    inclusion_criteria: >
+      Howard’s algorithm / policy iteration is used to solve HJB/Bellman equations.
+    exclusion_criteria: >
+      Pure value iteration without policy improvement steps.
+    synonyms:
+      - Howard algorithm
+      - policy improvement
+      - policy evaluation
+      - PI
+
+  - id: k-operator-splitting
+    prefix: k
+    name: Operator Splitting
+    definition: >
+      Decomposition of a coupled operator into simpler sub-steps (e.g., alternating HJB
+      and FP solves, Lie/Strang splitting, ADMM-like splitting).
+    inclusion_criteria: >
+      Explicit splitting of operators/time steps to solve the coupled system.
+    exclusion_criteria: >
+      Monolithic solves with no split structure.
+    synonyms:
+      - Lie splitting
+      - Strang splitting
+      - splitting scheme
+      - alternating solves
+
+  - id: k-implicit-differentiation
+    prefix: k
+    name: Implicit Differentiation
+    definition: >
+      Differentiating solutions defined by equations (fixed points, KKT systems) using
+      the implicit function theorem and linear solves for sensitivity.
+    inclusion_criteria: >
+      Gradients through equilibrium/solver via implicit Jacobian systems are explicit.
+    exclusion_criteria: >
+      Pure backprop through unrolled iterations without implicit step.
+    synonyms:
+      - IFT differentiation
+      - implicit function theorem
+      - implicit gradients
+      - differentiate through fixed point
+
+  - id: k-adjoint-method
+    prefix: k
+    name: Adjoint Method
+    definition: >
+      Gradient/sensitivity computation via adjoint equations (PDE/ODE), typically solving
+      a backward adjoint to obtain derivatives of scalar objectives.
+    inclusion_criteria: >
+      Adjoint PDE/BSDE/ODE derived and solved to compute gradients or influence.
+    exclusion_criteria: >
+      Finite-difference gradients or purely automatic differentiation without adjoint formulation.
+    synonyms:
+      - adjoint equation
+      - adjoint PDE
+      - backward adjoint
+      - Lagrange multiplier method
+
+  - id: k-jvp-vjp
+    prefix: k
+    name: JVP / VJP Primitives
+    definition: >
+      Jacobian–vector products (JVP) and vector–Jacobian products (VJP) used to compute
+      sensitivities efficiently without forming full Jacobians.
+    inclusion_criteria: >
+      Use of JVP/VJP, forward/reverse-mode autodiff primitives, linear-operator Jacobian access.
+    exclusion_criteria: >
+      Full Jacobian formation as dense matrices without JVP/VJP focus.
+    synonyms:
+      - Jacobian-vector product
+      - vector-Jacobian product
+      - forward-mode AD
+      - reverse-mode AD
+
+  - id: k-equilibrium-differentiation
+    prefix: k
+    name: Equilibrium Differentiation
+    definition: >
+      Differentiation techniques specialized to equilibria (Nash, fixed points, KKT, games),
+      including differentiable games and bilevel formulations.
+    inclusion_criteria: >
+      Explicit “differentiate through equilibrium/game” framing beyond generic implicit diff.
+    exclusion_criteria: >
+      Ordinary supervised learning gradients with no equilibrium layer.
+    synonyms:
+      - differentiable games
+      - differentiable equilibrium
+      - Nash differentiation
+      - bilevel differentiation
+
+  - id: k-viscosity-solutions
+    prefix: k
+    name: Viscosity Solutions
+    definition: >
+      Weak-solution framework for nonlinear first/second-order HJ-type PDEs used to ensure
+      well-posedness and convergence of monotone schemes.
+    inclusion_criteria: >
+      Viscosity solution definitions/theorems are used for HJB/HJ equations.
+    exclusion_criteria: >
+      Purely classical-solution analysis with no viscosity framework.
+    synonyms:
+      - viscosity solution
+      - Crandall-Lions
+      - weak solution (viscosity)
+
+  - id: k-monotonicity-method
+    prefix: k
+    name: Monotonicity Method (Lasry–Lions)
+    definition: >
+      Uniqueness/stability/existence arguments based on monotonicity of the coupling/operator,
+      characteristic of Lasry–Lions theory in MFG.
+    inclusion_criteria: >
+      Lasry–Lions monotonicity condition or monotone operator techniques are central.
+    exclusion_criteria: >
+      Proofs that do not use monotonicity (e.g., purely variational/potential arguments).
+    synonyms:
+      - Lasry-Lions monotonicity
+      - monotone coupling
+      - monotone operator method
+
+  - id: k-potential-structure
+    prefix: k
+    name: Potential / Variational Structure
+    definition: >
+      Using potential game structure where equilibrium corresponds to an optimizer of a global
+      functional, enabling variational formulations and convex analysis tools.
+    inclusion_criteria: >
+      “Potential MFG”, “variational MFG”, global energy functional minimized at equilibrium.
+    exclusion_criteria: >
+      Generic variational formulations without potential-game interpretation (use k-variational-formulation).
+    synonyms:
+      - potential MFG
+      - variational MFG
+      - energy formulation
+      - potential game
+
+  - id: k-regularity-estimates
+    prefix: k
+    name: Regularity Estimates
+    definition: >
+      A priori estimates and smoothness results (Sobolev/Hölder/Schauder, gradient bounds)
+      used to prove well-posedness or justify numerical methods.
+    inclusion_criteria: >
+      Theorems/lemmas providing regularity bounds are a core technical tool.
+    exclusion_criteria: >
+      Papers that assume regularity without proving/using estimates.
+    synonyms:
+      - Schauder estimates
+      - Sobolev estimates
+      - gradient bounds
+      - a priori estimates
+
+  - id: k-propagation-of-chaos
+    prefix: k
+    name: Propagation of Chaos
+    definition: >
+      Convergence theory showing that as N → ∞, finite-agent systems become asymptotically
+      independent with a common law governed by a mean-field limit.
+    inclusion_criteria: >
+      Particle approximation convergence proofs labeled propagation of chaos / chaoticity.
+    exclusion_criteria: >
+      Mean-field heuristics without convergence theorems.
+    synonyms:
+      - chaoticity
+      - mean-field limit proof
+      - interacting particle limit
+
+  - id: k-bsde-fbsde
+    prefix: k
+    name: BSDE / FBSDE Methods
+    definition: >
+      Probabilistic representations and solution methods using backward SDEs and
+      forward–backward SDE systems for control/MFG problems.
+    inclusion_criteria: >
+      BSDE/FBSDE formulation is central for analysis or numerics.
+    exclusion_criteria: >
+      PDE-only approach with no BSDE/FBSDE component.
+    synonyms:
+      - BSDE
+      - FBSDE
+      - forward-backward SDE
+      - probabilistic representation
+
+  - id: k-pde-discretization
+    prefix: k
+    name: PDE Discretization
+    definition: >
+      Numerical discretization of PDEs (finite difference/volume/element, monotone schemes,
+      semi-Lagrangian, upwind fluxes) to compute HJB/FP/master-equation solutions.
+    inclusion_criteria: >
+      Any explicit PDE discretization method used as the main computational tool.
+    exclusion_criteria: >
+      Pure particle/Monte Carlo methods with no PDE discretization.
+    synonyms:
+      - finite difference
+      - finite volume
+      - finite element
+      - semi-Lagrangian
+      - upwind scheme
+
+  - id: k-particle-methods
+    prefix: k
+    name: Particle Methods
+    definition: >
+      Simulation-based methods using interacting particles/agents (Monte Carlo) to approximate
+      mean-field dynamics, expectations, or equilibria.
+    inclusion_criteria: >
+      Interacting particle systems, Monte Carlo mean-field approximations, particle learning schemes.
+    exclusion_criteria: >
+      Grid/PDE-only methods with no particle component.
+    synonyms:
+      - Monte Carlo
+      - interacting particles
+      - particle simulation
+      - agent-based approximation
+
+  - id: k-iterative-linear-solvers
+    prefix: k
+    name: Iterative Linear Solvers
+    definition: >
+      Krylov or multilevel methods (CG, GMRES, BiCGStab, multigrid, PCG) used to solve
+      linear systems arising from discretization/linearization.
+    inclusion_criteria: >
+      Any iterative linear algebra solver is a named critical component (often in Newton/implicit steps).
+    exclusion_criteria: >
+      Direct solvers only (dense LU) without iterative method emphasis.
+    synonyms:
+      - CG
+      - GMRES
+      - Krylov methods
+      - multigrid
+      - PCG
+
+  - id: k-variational-formulation
+    prefix: k
+    name: Variational Formulation
+    definition: >
+      Recasting the problem as an optimization, variational inequality, or weak form
+      (Galerkin, energy methods, convex duality) to enable analysis or computation.
+    inclusion_criteria: >
+      Optimization/VI/weak-form derivations are central to the method or proof.
+    exclusion_criteria: >
+      Pure fixed-point iteration without a variational/weak-form framing.
+    synonyms:
+      - variational inequality
+      - weak formulation
+      - Galerkin method
+      - convex duality
+
+  - id: k-gradient-based
+    prefix: k
+    name: Gradient-Based Optimization
+    definition: >
+      Using gradient descent/SGD/proximal/accelerated methods to fit parameters or solve
+      optimization layers in MFG/MFC/RL pipelines.
+    inclusion_criteria: >
+      Explicit gradient-based optimization algorithm used as a core solver/training loop.
+    exclusion_criteria: >
+      Closed-form solvers or purely dynamic-programming-based exact methods.
+    synonyms:
+      - gradient descent
+      - SGD
+      - proximal gradient
+      - first-order methods
+
+  - id: k-rate-distortion
+    prefix: k
+    name: Rate–Distortion Theory
+    definition: >
+      Information-theoretic framework quantifying the optimal tradeoff between
+      communication rate and expected distortion (loss) under encoding constraints.
+    inclusion_criteria: >
+      Explicit rate–distortion objectives/bounds, R(D) curves, or coding-optimality arguments.
+    exclusion_criteria: >
+      Communication cost without information-theoretic rate–distortion framing.
+    synonyms:
+      - rate distortion
+      - R(D)
+      - rate-distortion tradeoff
+
+  - id: k-quantization
+    prefix: k
+    name: Quantization
+    definition: >
+      Discretizing continuous signals/states/messages into finite alphabets via scalar/vector
+      quantizers, codebooks, or clustering-like encoders.
+    inclusion_criteria: >
+      Quantizers, codebooks, vector quantization, quantization error analysis are explicit.
+    exclusion_criteria: >
+      Generic discretization of time/space grids (use k-pde-discretization) without signal quantization focus.
+    synonyms:
+      - vector quantization
+      - codebook
+      - discretize messages
+      - quantizer
+
+  - id: k-prefix-codes
+    prefix: k
+    name: Prefix Codes
+    definition: >
+      Prefix-free coding schemes (e.g., Huffman) enabling uniquely decodable variable-length
+      message encodings tied to probabilities or costs.
+    inclusion_criteria: >
+      Huffman/prefix-free codes, code-length optimality, Kraft inequality usage.
+    exclusion_criteria: >
+      Variable-rate messaging without explicit coding/prefix constraints.
+    synonyms:
+      - Huffman coding
+      - prefix-free codes
+      - Kraft inequality
+      - variable-length codes

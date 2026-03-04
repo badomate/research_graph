@@ -5,8 +5,13 @@ Pipeline for each paper in the 'Paper Tracker' Notion DB with Status == 's1-proc
 
   PREFLIGHT GATES
   ---------------
-  1. Parse Zotero item key from "Zotero URI" rich_text property.
-  2. Check Koofr zip exists ({key}.zip); if missing set status "s1b-waiting-attachment".
+  1a. Parse parent item key from "Zotero URI" (Notero URL points to bibliographic item).
+  1b. Resolve PDF attachment key via Zotero Web API (children endpoint).
+        - If URL already encodes /attachment/<KEY> use that directly.
+        - Otherwise GET /users/<uid>/items/<PARENT_KEY>/children, filter PDF attachments.
+        - Store zotero_parent_key, zotero_attachment_key, attachment_resolution_status
+          and attachment_resolution_log back to Notion.
+  2. Check Koofr zip exists ({attachment_key}.zip); if missing set "s1b-waiting-attachment".
   3. Download the zip, extract the largest PDF (or "primary_pdf_filename" if set).
   4. Compute pdf_sha256; store in "PDF SHA256" property.
   5. Idempotency check via JobLedger; if already done set status "s2-extracted" and skip.
@@ -72,7 +77,7 @@ logger = logging.getLogger(__name__)
 TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
 
 # ── OpenAI model ───────────────────────────────────────────────────────────────
-OPENAI_MODEL = "gpt-4o"
+OPENAI_MODEL = "gpt-5.2"
 
 # ── Notion hard limits ─────────────────────────────────────────────────────────
 # Notion's API rejects any rich_text content exceeding 2000 characters.
@@ -81,51 +86,256 @@ NOTION_BLOCK_MAX_CHARS = 1900
 # Notion allows at most 100 child blocks per append_block_children call.
 NOTION_BLOCKS_PER_REQUEST = 100
 
-# ── Zotero key regex ───────────────────────────────────────────────────────────
-# Matches exactly 8 uppercase alphanumeric characters that are NOT surrounded
-# by other uppercase-alphanumeric characters (i.e. not part of a longer token).
-# Negative lookbehind/lookahead on [A-Z0-9] acts as a word-boundary for this
-# character class since \b treats digits and uppercase as word chars.
+# ── Zotero URL regex ──────────────────────────────────────────────────────────
+# Two patterns to handle both Notero URL shapes:
+#
+#   Parent item URL (most common from Notero):
+#     https://zotero.org/<user>/items/<PARENT_KEY>
+#
+#   Direct attachment URL (if Notero ever links the file directly):
+#     https://zotero.org/<user>/items/<PARENT_KEY>/attachment/<ATTACH_KEY>
+#
+# If the attachment key is present we skip the Zotero API call entirely.
+_ZOTERO_PARENT_RE = re.compile(r"zotero\.org/[^/]+/items/([A-Z0-9]{8})")
+_ZOTERO_ATTACH_RE = re.compile(
+    r"zotero\.org/[^/]+/items/[A-Z0-9]{8}/attachment/([A-Z0-9]{8})"
+)
+
+# ── Zotero Web API ─────────────────────────────────────────────────────────────
+ZOTERO_API_BASE = "https://api.zotero.org"
+
 # Maximum number of validation errors to include in the repair prompt.
 MAX_REPAIR_ERRORS = 5
-
-_ZOTERO_KEY_RE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{8})(?![A-Z0-9])")
 
 # ── System prompt template ─────────────────────────────────────────────────────
 # [INJECT_DYNAMIC_HUBS_HERE] is replaced at runtime with the live hub list.
 EXTRACTION_SYSTEM_PROMPT = """\
-You are a highly rigorous researcher in applied mathematics. Process the Markdown paper \
-and extract strictly factual mathematical structures.
+You are a research assistant specialized in extracting precise mathematical knowledge
+from scientific papers in applied mathematics, probability, optimization, and mean-field games.
 
-Rules:
-1. Extract exact mathematical formulations. Do not paraphrase.
-2. Format variables and equations in valid LaTeX ($ for inline, $$ for display).
-3. Explicitly extract boundary conditions or assumptions. If none, write \
+Your task is to convert a Markdown representation of a research paper into a structured
+set of reusable mathematical concepts suitable for a long-term research knowledge graph.
+
+The goal is NOT summarization. The goal is to extract the **core reusable mathematical objects**
+that appear in the paper.
+
+Your output will populate a Zettelkasten-style knowledge graph consisting of:
+
+• **Concepts ("bricks")**
+• **Hubs ("maps")**
+
+----------------------------------------------------------------------
+KNOWLEDGE GRAPH STRUCTURE
+----------------------------------------------------------------------
+
+The knowledge graph has two layers:
+
+1. **Concepts (Atomic Knowledge Units)**
+
+Concepts are the smallest reusable mathematical building blocks.
+Examples include:
+
+• Definitions  
+• Theorems  
+• Lemmas  
+• Algorithms  
+• Assumptions  
+• Important proof techniques
+
+Each concept should be a **self-contained mathematical statement**
+that can be understood independently of the paper.
+
+A concept should represent a **mathematical result that might be reused
+in other research contexts.**
+
+Examples:
+
+GOOD concepts:
+- Lasry–Lions Monotonicity Condition for Mean Field Games
+- Existence of Nash Equilibrium in Finite-State GMFG
+- Fixed Point Characterization of Mean Field Game Equilibrium
+- Contractive Bellman Operator for GMFG
+
+BAD concepts:
+- "Theorem 1"
+- "Equation 5"
+- "Proof of theorem"
+- intermediate inequalities inside proofs
+- trivial steps used only locally
+
+Do NOT extract tiny intermediate lemmas that are only used as a step
+inside a larger theorem unless they are independently meaningful.
+
+Example rule:
+
+If a paper proves:
+
+Lemma A → Lemma B → Theorem C
+
+and Lemma A/B only exist to prove C,
+then extract **only Theorem C**.
+
+Only extract smaller results if they have clear independent value.
+
+----------------------------------------------------------------------
+2. Hubs (Concept Maps)
+----------------------------------------------------------------------
+
+Hubs are high-level topic clusters in the knowledge graph.
+
+Each concept must be assigned to **one hub** from ALLOWED_HUBS.
+
+Hubs represent areas of theory such as:
+
+- Mean Field Games
+- Graphon MFG
+- Master Equation Theory
+- HJB–FP PDE Systems
+- Fixed Point Theory
+- Numerical MFG Methods
+- Stochastic Control
+
+You MUST choose a hub from ALLOWED_HUBS.
+
+If no hub fits, use:
+
+"Uncategorized"
+
+Never invent new hubs.
+
+----------------------------------------------------------------------
+CONCEPT NAMING RULES
+----------------------------------------------------------------------
+
+Each concept must have a **descriptive canonical title**.
+
+DO NOT use numbering such as:
+
+❌ "Theorem 1"
+❌ "Lemma 3.2"
+
+Instead convert to a descriptive name such as:
+
+✔ "Existence of Nash Equilibrium in Finite-State GMFG"
+✔ "Lasry–Lions Monotonicity Condition"
+✔ "Convergence of Policy Iteration for Finite-State MFG"
+
+The title should allow a researcher to identify the concept later
+without reopening the paper.
+
+----------------------------------------------------------------------
+MATHEMATICAL EXTRACTION RULES
+----------------------------------------------------------------------
+
+1. Extract **exact mathematical statements** when possible.
+2. Use valid LaTeX.
+3. Preserve mathematical notation from the paper.
+4. Explicitly extract **assumptions and boundary conditions**.
+5. If assumptions are not clearly stated write:
+
 "None explicitly stated."
-4. For hub suggestions: provide descriptive text only from ALLOWED_HUBS. \
-Do not invent hubs. If none fit, use "Uncategorized".
 
-ALLOWED_HUBS: [INJECT_DYNAMIC_HUBS_HERE]
+6. Do NOT hallucinate missing equations.
 
-You MUST respond in valid JSON matching this EXACT schema:
+----------------------------------------------------------------------
+WHAT TO EXTRACT
+----------------------------------------------------------------------
+
+Extract only **mathematical structures that are useful outside this paper**:
+
+• core definitions
+• main theoretical results
+• key lemmas used broadly
+• algorithms or procedures
+• important assumptions
+• convergence results
+• equilibrium characterizations
+
+Do NOT extract:
+
+• trivial steps in proofs
+• repeated equations
+• long proof arguments
+• discussion text
+• motivation paragraphs
+• minor technical bounds
+
+Proofs should only be extracted if the **proof technique itself is reusable**.
+
+----------------------------------------------------------------------
+VARIABLE DESCRIPTION RULES
+----------------------------------------------------------------------
+
+The "variables" field must explain the symbols used in the theorem.
+
+Example:
+
+"x ∈ Ω (state), m_t (population distribution), V(t,x) (value function)"
+
+----------------------------------------------------------------------
+SOURCE TRACEABILITY
+----------------------------------------------------------------------
+
+Every concept must include traceability information:
+
+• source_pages
+• optional short quote
+
+Quotes must be **≤ 25 words**.
+
+----------------------------------------------------------------------
+OUTPUT FORMAT
+----------------------------------------------------------------------
+
+You MUST respond in **valid JSON only**.
+
+No explanations outside JSON.
+
+The JSON MUST match the following schema exactly.
+
+Before producing the JSON, internally perform these steps:
+
+1. Identify the main mathematical contributions of the paper.
+2. Determine which results are reusable outside this paper.
+3. Remove trivial or proof-only steps.
+4. Assign canonical descriptive names to each concept.
+
+Then produce the JSON.
 {
-  "one_liner": "string - one sentence summary",
+  "one_liner": "string - one sentence description of the paper",
   "active_themes": ["string"],
   "extracted_concepts": [
     {
       "type": "Definition | Theorem | Lemma | Algorithm | Assumption | Proof",
-      "title": "string - short label or theorem number",
-      "statement_latex": "string - exact statement in valid LaTeX",
+      "title": "string - descriptive canonical concept name",
+      "statement_latex": "string - exact mathematical statement in LaTeX",
       "assumptions": "string - boundary conditions or None explicitly stated.",
       "variables": "string - comma-separated variable descriptions",
-      "conclusion": "string - result in plain English",
-      "source_pages": [1, 2],
-      "source_quotes": "optional verbatim quote max 25 words or null",
-      "confidence": 0.95,
+      "conclusion": "string - result explained in plain English",
+      "source_pages": [1,2],
+      "source_quotes": "optional quote ≤25 words or null",
+      "confidence": 0.0-1.0,
       "suggested_hub": "string from ALLOWED_HUBS"
     }
   ]
 }
+
+----------------------------------------------------------------------
+QUALITY STANDARD
+----------------------------------------------------------------------
+
+Prefer **fewer, higher-quality concepts** over many trivial ones.
+
+Typical research paper output should contain **3-12 concepts**.
+
+Each concept must represent a **meaningful mathematical contribution.**
+
+----------------------------------------------------------------------
+ALLOWED_HUBS
+----------------------------------------------------------------------
+
+[INJECT_DYNAMIC_HUBS_HERE]
+
 """
 
 
@@ -140,9 +350,92 @@ class IngestionEngine:
         self.paper_tracker_db = os.environ["NOTION_PAPER_TRACKER_DB_ID"]
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
-        self.koofr_base = os.environ.get("KOOFR_PDF_PATH", "/zotero")
+        self.koofr_base = os.environ.get("KOOFR_PDF_PATH", "Koofr/zotero")
         self._ledger = JobLedger()
         self._tag_linter = TagLinter()
+        # Zotero Web API credentials for attachment key resolution.
+        self.zotero_user_id = os.environ["ZOTERO_USER_ID"]
+        self.zotero_api_key = os.environ["ZOTERO_API_KEY"]
+
+    # ── Zotero attachment resolution ──────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
+    def _zotero_children(self, parent_key: str) -> list[dict]:
+        """Fetch children of a Zotero parent item via the Web API."""
+        url = f"{ZOTERO_API_BASE}/users/{self.zotero_user_id}/items/{parent_key}/children"
+        resp = requests.get(
+            url,
+            headers={"Zotero-API-Key": self.zotero_api_key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _resolve_attachment_key(
+        self, zotero_uri: str, preferred_filename: str | None = None
+    ) -> tuple[str, str]:
+        """
+        Resolve (parent_key, attachment_key) from a Notero Zotero URI.
+
+        Short-circuits if the URL already encodes the attachment key directly.
+        Otherwise queries the Zotero Web API children endpoint and picks the
+        appropriate PDF attachment.
+
+        Raises
+        ------
+        ValueError  – URL cannot be parsed.
+        RuntimeError – No PDF attachment found among children.
+        RuntimeError – Multiple PDFs and no preferred_filename to disambiguate.
+        """
+        # Fast path: URL already points at a specific attachment.
+        m_attach = _ZOTERO_ATTACH_RE.search(zotero_uri)
+        if m_attach:
+            attach_key = m_attach.group(1)
+            m_parent = _ZOTERO_PARENT_RE.search(zotero_uri)
+            parent_key = m_parent.group(1) if m_parent else attach_key
+            return parent_key, attach_key
+
+        # Normal path: URL points at the parent bibliographic item.
+        m_parent = _ZOTERO_PARENT_RE.search(zotero_uri)
+        if not m_parent:
+            raise ValueError(f"Cannot parse Zotero key from URI: {zotero_uri!r}")
+        parent_key = m_parent.group(1)
+
+        children = self._zotero_children(parent_key)
+
+        pdfs: list[dict] = []
+        for item in children:
+            data = item.get("data", {})
+            if data.get("itemType") != "attachment":
+                continue
+            fn = (data.get("filename") or "").lower()
+            ct = (data.get("contentType") or "").lower()
+            if ct == "application/pdf" or fn.endswith(".pdf"):
+                pdfs.append({
+                    "key": item.get("key"),
+                    "filename": data.get("filename"),
+                    "size": data.get("size") or 0,
+                })
+
+        if not pdfs:
+            raise RuntimeError("No PDF attachment found among Zotero children.")
+
+        # If caller specified a preferred filename, try to match it first.
+        if preferred_filename:
+            for a in pdfs:
+                if a["filename"] == preferred_filename:
+                    return parent_key, a["key"]
+
+        if len(pdfs) == 1:
+            return parent_key, pdfs[0]["key"]
+
+        # Multiple PDFs: pick the largest.
+        pdfs.sort(key=lambda x: x["size"], reverse=True)
+        logger.warning(
+            "Multiple PDF attachments for parent %s; picking largest (%s, %d bytes).",
+            parent_key, pdfs[0]["filename"], pdfs[0]["size"],
+        )
+        return parent_key, pdfs[0]["key"]
 
     # ── WebDAV client factory ──────────────────────────────────────────────────
 
@@ -228,15 +521,14 @@ class IngestionEngine:
         page_id = page["id"]
         props = page["properties"]
 
-        # ── Preflight gate 1: Parse Zotero key ────────────────────────────────
+        # ── Preflight gate 1a: Parse parent key from Notero URL ──────────────
         zotero_uri = self._get_text_prop(props, "Zotero URI")
-        match = _ZOTERO_KEY_RE.search(zotero_uri)
-        if not match:
+        if not _ZOTERO_PARENT_RE.search(zotero_uri):
             logger.warning(
-                "[%s] Missing or invalid Zotero URI: '%s' -- skipping.", page_id, zotero_uri
+                "[%s] Missing or unparseable Zotero URI: '%s' -- skipping.",
+                page_id, zotero_uri,
             )
             return
-        zotero_key = match.group(1)
 
         # Short unique ID for log correlation and temp-file naming.
         run_id = uuid.uuid4().hex[:8]
@@ -245,49 +537,81 @@ class IngestionEngine:
         job_id: int | None = None
 
         try:
-            # ── Preflight gate 2: Check zip exists ────────────────────────────
-            zip_remote = f"{self.koofr_base}/{zotero_key}.zip"
-            logger.info("[%s] Checking Koofr zip: %s", run_id, zip_remote)
-            if not self._koofr_exists(zip_remote):
-                logger.warning("[%s] Zip not found -- setting s1b-waiting-attachment.", run_id)
+            # ── Preflight gate 1b: Resolve PDF attachment key ─────────────────
+            preferred_filename = self._get_text_prop(props, "primary_pdf_filename") or None
+            logger.info("[%s] Resolving Zotero attachment key for URI: %s", run_id, zotero_uri)
+            try:
+                parent_key, attachment_key = self._resolve_attachment_key(
+                    zotero_uri, preferred_filename=preferred_filename
+                )
+            except (ValueError, RuntimeError) as exc:
+                logger.warning("[%s] Attachment resolution failed: %s", run_id, exc)
                 self.notion.update_page(
                     page_id=page_id,
-                    properties={"Status": self.notion.select_prop("s1b-waiting-attachment")},
+                    properties={
+                        "Status": self.notion.status_prop("s1b-waiting-attachment"),
+                        "attachment_resolution_status": self.notion.select_prop("error"),
+                        "attachment_resolution_log": {
+                            "rich_text": self.notion.rich_text(str(exc))
+                        },
+                    },
                 )
                 return
 
-            # ── Preflight gate 3: Download zip and extract PDF ────────────────
-            TMP_DIR.mkdir(parents=True, exist_ok=True)
-            local_zip = TMP_DIR / f"{run_id}.zip"
-            local_pdf = TMP_DIR / f"{run_id}.pdf"
-            local_md = TMP_DIR / f"{run_id}.md"
-
-            self._download_koofr(zip_remote, local_zip)
-
-            primary_filename = self._get_text_prop(props, "primary_pdf_filename")
-            self._extract_pdf_from_zip(
-                local_zip, local_pdf, preferred=primary_filename or None
+            logger.info(
+                "[%s] Resolved parent=%s attachment=%s", run_id, parent_key, attachment_key
             )
-            local_zip.unlink(missing_ok=True)
-
-            # ── Preflight gate 4: Compute SHA256 ──────────────────────────────
-            pdf_sha256 = self._sha256(local_pdf)
-            logger.info("[%s] PDF SHA256: %s", run_id, pdf_sha256)
+            # Store both keys and mark resolution as ok.
             self.notion.update_page(
                 page_id=page_id,
-                properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
+                properties={
+                    "zotero_parent_key": {
+                        "rich_text": self.notion.rich_text(parent_key)
+                    },
+                    "zotero_attachment_key": {
+                        "rich_text": self.notion.rich_text(attachment_key)
+                    },
+                    "attachment_resolution_status": self.notion.select_prop("ok"),
+                    "attachment_resolution_log": {"rich_text": self.notion.rich_text("")},
+                },
+            )
+            # ── Preflight gate 2–4 (LOCAL TEST MODE) ─────────────────────────────
+            # Looks for "{attachment_key}.zip" in the same folder as this Python file.
+
+          # zip is next to this python file (fine)
+            script_dir = Path(__file__).resolve().parent
+            local_zip = script_dir / f"{attachment_key}.zip"
+
+            # IMPORTANT: write the PDF into the shared volume path so marker-api can read it
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            local_pdf = TMP_DIR / f"{run_id}.pdf"
+            local_md  = TMP_DIR / f"{run_id}.md"
+
+            logger.info("[%s] LOCAL ZIP MODE: %s -> %s", run_id, local_zip, local_pdf)
+
+            self._extract_pdf_from_zip(local_zip, local_pdf, preferred=preferred_filename)
+
+            # ── Compute SHA256 ───────────────────────────────────────────────────
+            pdf_sha256 = self._sha256(local_pdf)
+            logger.info("[%s] PDF SHA256: %s", run_id, pdf_sha256)
+
+            self.notion.update_page(
+                page_id=page_id,
+                properties={
+                    "PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}
+                },
             )
 
-            # ── Preflight gate 5: Idempotency check ───────────────────────────
-            if self._ledger.is_already_done(zotero_key, pdf_sha256, EXTRACTION_VERSION):
-                logger.info(
-                    "[%s] Already processed (ledger hit) -- marking s2-extracted.", run_id
-                )
-                self.notion.update_page(
-                    page_id=page_id,
-                    properties={"Status": self.notion.select_prop("s2-extracted")},
-                )
-                return
+            # # ── Preflight gate 5: Idempotency check ───────────────────────────
+            # if self._ledger.is_already_done(attachment_key, pdf_sha256, EXTRACTION_VERSION):
+            #     logger.info(
+            #         "[%s] Already processed (ledger hit) -- marking s2-extracted.", run_id
+            #     )
+            #     self.notion.update_page(
+            #         page_id=page_id,
+            #         properties={"Status": self.notion.status_prop("s2-extracted")},
+            #     )
+            #     return
 
             # ── Tag completeness gate ─────────────────────────────────────────
             tags = self._get_multi_select_prop(props, "Tags")
@@ -298,7 +622,7 @@ class IngestionEngine:
                 self.notion.update_page(
                     page_id=page_id,
                     properties={
-                        "Status": self.notion.select_prop("blocked-tags"),
+                        "Status": self.notion.status_prop("blocked-tags"),
                         "tag_lint_report": {
                             "rich_text": self.notion.rich_text(report_text)
                         },
@@ -319,12 +643,16 @@ class IngestionEngine:
                 )
 
             # ── Start job ledger ──────────────────────────────────────────────
-            job_id = self._ledger.start_job(zotero_key, pdf_sha256, EXTRACTION_VERSION)
+            job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
             logger.info("[%s] JobLedger job_id=%d", run_id, job_id)
 
             # ── Step 1: Convert PDF to Markdown ───────────────────────────────
-            logger.info("[%s] Converting PDF to Markdown ...", run_id)
-            markdown_text = self._pdf_to_markdown(local_pdf)
+            # ── Step 1 (TEST MODE): Load precomputed Markdown next to the zip ─────────
+            script_dir = Path(__file__).resolve().parent
+            md_path = script_dir / f"{attachment_key}.md"   # you pasted it here
+            logger.info("[%s] TEST MODE: loading markdown from %s", run_id, md_path)
+
+            markdown_text = md_path.read_text(encoding="utf-8")
             local_md.write_text(markdown_text, encoding="utf-8")
             self._ledger.update_status(job_id, "marker_done")
 
@@ -572,7 +900,7 @@ class IngestionEngine:
         self.notion.update_page(
             page_id=page_id,
             properties={
-                "Status": self.notion.select_prop("s2-extracted"),
+                "Status": self.notion.status_prop("s2-extracted"),
                 "AI Status": self.notion.select_prop("Unverified-AI"),
                 "One Liner": {"rich_text": self.notion.rich_text(result.one_liner)},
                 "Active Themes": self.notion.multi_select_prop(result.active_themes),
@@ -748,9 +1076,14 @@ class IngestionEngine:
 
     @staticmethod
     def _get_text_prop(props: dict, key: str) -> str:
-        """Extract plain text from a Notion rich_text property."""
+        """Extract plain text from a Notion rich_text or url property."""
+        prop = props.get(key, {})
+        prop_type = prop.get("type")
+        if prop_type == "url":
+            return prop.get("url") or ""
+        # rich_text (default)
         try:
-            return props[key]["rich_text"][0]["plain_text"]
+            return prop["rich_text"][0]["plain_text"]
         except (KeyError, IndexError):
             return ""
 
