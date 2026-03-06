@@ -127,7 +127,7 @@ def main() -> None:
     # ── Module 1: Ingestion Engine — every 5 minutes ─────────────────────────
     scheduler.add_job(
         run_ingestion,
-        trigger=IntervalTrigger(minutes=1),
+        trigger=IntervalTrigger(minutes=10),
         id="ingestion",
         name="Core Ingestion Engine",
         max_instances=1,
@@ -182,7 +182,7 @@ def main() -> None:
     # ── Module 6: Promotion Engine — every 30 minutes ─────────────────────────
     scheduler.add_job(
         run_promotion,
-        trigger=IntervalTrigger(minutes=30),
+        trigger=IntervalTrigger(minutes=1),
         id="promotion",
         name="Promotion Engine",
         max_instances=1,
@@ -195,6 +195,7 @@ def main() -> None:
         logger.info("  • [%s] %s", job.id, job.name)
 
     try:
+        run_promotion()
         scheduler.start()
 
     except (KeyboardInterrupt, SystemExit):

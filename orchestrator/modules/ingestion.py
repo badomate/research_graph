@@ -84,7 +84,7 @@ from .extraction_schema import (
 from .job_ledger import JobLedger
 from .notion_client_wrapper import NotionClientWrapper
 from .tag_linter import TagLinter, lint_report_to_text
-
+from .notion_parser import paragraph_blocks_from_latex
 logger = logging.getLogger(__name__)
 
 # -- Scratch directory inside the Docker volume ---------------------------------
@@ -315,6 +315,9 @@ class IngestionEngine:
         self._tag_linter = TagLinter()
         self.zotero_user_id = os.environ["ZOTERO_USER_ID"]
         self.zotero_api_key = os.environ["ZOTERO_API_KEY"]
+        # Lazy-cached {prop_name: prop_type} for the Knowledge Inbox DB.
+        # Populated on first use by _get_ki_schema().
+        self._ki_schema: dict[str, str] | None = None
 
     # -- WebDAV client factory --------------------------------------------------
 
@@ -539,18 +542,18 @@ class IngestionEngine:
             )
 
             # -- Preflight gate 5: Idempotency check ---------------------------
-            if self._ledger.is_already_done(attachment_key, pdf_sha256, EXTRACTION_VERSION):
-                logger.info(
-                    "[%s] Already processed (ledger hit) -- marking s2b-linked-ai.",
-                    run_id,
-                )
-                self.notion.update_page(
-                    page_id=page_id,
-                    properties={
-                        "Status": self.notion.status_prop("s2b-linked-ai")
-                    },
-                )
-                return
+            # if self._ledger.is_already_done(attachment_key, pdf_sha256, EXTRACTION_VERSION):
+            #     logger.info(
+            #         "[%s] Already processed (ledger hit) -- marking s2b-linked-ai.",
+            #         run_id,
+            #     )
+            #     self.notion.update_page(
+            #         page_id=page_id,
+            #         properties={
+            #             "Status": self.notion.status_prop("s2b-linked-ai")
+            #         },
+            #     )
+            #     return
 
             # -- Tag completeness gate -----------------------------------------
             tags = self._get_multi_select_prop(props, "Tags")
@@ -619,6 +622,9 @@ class IngestionEngine:
             logger.info("[%s] Created %d Knowledge Inbox page(s).", run_id, len(ki_pages))
             self._ledger.update_status(job_id, "extract_done")
 
+            # Inject newly created concepts into sb_index so Stage 2/3 can link to them.
+            self._inject_ki_pages_into_index(ki_pages, sb_index)
+
             # -- STAGE 2: Retrieve candidates ----------------------------------
             logger.info("[%s] Stage 2: retrieving candidates from Second Brain ...", run_id)
             concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
@@ -626,7 +632,7 @@ class IngestionEngine:
                 candidates = self._retrieve_candidates_for_concept(concept, sb_index)
                 self._update_knowledge_item_candidates(ki_page_id, candidates)
                 concept_candidates.append((concept, ki_page_id, candidates))
-                logger.debug(
+                logger.info(
                     "[%s] '%s': %d candidate(s) retrieved.",
                     run_id,
                     concept.title,
@@ -678,6 +684,47 @@ class IngestionEngine:
             if local_pdf is not None and local_pdf.exists():
                 local_pdf.unlink()
 
+    def _inject_ki_pages_into_index(
+        self,
+        ki_pages: list[tuple[MathObject, str]],
+        sb_index: list[dict],
+    ) -> None:
+        """
+        Append freshly created Knowledge Inbox concepts into the live sb_index
+        so that Stage 2/3 candidate retrieval can link to them.
+
+        This handles both intra-paper linking (concepts within the same paper)
+        and inter-paper linking (concepts from earlier papers in the same batch).
+        """
+        def _toks(s: str) -> set:
+            return {t.lower().strip() for t in re.split(r"[\s\-,;]+", s) if t.strip()}
+
+        for concept, ki_page_id in ki_pages:
+            bag: set = set()
+            for kw_list in (
+                concept.canonical_keywords,
+                concept.prereq_keywords,
+                concept.downstream_keywords,
+            ):
+                for kw in kw_list:
+                    bag |= _toks(kw)
+            bag |= _toks(concept.title)
+
+            sb_index.append({
+                "id": ki_page_id,
+                "title": concept.title,
+                "hub": concept.suggested_hub or "",
+                "summary": concept.conclusion or "",
+                "tags": concept.setting or [],
+                "keywords_bag": bag,
+            })
+
+        logger.debug(
+            "Injected %d new concept(s) into sb_index (total now: %d).",
+            len(ki_pages),
+            len(sb_index),
+        )
+        
     # -- Zotero helpers --------------------------------------------------------
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=20))
@@ -1033,6 +1080,34 @@ class IngestionEngine:
 
     # -- Create Knowledge Inbox entry ------------------------------------------
 
+    def _get_ki_schema(self) -> dict[str, str]:
+        """
+        Return a ``{property_name: property_type}`` mapping for the Knowledge
+        Inbox DB, fetched once and cached for the lifetime of this engine
+        instance.
+        """
+        if self._ki_schema is None:
+            db = self.notion.get_database(self.knowledge_inbox_db)
+            self._ki_schema = {
+                k: v["type"] for k, v in db.get("properties", {}).items()
+            }
+            logger.debug("KI DB schema: %s", self._ki_schema)
+        return self._ki_schema
+
+    def _ki_prop(self, key: str, value: str) -> dict:
+        """
+        Build a Notion property value for a Knowledge Inbox field whose type
+        may be either ``select`` or ``status`` depending on the live schema.
+
+        Using ``select_prop`` for a ``status``-typed field (or vice-versa)
+        causes Notion to return a 400 validation error, so we always consult
+        the cached schema rather than hardcoding the type.
+        """
+        prop_type = self._get_ki_schema().get(key, "select")
+        if prop_type == "status":
+            return self.notion.status_prop(value)
+        return self.notion.select_prop(value)
+
     def _create_knowledge_item(
         self,
         paper_page_id: str,
@@ -1056,13 +1131,13 @@ class IngestionEngine:
             if concept.source_pages
             else ""
         )
-        title_key = self.notion.get_title_property_name(self.knowledge_inbox_db)    
+        title_key = self.notion.get_title_property_name(self.knowledge_inbox_db)
         properties: dict = {
-            title_key: self.notion.title_prop(f"[{kind}] {title}"),
+            title_key: self.notion.title_prop(f"{title}"),
             "Type": self.notion.select_prop(kind),
-            "Status": self.notion.select_prop("Inbox"),
-            "verification_status": self.notion.select_prop("unverified"),
-            "Graph Link Status": self.notion.select_prop("unlinked"),
+            "Status": self._ki_prop("Status", "Inbox"),
+            "verification_status": self._ki_prop("verification_status", "unverified"),
+            "Graph Link Status": self._ki_prop("Graph Link Status", "unlinked"),
             "Source Paper": self.notion.relation_prop([paper_page_id]),
         }
 
@@ -1071,7 +1146,7 @@ class IngestionEngine:
                 "rich_text": self.notion.rich_text(source_pages_str)
             }
         if concept.suggested_hub:
-            properties["Suggested Hub"] = self.notion.rich_text(concept.suggested_hub)
+             properties["Suggested Hub"] = {"rich_text": self.notion.rich_text(concept.suggested_hub)}
 
         properties["AI Confidence"] = {"number": concept.confidence}
 
@@ -1127,24 +1202,24 @@ class IngestionEngine:
 
         body_blocks: list[dict] = []
         body_blocks.append(self._heading_block("Assumptions"))
-        body_blocks.extend(self._paragraph_blocks(concept.assumptions))
+        body_blocks.extend(paragraph_blocks_from_latex(concept.assumptions))
         body_blocks.append(self._heading_block("Statement"))
-        body_blocks.extend(self._paragraph_blocks(concept.statement_latex))
+        body_blocks.extend(paragraph_blocks_from_latex(concept.statement_latex))
         if concept.variables:
             body_blocks.append(self._heading_block("Variables"))
-            body_blocks.extend(self._paragraph_blocks(concept.variables))
+            body_blocks.extend(paragraph_blocks_from_latex(concept.variables))
         if concept.conclusion:
             body_blocks.append(self._heading_block("Conclusion"))
-            body_blocks.extend(self._paragraph_blocks(concept.conclusion))
+            body_blocks.extend(paragraph_blocks_from_latex(concept.conclusion))
         if concept.source_quotes:
             body_blocks.append(self._heading_block("Source Quote"))
-            body_blocks.extend(self._paragraph_blocks(concept.source_quotes))
+            body_blocks.extend(paragraph_blocks_from_latex(concept.source_quotes))
         if concept.interpretation:
             body_blocks.append(self._heading_block("Interpretation"))
-            body_blocks.extend(self._paragraph_blocks(concept.interpretation))
+            body_blocks.extend(paragraph_blocks_from_latex(concept.interpretation))
         if concept.proof_idea:
             body_blocks.append(self._heading_block("Proof Idea"))
-            body_blocks.extend(self._paragraph_blocks(concept.proof_idea))
+            body_blocks.extend(paragraph_blocks_from_latex(concept.proof_idea))
 
         self._append_blocks_in_batches(new_page_id, body_blocks)
         return new_page_id
@@ -1178,7 +1253,7 @@ class IngestionEngine:
                 "Edge Suggestions": {
                     "rich_text": self.notion.rich_text(edge_json)
                 },
-                "Graph Link Status": self.notion.select_prop("linked-ai"),
+                "Graph Link Status": self._ki_prop("Graph Link Status", "linked-ai"),
             },
         )
 
@@ -1210,17 +1285,17 @@ class IngestionEngine:
                 concept_tokens |= _toks(kw)
         concept_tokens |= _toks(concept.title)
 
-        if not concept_tokens:
-            return []
+        # if not concept_tokens:
+        #     return []
 
         scored: list[tuple[float, dict]] = []
         for record in sb_index:
             bag = record.get("keywords_bag", set())
-            if not bag:
-                continue
+            # if not bag:
+                # continue
             overlap = len(concept_tokens & bag)
-            if overlap == 0:
-                continue
+            # if overlap == 0:
+            #     continue
             score = overlap / math.log(1.0 + len(bag))
             if record.get("hub") and record["hub"] == concept.suggested_hub:
                 score += 0.2
