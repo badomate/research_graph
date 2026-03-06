@@ -1,108 +1,130 @@
 #!/usr/bin/env python3
 """
-Minimal Koofr WebDAV validator.
+notion_smoketest.py
 
-What it checks:
-1) Connects to Koofr WebDAV
-2) Verifies base folder exists (e.g., /zotero)
-3) For a given attachment key, checks existence of:
-   - /zotero/<KEY>.zip
-   - /zotero/<KEY>.prop
-4) Optionally lists the first N entries in the base folder.
-
-Usage:
-  export KOOFR_USER="..."
-  export KOOFR_APP_PASSWORD="..."
-  export KOOFR_PDF_PATH="/zotero"   # optional
-  python koofr_validate.py FT2BINAR --list 20
+A minimal Notion API smoke test that works across *any* database:
+- Reads NOTION_TOKEN and NOTION_DATABASE_ID from env
+- Retrieves DB schema
+- Finds the *actual* title property key (never assumes "Name")
+- Creates a page with ONLY the title (guaranteed-valid)
+- Appends one paragraph block
+- Queries DB to confirm the page exists
 """
 
-import argparse
 import os
-import posixpath
 import sys
-from time import sleep, time
-from typing import Optional
+from datetime import datetime, timezone
+
+from notion_client import Client
+from notion_client.errors import APIResponseError
+
 from dotenv import load_dotenv
+
 
 # Load .env file if present (useful for local development outside Docker)
 load_dotenv()
-try:
-    from webdav3.client import Client as WebDAVClient
-    from webdav3.exceptions import ResponseErrorCode
-except ImportError:
-    print("Missing dependency: webdavclient3. Install: pip install webdavclient3", file=sys.stderr)
-    raise
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
 
 
+def find_title_prop_name(db: dict) -> str:
+    props = db.get("properties", {})
+    for prop_name, prop in props.items():
+        if prop.get("type") == "title":
+            return prop_name
+    die("No title property found in database schema.")
 
 
-def koofr_join(base: str, name: str) -> str:
-    base = "/" + (base or "").strip("/")
-    name = (name or "").lstrip("/")
-    return posixpath.join(base, name)
+def title_value(text: str) -> dict:
+    return {"title": [{"type": "text", "text": {"content": text[:2000]}}]}
 
-def build_client() -> WebDAVClient:
-    options = {
-        "webdav_hostname": "https://app.koofr.net/dav/Koofr",
-        "webdav_login": os.environ["KOOFR_USER"],
-        "webdav_password": os.environ["KOOFR_APP_PASSWORD"],
+
+def paragraph_block(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[:2000]}}]},
     }
-    return WebDAVClient(options)
 
-def check_with_retry(client: WebDAVClient, path: str, attempts: int = 6) -> bool:
-    delay = 1.0
-    for i in range(1, attempts + 1):
-        try:
-            return bool(client.check(path))
-        except ResponseErrorCode as e:
-            # Koofr rate limit
-            if getattr(e, "code", None) == 429:
-                print(f"[WARN] 429 rate limit on attempt {i}/{attempts} for {path}. Sleeping {delay:.1f}s...")
-                sleep(delay)
-                delay = min(delay * 2, 20.0)
-                continue
-            raise
-    raise RuntimeError(f"Rate-limited after {attempts} attempts for path={path}")
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("attachment_key")
-    ap.add_argument("--base", default=os.environ.get("KOOFR_PDF_PATH", "/zotero"))
-    args = ap.parse_args()
+def main() -> None:
+    token = os.getenv("NOTION_TOKEN")
+    db_id = "3198006826a680358e69d0a09fac9e81"
 
-    # Force-correct common misconfig: "/Koofr/zotero" -> "/zotero"
-    base = "/" + args.base.strip("/")
-    if base.lower().startswith("/koofr/"):
-        base = "/" + base.split("/", 2)[-1]  # drop leading "/Koofr"
-        print(f"[INFO] Normalized base to: {base}")
+    if not token:
+        die("Missing env NOTION_TOKEN")
+    if not db_id:
+        die("Missing env NOTION_DATABASE_ID (the database id)")
 
-    client = build_client()
-
-    print("[INFO] Host:", "https://app.koofr.net/dav/Koofr")
-    print("[INFO] Base:", base)
+    client = Client(auth=token)
 
     try:
-        if check_with_retry(client, base):
-            print("[OK] Base exists:", base)
-        else:
-            print("[FAIL] Base missing:", base)
-            return 2
-    except Exception as e:
-        print("[ERROR] Base check failed:", type(e).__name__, str(e))
-        return 3
+        db = client.databases.retrieve(database_id=db_id)
+    except APIResponseError as e:
+        die(f"Failed to retrieve database. {e}")
 
-    zip_path = koofr_join(base, f"{args.attachment_key}.zip")
-    prop_path = koofr_join(base, f"{args.attachment_key}.prop")
+    prop_types = {k: v.get("type") for k, v in db.get("properties", {}).items()}
+    title_key = find_title_prop_name(db)
 
-    for p, label in [(zip_path, "ZIP"), (prop_path, "PROP")]:
-        try:
-            exists = check_with_retry(client, p)
-            print(f"[{'OK' if exists else 'MISS'}] {label}: {p}")
-        except Exception as e:
-            print(f"[ERROR] {label} check failed: {p} :: {type(e).__name__}: {e}")
+    print("=== Database schema ===")
+    print(f"DB id: {db_id}")
+    print(f"Title property key: {title_key}")
+    print("Property types:")
+    for k, t in prop_types.items():
+        print(f"  - {k}: {t}")
 
-    return 0
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    page_title = f"Notion smoke test @ {now}"
+
+    properties = {title_key: title_value(page_title)}
+
+    print("\n=== Creating page ===")
+    print(f"Outgoing property keys: {list(properties.keys())}")
+
+    try:
+        page = client.pages.create(
+            parent={"database_id": db_id},
+            properties=properties,
+        )
+    except APIResponseError as e:
+        die(f"Failed to create page. {e}")
+
+    page_id = page["id"]
+    page_url = page.get("url", "<no url returned>")
+    print(f"Created page_id: {page_id}")
+    print(f"URL: {page_url}")
+
+    print("\n=== Appending a paragraph block ===")
+    try:
+        client.blocks.children.append(
+            block_id=page_id,
+            children=[paragraph_block("If you can read this, your Notion integration works.")],
+        )
+    except APIResponseError as e:
+        die(f"Failed to append block children. {e}")
+
+    print("Appended block OK.")
+
+    print("\n=== Querying DB to confirm page exists ===")
+    try:
+        res = client.databases.query(database_id=db_id, page_size=5)
+        titles = []
+        for r in res.get("results", []):
+            # read title safely
+            tprop = r["properties"].get(title_key, {})
+            parts = tprop.get("title", [])
+            txt = "".join(p.get("plain_text", "") for p in parts)
+            titles.append(txt)
+        print("Latest pages (first 5):")
+        for t in titles:
+            print(f"  - {t}")
+    except APIResponseError as e:
+        die(f"Failed to query database. {e}")
+
+    print("\nOK")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

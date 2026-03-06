@@ -5,17 +5,33 @@ version: "3.9"
 #
 # Services
 # --------
-#   orchestrator  Main Python scheduler (APScheduler).  Runs all five modules.
-#   marker-api    Proxy that forwards PDF conversion to the Datalab Marker API.
-#   graph-server  Lightweight FastAPI server that serves the dependency graph.
+#   orchestrator    Main Python scheduler (APScheduler). Runs all five modules.
+#   marker-api      Proxy that forwards PDF conversion to the Datalab Marker API.
+#   marker-local    Local marker-pdf runner (CPU or GPU depending on profile).
+#   graph-server    Lightweight FastAPI server that serves the dependency graph.
+#
+# Profiles
+# --------
+#   (default / no profile)   marker-api is active  — uses Datalab cloud API
+#   marker-local-cpu         marker-local is active — CPU inference
+#   marker-local-gpu         marker-local is active — GPU inference (needs NVIDIA runtime)
+#
+# Usage
+# -----
+#   Cloud API (default):
+#     docker compose up
+#
+#   Local CPU:
+#     docker compose --profile marker-local-cpu up
+#
+#   Local GPU:
+#     docker compose --profile marker-local-gpu up
 #
 # Volumes
 # -------
-#   tmp_storage     Ephemeral scratch space for downloaded PDFs / Markdown files.
-#                   Both orchestrator and marker-api mount it so the PDF can be
-#                   written by the orchestrator and read by marker-api.
-#   graph_static    Persistent volume shared between orchestrator (writer) and
-#                   graph-server (reader) for the generated HTML graph.
+#   tmp_storage     Ephemeral scratch space for PDFs / Markdown.
+#   graph_static    Persistent volume shared between orchestrator and graph-server.
+#   marker_models   Persistent volume for downloaded model weights (local only).
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -30,43 +46,33 @@ services:
     env_file:
       - .env
     environment:
-      # Make internal URLs available inside the container
-      MARKER_API_URL: "http://marker-api:8080"
+      # Switches between cloud proxy and local runner.
+      # Override in .env: MARKER_API_URL=http://marker-local:8080
+      MARKER_API_URL: "${MARKER_API_URL:-http://marker-api:8080}"
     volumes:
-      # Scratch space — purged per-job inside the code
       - tmp_storage:/tmp/pipeline
-      # Shared graph output
       - graph_static:/app/static
-      # Tag registry — bind-mount from project root so it's available
-      # at the path the default TagRegistry path resolution expects.
       - ./tags_registry.yaml:/tags_registry.yaml:ro
-    depends_on:
-      marker-api:
-        condition: service_healthy
     networks:
       - pipeline_net
 
-  # ── 2. Marker OCR API ─────────────────────────────────────────────────────
+  # ── 2. Marker cloud proxy (default) ──────────────────────────────────────
   marker-api:
-    # Lightweight FastAPI proxy — forwards PDF conversion to the Datalab
-    # Marker API (https://www.datalab.to) and returns the markdown.
-    # POST /marker  {"filepath": "<path on the shared tmp_storage volume>"}
     build:
       context: ./marker-api
       dockerfile: Dockerfile
     container_name: marker-api
+    profiles:
+      - marker-api
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      # Datalab API key — set DATALAB_API_KEY in .env
       DATALAB_API_KEY: "${DATALAB_API_KEY}"
-      # Conversion mode: fast | balanced | accurate  (default: balanced)
       MARKER_MODE: "${MARKER_MODE:-balanced}"
     volumes:
       - tmp_storage:/tmp/pipeline
     ports:
-      # Expose for local debugging; internal traffic uses Docker network
       - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
@@ -77,7 +83,72 @@ services:
     networks:
       - pipeline_net
 
-  # ── 3. Dependency graph server ────────────────────────────────────────────
+  # ── 3. Marker local — CPU ─────────────────────────────────────────────────
+  marker-local-cpu:
+    build:
+      context: ./marker-local
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: "https://download.pytorch.org/whl/cpu"
+    container_name: marker-local
+    profiles:
+      - marker-local-cpu
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TORCH_DEVICE: "cpu"
+    volumes:
+      - tmp_storage:/tmp/pipeline
+      - marker_models:/model_cache
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pipeline_net
+
+  # ── 4. Marker local — GPU ─────────────────────────────────────────────────
+  marker-local-gpu:
+    build:
+      context: ./marker-local
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu121"
+    container_name: marker-local
+    profiles:
+      - marker-local-gpu
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TORCH_DEVICE: "cuda"
+    volumes:
+      - tmp_storage:/tmp/pipeline
+      - marker_models:/model_cache
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pipeline_net
+
+  # ── 5. Dependency graph server ────────────────────────────────────────────
   graph-server:
     build:
       context: ./graph-server
@@ -98,6 +169,8 @@ volumes:
   tmp_storage:
     driver: local
   graph_static:
+    driver: local
+  marker_models:
     driver: local
 
 # ── Internal network ──────────────────────────────────────────────────────────

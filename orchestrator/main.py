@@ -195,7 +195,6 @@ def main() -> None:
         logger.info("  • [%s] %s", job.id, job.name)
 
     try:
-        run_promotion()
         scheduler.start()
 
     except (KeyboardInterrupt, SystemExit):
