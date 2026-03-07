@@ -25,7 +25,11 @@ import sys
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from modules.vector_index import VectorIndexEngine
+from modules.ingestion import IngestionEngine
+from modules.promotion import PromotionEngine
 from dotenv import load_dotenv
+
 
 
 # Load .env file if present (useful for local development outside Docker)
@@ -61,9 +65,6 @@ def _import_modules():
 
 # ── Job wrappers (each constructs fresh instance to avoid state leakage) ──────
 
-def run_ingestion() -> None:
-    from modules.ingestion import IngestionEngine
-    IngestionEngine().run()
 
 
 def run_arxiv_sniper() -> None:
@@ -84,11 +85,6 @@ def run_latex_compiler() -> None:
 def run_dependency_grapher() -> None:
     from modules.dependency_grapher import DependencyGrapher
     DependencyGrapher().run()
-
-
-def run_promotion() -> None:
-    from modules.promotion import PromotionEngine
-    PromotionEngine().run()
 
 
 # ── Startup checks ────────────────────────────────────────────────────────────
@@ -122,12 +118,15 @@ def _check_env() -> None:
 
 def main() -> None:
     _check_env()
+
+    vector_index = VectorIndexEngine()
+
     
     scheduler = BlockingScheduler(timezone="UTC")
     # ── Module 1: Ingestion Engine — every 5 minutes ─────────────────────────
     scheduler.add_job(
-        run_ingestion,
-        trigger=IntervalTrigger(minutes=10),
+        lambda: IngestionEngine(vector_index=vector_index).run(),
+        trigger=IntervalTrigger(minutes=1),
         id="ingestion",
         name="Core Ingestion Engine",
         max_instances=1,
@@ -146,32 +145,32 @@ def main() -> None:
         misfire_grace_time=600,
     )
 
-    # ── Module 3: Conflict Detector — every 30 minutes ────────────────────────
-    scheduler.add_job(
-        run_conflict_detector,
-        trigger=IntervalTrigger(minutes=30),
-        id="conflict_detector",
-        name="Assumption Conflict Detector",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=120,
-    )
+    # # ── Module 3: Conflict Detector — every 30 minutes ────────────────────────
+    # scheduler.add_job(
+    #     run_conflict_detector,
+    #     trigger=IntervalTrigger(minutes=30),
+    #     id="conflict_detector",
+    #     name="Assumption Conflict Detector",
+    #     max_instances=1,
+    #     coalesce=True,
+    #     misfire_grace_time=120,
+    # )
 
     # ── Module 4: LaTeX Compiler — every 15 minutes ───────────────────────────
-    scheduler.add_job(
-        run_latex_compiler,
-        trigger=IntervalTrigger(minutes=15),
-        id="latex_compiler",
-        name="LaTeX Skeleton Compiler",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=120,
-    )
+    # scheduler.add_job(
+    #     run_latex_compiler,
+    #     trigger=IntervalTrigger(minutes=15),
+    #     id="latex_compiler",
+    #     name="LaTeX Skeleton Compiler",
+    #     max_instances=1,
+    #     coalesce=True,
+    #     misfire_grace_time=120,
+    # )
 
     # ── Module 5: Dependency Grapher — every 12 hours ─────────────────────────
     scheduler.add_job(
         run_dependency_grapher,
-        trigger=IntervalTrigger(hours=12),
+        trigger=IntervalTrigger(minutes=1),
         id="dependency_grapher",
         name="Dependency Grapher",
         max_instances=1,
@@ -181,7 +180,7 @@ def main() -> None:
 
     # ── Module 6: Promotion Engine — every 30 minutes ─────────────────────────
     scheduler.add_job(
-        run_promotion,
+        lambda: PromotionEngine(vector_index=vector_index).run(),
         trigger=IntervalTrigger(minutes=1),
         id="promotion",
         name="Promotion Engine",

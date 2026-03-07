@@ -36,7 +36,8 @@ Prerequisites (manual Notion setup)
 - Second Brain DB must have:
     ``Sources`` (Relation), ``Interpretation`` (Rich Text),
     ``Proof Idea`` (Rich Text), ``Named Tools`` (Multi-select),
-    ``Aliases`` (Rich Text), ``Verified`` (Checkbox),
+    ``Aliases`` (Rich Text), ``Assumptions`` (Rich Text),
+    ``Statement LaTeX`` (Rich Text), ``Verified`` (Checkbox),
     ``Last Verified At`` (Date), ``Type`` (Select),
     ``Note Level`` (Select).
 - Edges DB must have:
@@ -58,9 +59,10 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from .notion_client_wrapper import NotionClientWrapper
+from .vector_index import VectorIndexEngine
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -82,13 +84,15 @@ class PromotionEngine:
     and Edges DB.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, vector_index: Optional[VectorIndexEngine]) -> None:
         self.notion = NotionClientWrapper()
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db    = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
         self.edges_db: str      = os.environ.get("NOTION_EDGES_DB_ID", "")
         # title -> SB page_id; populated once per run(), augmented on promotion.
         self._sb_title_cache: dict[str, str] = {}
+        # Module 7: VectorIndexEngine — only active when VECTOR_INDEX_ENABLED is set.
+        self._vector_index: VectorIndexEngine | None = vector_index if vector_index else None
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -246,6 +250,17 @@ class PromotionEngine:
         # Inject into cache so pass 2 (and later items in pass 1) can resolve
         # edges pointing to this concept by title.
         self._sb_title_cache[title] = sb_page_id
+
+        # Module 7: migrate the vector index entry from KI to SB.
+        if self._vector_index and self._vector_index.available:
+            try:
+                self._vector_index.promote_concept(ki_page_id, sb_page_id)
+            except Exception:
+                logger.warning(
+                    "PromotionEngine: vector promote failed for KI %s → SB %s.",
+                    ki_page_id, sb_page_id,
+                )
+
         return sb_page_id
 
     # ── Pass 2: edge promotion ────────────────────────────────────────────────
@@ -417,9 +432,11 @@ class PromotionEngine:
             sb_props["Type"] = self.notion.select_prop(concept_type)
 
         for ki_key, sb_key in [
-            ("Interpretation", "Interpretation"),
-            ("Proof Idea",     "Proof Idea"),
-            ("Aliases",        "Aliases"),
+            ("Interpretation",  "Interpretation"),
+            ("Proof Idea",      "Proof Idea"),
+            ("Aliases",         "Aliases"),
+            ("Assumptions",     "Assumptions"),
+            ("Statement LaTeX", "Statement LaTeX"),
         ]:
             text = self._get_text(props, ki_key)
             if text:

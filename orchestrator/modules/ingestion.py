@@ -60,7 +60,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import openai
 import requests
@@ -84,7 +84,8 @@ from .extraction_schema import (
 from .job_ledger import JobLedger
 from .notion_client_wrapper import NotionClientWrapper
 from .tag_linter import TagLinter, lint_report_to_text
-from .notion_parser import paragraph_blocks_from_latex
+from .notion_parser import paragraph_blocks_from_latex, sanitize_statement_latex
+from .vector_index import VectorIndexEngine
 logger = logging.getLogger(__name__)
 
 # -- Scratch directory inside the Docker volume ---------------------------------
@@ -175,12 +176,86 @@ EXTRACTION_SYSTEM_PROMPT = """\
 You are a mathematical extraction engine for applied mathematics papers (MFG/PDE/probability/optimization).
 You extract a SMALL set of reusable mathematical concept nodes from ONE paper, from Markdown input.
 
+LATEX FORMATTING RULES (STRICTLY ENFORCED — violations will break rendering)
+═════════════════════════════════════════════════════════════════════════════
+
+1. DELIMITERS — every LaTeX expression must be wrapped. No exceptions.
+   - Inline math:  $...$       → for symbols, variables, short expressions
+   - Display math: \\[...\\]   → for full statements, multi-line equations
+   - NEVER use $$...$$ (double-dollar) — use \\[...\\] for display math
+   - NEVER write bare LaTeX commands outside a delimiter:
+       WRONG:  \\partial_\\alpha f(\\alpha^*)=0
+       CORRECT: $\\partial_\\alpha f(\\alpha^*) = 0$
+
+2. ENVIRONMENTS — must always be nested inside \\[...\\]
+   - CORRECT:  \\[\\begin{aligned} f(x) &= 0 \\\\ g(x) &= 1 \\end{aligned}\\]
+   - WRONG:    \\begin{aligned} f(x) &= 0 \\\\ g(x) &= 1 \\end{aligned}
+   - Multi-line equations: use \\\\ for line breaks inside \\begin{aligned}
+   - NEVER use \\begin{equation} — use \\[...\\] directly
+   - NEVER write literal newlines between \\[ and \\] without \\begin{aligned}
+
+3. \\text{} — only valid inside a math environment
+   - WRONG:  \\text{If condition holds, then } \\alpha \\in (0,1)
+   - CORRECT: "If condition holds, then $\\alpha \\in (0,1)$"
+   - To mix prose and math: write prose outside delimiters, math inside
+
+4. FORBIDDEN IN ALL FIELDS
+   - \\tag{N}       — equation numbers from the source paper are meaningless here
+   - \\label{...}   — no cross-referencing
+   - \\ref{...}     — no cross-referencing
+   - \\nonumber     — irrelevant outside a document
+   - \\begin{equation} / \\end{equation}
+
+5. NOTATION — always use the canonical form
+   - Fractions:    \\frac{a}{b}         NEVER a/b in display math
+   - Norms:        \\|x\\|              NEVER ||x||
+   - Inner product: \\langle x,y \\rangle  NEVER <x,y>
+   - Real numbers: \\mathbb{R}          NEVER just R
+   - Expectation:  \\mathbb{E}          NEVER E[...]
+   - Probability:  \\mathbb{P}          NEVER P(...)
+   - Implies:      \\Rightarrow         NEVER =>
+   - Iff:          \\Leftrightarrow     NEVER <=>
+
+6. FIELD-SPECIFIC RULES
+
+   statement_latex:
+     - Must be exactly ONE \\[...\\] block containing the complete formal statement
+     - If the statement has multiple equations, use \\begin{aligned}...\\end{aligned}
+       inside the \\[...\\]
+     - Must be self-contained and parseable by KaTeX
+     - Example:
+         \\[\\begin{aligned}
+           \\partial_\\alpha f_\\ell(\\alpha^*) &= 0, \\quad \\forall \\ell \\in \\{1,\\dots,L\\} \\\\
+           \\partial_{\\alpha\\alpha}^2 f_\\ell(\\alpha^*) &\\geq 0
+         \\end{aligned}\\]
+
+   assumptions:
+     - Plain English prose only
+     - Mathematical objects in inline $...$ only — NO display math blocks
+     - Example: "Finite state/action spaces; $\\alpha \\in [0,1]$; Lipschitz
+       graphon $W \\in L^p$"
+
+   variables:
+     - One variable per line as: $<symbol>$ (<plain English description>)
+     - Example: "$\\alpha \\in [0,1]$ (node index), $m^\\alpha$ (initial mean)"
+
+   conclusion:
+     - Plain English — avoid LaTeX unless unavoidable
+     - If LaTeX is needed, inline $...$ only — no display math
+
+   interpretation:
+     - Plain English — same rule as conclusion
+
+   proof_idea:
+     - May use inline $...$ freely
+     - No display math blocks
+
 GOAL
 Produce high-fidelity, reusable mathematical "Concept Nodes" suitable for a long-term concept graph.
 This is NOT summarization. Do not invent. Do not add general background material that is not in the paper.
 
 OUTPUT BIAS
-Prefer FEWER, HIGHER-VALUE concepts (3–12) rather than many low-value fragments.
+Prefer FEWER, HIGHER-VALUE concepts rather than many low-value fragments.
 A false concept is worse than a missed concept.
 
 HUBS
@@ -229,19 +304,19 @@ Give a comma-separated list of variable descriptions, e.g.:
 "x∈Ω (state), t∈[0,T] (time), m_t (population distribution), V(t,x) (value function), H(x,p,m) (Hamiltonian)"
 
 CONCLUSION FIELD
-Explain the result in plain English (1–2 sentences).
+Explain the result in plain English.
 No marketing language.
 
 KEYWORDS (FOR GRAPH RETRIEVAL)
 You MUST produce three keyword lists per concept:
-- canonical_keywords: 5–15 terms describing what the concept IS
-- prereq_keywords: 5–15 terms describing what the concept REQUIRES
-- downstream_keywords: 5–15 terms describing what the concept ENABLES
+- canonical_keywords maximum 15 terms describing what the concept IS
+- prereq_keywords: maximum 15 terms describing what the concept REQUIRES
+- downstream_keywords: maximum 15 terms describing what the concept ENABLES
 
 Keyword format rules:
 - lowercase
 - hyphen-separated
-- 2–5 words per keyword
+- 1–4 words per keyword
 - examples: "lasry-lions-monotonicity", "fixed-point-existence", "viscosity-solution", "graphon-coupling"
 
 OPTIONAL FIELDS (include only if supported by the text)
@@ -249,8 +324,8 @@ OPTIONAL FIELDS (include only if supported by the text)
 - proof_idea: high-level reusable technique (≤ 3 sentences), NOT a full proof
 - source_anchors: section/equation refs like "Section 3.2; Eq. (12); Theorem 4.1"
 - named_tools: named theorems/techniques explicitly referenced (e.g., Schauder, Kakutani, Gronwall)
-- setting: list of setting tags such as finite_state, continuous, graphon, ergodic, common_noise
-- result_category: one of {existence, uniqueness, convergence, stability, approximation}
+- setting: list of setting tags such as finite_state, continuous, graphon, ergodic, common_noise, etc...
+- result_category: one of {existence, uniqueness, convergence, stability, approximation, etc...}
 - aliases: short list of alternative names for the concept (strings)
 
 TRACEABILITY
@@ -302,7 +377,7 @@ ALLOWED_HUBS:
 class IngestionEngine:
     """Module 1: Core Ingestion Engine (Notion -> WebDAV -> Marker -> OpenAI -> Notion)."""
 
-    def __init__(self) -> None:
+    def __init__(self, vector_index: Optional[VectorIndexEngine]) -> None:
         self.notion = NotionClientWrapper()
         self.openai_client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self._webdav = self._build_webdav_client()
@@ -318,7 +393,9 @@ class IngestionEngine:
         # Lazy-cached {prop_name: prop_type} for the Knowledge Inbox DB.
         # Populated on first use by _get_ki_schema().
         self._ki_schema: dict[str, str] | None = None
-
+        # Module 7: VectorIndexEngine — only active when VECTOR_INDEX_ENABLED is set.
+        # Falls back to TF-IDF silently if Qdrant is unreachable.
+        self._vector_index: VectorIndexEngine | None = vector_index if vector_index else None
     # -- WebDAV client factory --------------------------------------------------
 
     @staticmethod
@@ -556,32 +633,32 @@ class IngestionEngine:
             #     return
 
             # -- Tag completeness gate -----------------------------------------
-            tags = self._get_multi_select_prop(props, "Tags")
-            lint_report = self._tag_linter.lint(tags)
-            if not lint_report.valid_tags:
-                report_text = lint_report_to_text(lint_report)
-                logger.warning("[%s] Tag gate failed -- blocking.", run_id)
-                self.notion.update_page(
-                    page_id=page_id,
-                    properties={
-                        "Status": self.notion.status_prop("blocked-tags"),
-                        "tag_lint_report": {
-                            "rich_text": self.notion.rich_text(report_text)
-                        },
-                    },
-                )
-                return
+            # tags = self._get_multi_select_prop(props, "Tags")
+            # lint_report = self._tag_linter.lint(tags)
+            # if not lint_report.valid_tags:
+            #     report_text = lint_report_to_text(lint_report)
+            #     logger.warning("[%s] Tag gate failed -- blocking.", run_id)
+            #     self.notion.update_page(
+            #         page_id=page_id,
+            #         properties={
+            #             "Status": self.notion.status_prop("blocked-tags"),
+            #             "tag_lint_report": {
+            #                 "rich_text": self.notion.rich_text(report_text)
+            #             },
+            #         },
+            #     )
+            #     return
 
-            if lint_report.errors:
-                report_text = lint_report_to_text(lint_report)
-                self.notion.update_page(
-                    page_id=page_id,
-                    properties={
-                        "tag_lint_report": {
-                            "rich_text": self.notion.rich_text(report_text)
-                        }
-                    },
-                )
+            # if lint_report.errors:
+            #     report_text = lint_report_to_text(lint_report)
+            #     self.notion.update_page(
+            #         page_id=page_id,
+            #         properties={
+            #             "tag_lint_report": {
+            #                 "rich_text": self.notion.rich_text(report_text)
+            #             }
+            #         },
+            #     )
 
             # -- Start job ledger ----------------------------------------------
             job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
@@ -613,6 +690,17 @@ class IngestionEngine:
                 try:
                     ki_page_id = self._create_knowledge_item(page_id, concept, hubs)
                     ki_pages.append((concept, ki_page_id))
+                    # Module 7: index in Qdrant immediately after KI creation.
+                    if self._vector_index and self._vector_index.available:
+                        try:
+                            self._vector_index.index_concept(
+                                concept, ki_page_id, verified=False
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[%s] VectorIndex: failed to index '%s' — continuing.",
+                                run_id, concept.title,
+                            )
                 except Exception:
                     logger.exception(
                         "[%s] Failed to create knowledge item '%s'",
@@ -629,7 +717,9 @@ class IngestionEngine:
             logger.info("[%s] Stage 2: retrieving candidates from Second Brain ...", run_id)
             concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
             for concept, ki_page_id in ki_pages:
-                candidates = self._retrieve_candidates_for_concept(concept, sb_index)
+                candidates = self._retrieve_candidates_for_concept(
+                    concept, sb_index, current_page_id=ki_page_id
+                )
                 self._update_knowledge_item_candidates(ki_page_id, candidates)
                 concept_candidates.append((concept, ki_page_id, candidates))
                 logger.info(
@@ -1178,6 +1268,14 @@ class IngestionEngine:
             properties["Aliases"] = {
                 "rich_text": self.notion.rich_text(concept.aliases)
             }
+        if concept.assumptions:
+            properties["Assumptions"] = {
+                "rich_text": self.notion.rich_text(concept.assumptions[:2000])
+            }
+        if concept.statement_latex:
+            properties["Statement LaTeX"] = {
+                "rich_text": self.notion.rich_text(concept.statement_latex[:2000])
+            }
         if concept.source_quotes:
             properties["Source Quote"] = {
                 "rich_text": self.notion.rich_text(concept.source_quotes)
@@ -1204,7 +1302,7 @@ class IngestionEngine:
         body_blocks.append(self._heading_block("Assumptions"))
         body_blocks.extend(paragraph_blocks_from_latex(concept.assumptions))
         body_blocks.append(self._heading_block("Statement"))
-        body_blocks.extend(paragraph_blocks_from_latex(concept.statement_latex))
+        body_blocks.extend(paragraph_blocks_from_latex(sanitize_statement_latex(concept.statement_latex)))
         if concept.variables:
             body_blocks.append(self._heading_block("Variables"))
             body_blocks.extend(paragraph_blocks_from_latex(concept.variables))
@@ -1257,19 +1355,44 @@ class IngestionEngine:
             },
         )
 
-    # -- Stage 2: candidate retrieval (TF-IDF token overlap) -------------------
+    # -- Stage 2: candidate retrieval (dispatcher) ----------------------------
 
     def _retrieve_candidates_for_concept(
         self,
         concept: MathObject,
         sb_index: list[dict],
         k: int = RETRIEVE_CANDIDATES_K,
+        current_page_id: str | None = None,
     ) -> list[dict]:
         """
-        Score every Second Brain concept record against this concept using
-        TF-IDF-style token overlap with a hub-affinity bonus, return top-k.
+        Return top-k candidate concepts for linking.
 
-        Score = |concept_tokens intersect r.keywords_bag| / log(1 + |bag|)
+        When VECTOR_INDEX_ENABLED is set and Qdrant is reachable, delegates to
+        VectorIndexEngine.retrieve_candidates (semantic ANN search).
+        Otherwise falls back to TF-IDF token-overlap scoring.
+
+        ``current_page_id`` — if provided, the concept's own KI page ID is
+        filtered out of the results to prevent self-links.
+        """
+        if self._vector_index and self._vector_index.available:
+            hints = self._vector_index.retrieve_candidates(concept, verified_only=False)
+            # Exclude self.
+            if current_page_id:
+                hints = [h for h in hints if h.notion_page_id != current_page_id]
+            # Convert to the dict format expected by Stage 3.
+            return [h.to_dict() for h in hints[:k]]
+        return self._tfidf_retrieve(concept, sb_index, k)
+
+    def _tfidf_retrieve(
+        self,
+        concept: MathObject,
+        sb_index: list[dict],
+        k: int = RETRIEVE_CANDIDATES_K,
+    ) -> list[dict]:
+        """
+        Fallback Stage 2: TF-IDF-style token overlap with hub-affinity bonus.
+
+        Score = |concept_tokens ∩ r.keywords_bag| / log(1 + |bag|)
                 + 0.2 if r.hub == concept.suggested_hub
         """
         def _toks(s: str) -> set:
@@ -1285,17 +1408,10 @@ class IngestionEngine:
                 concept_tokens |= _toks(kw)
         concept_tokens |= _toks(concept.title)
 
-        # if not concept_tokens:
-        #     return []
-
         scored: list[tuple[float, dict]] = []
         for record in sb_index:
             bag = record.get("keywords_bag", set())
-            # if not bag:
-                # continue
             overlap = len(concept_tokens & bag)
-            # if overlap == 0:
-            #     continue
             score = overlap / math.log(1.0 + len(bag))
             if record.get("hub") and record["hub"] == concept.suggested_hub:
                 score += 0.2
@@ -1359,9 +1475,10 @@ class IngestionEngine:
     ) -> ConceptLinkResult:
         """Invoke the Stage 3 linking prompt via OpenAI."""
         candidate_lines = "\n".join(
-            f"{i + 1}. {r['title']}"
+            f"{i + 1}. [id:{r.get('id', '')}] {r['title']}"
             + (f" [{r['hub']}]" if r.get("hub") else "")
-            + (f" -- {r['summary']}" if r.get("summary") else "")
+            + (f" (suggested relation: {r['edge_type_hint']})" if r.get("edge_type_hint") else "")
+            + (f" — {r['summary']}" if r.get("summary") else "")
             for i, r in enumerate(candidates)
         )
         concept_summary = (

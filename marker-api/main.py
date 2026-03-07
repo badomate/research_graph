@@ -163,21 +163,21 @@ def convert(req: MarkerRequest) -> dict[str, Any]:
     # ------------------------------------------------------------------ #
     # STUB MODE: return static .md file, never touch the Datalab API      #
     # ------------------------------------------------------------------ #
-    stub_path = Path(MARKER_STUB_MD_PATH)
-    if not stub_path.exists():
-        raise HTTPException(
-            status_code=500,
-            detail=f"MARKER_STUB is enabled but stub file not found: {stub_path}",
-        )
-    markdown = stub_path.read_text(encoding="utf-8")
-    logger.info("STUB MODE – returning %s (%d chars)", stub_path.name, len(markdown))
-    return {
-        "markdown": markdown,
-        "page_count": None,
-        "parse_quality_score": None,
-        "cost_breakdown": None,
-        "metadata": {"stub": True, "stub_file": str(stub_path)},
-    }
+    # stub_path = Path(MARKER_STUB_MD_PATH)
+    # if not stub_path.exists():
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"MARKER_STUB is enabled but stub file not found: {stub_path}",
+    #     )
+    # markdown = stub_path.read_text(encoding="utf-8")
+    # logger.info("STUB MODE – returning %s (%d chars)", stub_path.name, len(markdown))
+    # return {
+    #     "markdown": markdown,
+    #     "page_count": None,
+    #     "parse_quality_score": None,
+    #     "cost_breakdown": None,
+    #     "metadata": {"stub": True, "stub_file": str(stub_path)},
+    # }
 
     if not DATALAB_API_KEY:
         raise HTTPException(status_code=500, detail="DATALAB_API_KEY is not configured")

@@ -32,3 +32,13 @@ pydantic>=2.0,<3
 
 # ── YAML parsing (tag registry) ───────────────────────────────────────────────
 pyyaml>=6.0
+
+# ── Vector index (Module 7) ───────────────────────────────────────────────────
+# Qdrant client — synchronous API used throughout VectorIndexEngine.
+qdrant-client>=1.9.0
+# sentence-transformers is OPTIONAL: only required when
+# VECTOR_EMBEDDING_BACKEND=local (SPECTER2 / other HuggingFace models).
+# Uncomment the line below to enable local embedding:
+sentence-transformers>=2.7.0
+
+peft

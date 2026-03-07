@@ -158,7 +158,15 @@ def _line_to_blocks(line: str) -> list[dict]:
     line = line.strip()
     if not line:
         return []
-
+    
+    # NEW: if line starts with a LaTeX command and has no delimiters,
+    # treat entire line as an equation block
+    _BARE_LATEX_RE = re.compile(
+        r'^(\\text\{|\\begin\{|\\partial|\\frac|\\sum|\\int|\\prod)'
+    )
+    if _BARE_LATEX_RE.match(line) and '$' not in line and r'\[' not in line:
+        return [_equation_block(line)]
+    
     segments = _tokenise(line)
 
     # Fast path: pure block equation
@@ -238,27 +246,36 @@ def parse_to_blocks(text: str) -> list[dict]:
         blocks.extend(_line_to_blocks(line))
     return blocks
 
-
 def _normalize_multiline_delimiters(text: str) -> str:
-    """
-    Collapse multi-line block math expressions onto a single line so the
-    line-by-line tokeniser can match them.
-
-    Handles:
-        \[          \[...\]  (possibly spanning N lines)
-        \]
-        $$          $$...$$  (possibly spanning N lines)
-        $$
-    """
-    # \[...\] spanning multiple lines
-    text = re.sub(r'\\\[\s*\n(.*?)\n\s*\\\]', 
-                  lambda m: r'\[' + ' '.join(m.group(1).splitlines()) + r'\]',
-                  text, flags=re.DOTALL)
-    # $$...$$ spanning multiple lines
-    text = re.sub(r'\$\$\s*\n(.*?)\n\s*\$\$',
-                  lambda m: '$$' + ' '.join(m.group(1).splitlines()) + '$$',
-                  text, flags=re.DOTALL)
-    return text
+    # 1. Collapse multiline \[...\] onto one line (consumes \begin{} inside)
+    text = re.sub(
+        r'\\\[(.*?)\\\]',
+        lambda m: r'\[' + ' '.join(m.group(1).splitlines()) + r'\]',
+        text, flags=re.DOTALL
+    )
+    # 2. Collapse multiline $$...$$
+    text = re.sub(
+        r'\$\$(.*?)\$\$',
+        lambda m: '$$' + ' '.join(m.group(1).splitlines()) + '$$',
+        text, flags=re.DOTALL
+    )
+    # 3. Wrap bare \begin{env}...\end{env} not already inside \[...\]
+    # Split on existing \[...\] tokens — only process segments between them.
+    parts = re.split(r'(\\\[.*?\\\])', text, flags=re.DOTALL)
+    processed = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # Inside an existing \[...\] block — leave untouched
+            processed.append(part)
+        else:
+            # Outside any \[...\] — wrap bare environments
+            part = re.sub(
+                r'(\\begin\{[a-z*]+\}.*?\\end\{[a-z*]+\})',
+                lambda m: r'\[' + ' '.join(m.group(1).splitlines()) + r'\]',
+                part, flags=re.DOTALL | re.IGNORECASE
+            )
+            processed.append(part)
+    return ''.join(processed)
 
 def rich_text_segments(text: str) -> list[dict]:
     """
@@ -300,33 +317,288 @@ def paragraph_blocks_from_latex(text: str) -> list[dict]:
     """
     return parse_to_blocks(text)
 
+def sanitize_statement_latex(text: str) -> str:
+    text = text.strip()
+
+    # $$\begin{align}...\end{align}$$ → \[\begin{aligned}...\end{aligned}\]
+    text = re.sub(
+        r'^\$\$\s*(\\begin\{align\*?\}[\s\S]*?\\end\{align\*?\})\s*\$\$$',
+        r'\\[\1\\]',
+        text
+    )
+
+    # $$\[...\]$$ → \[...\]  (redundant outer wrapper)
+    text = re.sub(
+        r'^\$\$\s*(\\[\s\S]*?\\])\s*\$\$$',
+        r'\1',
+        text
+    )
+
+    # bare $$...$$ with no \[ inside → \[...\]
+    if text.startswith('$$') and text.endswith('$$') and r'\[' not in text:
+        text = r'\[' + text[2:-2].strip() + r'\]'
+
+    return text
+# ── Self-test ─────────────────────────────────────────────────────────────────
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
 
-    cases = [
-        # Pure block eq
-        r"$$\rho_N^{-1} W_N - W \|_\square \to 0$$",
-        # \[...\] block
-        r"\[\rho_N^{-1} W_N - W\|_{L_\infty} \to L_1\]",
-        # Inline only
-        r"The sequence $W_N$ converges in cut norm $\|\cdot\|_\square$.",
-        # Mixed inline
-        r"Let $\alpha > 0$ and $W(x,y) = (1-\alpha)^2 (xy)^{-\alpha}$.",
-        # Multi-line with block eq embedded
-        "Assumption: $W \\in \\mathcal{W}_0$.\n"
-        "$$\\rho_N^{-1} W_N - W\\|_\\square \\to 0$$\n"
-        "This holds for all $N \\to \\infty$.",
-        # \(...\) inline
-        r"Define \(\mu_t\) as the marginal of \(X_t\).",
-        # Plain text, no math
-        "Not applicable (example family).",
-    ]
+    PASS = "✅ PASS"
+    FAIL = "❌ FAIL"
+    results = []
 
-    for i, c in enumerate(cases):
-        print(f"\n── Case {i+1} ──────────────────────────────")
-        print(f"Input : {c!r}")
-        result = parse_to_blocks(c)
-        print(f"Output: {json.dumps(result, indent=2)}")
+    def check(name, got, expect_fn, show=True):
+        ok = expect_fn(got)
+        status = PASS if ok else FAIL
+        results.append((name, ok))
+        if show or not ok:
+            print(f"\n{status}  {name}")
+            if not ok:
+                print(f"       Got: {json.dumps(got, indent=2)}")
+        return ok
+
+    # ── 1. Pure $$...$$ → single equation block ───────────────────────────────
+    check(
+        "1. Pure $$...$$ → equation block",
+        parse_to_blocks(r"$$\alpha \in [0,1]$$"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            r[0]["equation"]["expression"] == r"\alpha \in [0,1]"
+        ),
+    )
+
+    # ── 2. Pure \[...\] → single equation block ───────────────────────────────
+    check(
+        r"2. Pure \[...\] → equation block",
+        parse_to_blocks(r"\[\alpha \in [0,1]\]"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation"
+        ),
+    )
+
+    # ── 3. Inline $...$ in prose → paragraph with mixed rich_text ────────────
+    check(
+        "3. Inline $...$ → paragraph with mixed rich_text",
+        parse_to_blocks(r"Let $\alpha > 0$ be the node index."),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "paragraph" and
+            any(s["type"] == "equation" for s in r[0]["paragraph"]["rich_text"]) and
+            any(s["type"] == "text"     for s in r[0]["paragraph"]["rich_text"])
+        ),
+    )
+
+    # ── 4. \(...\) inline → paragraph with equation segment ──────────────────
+    check(
+        r"4. \(...\) inline → equation segment in paragraph",
+        parse_to_blocks(r"Define \(\mu_t\) as the flow measure."),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "paragraph" and
+            any(s["type"] == "equation" for s in r[0]["paragraph"]["rich_text"])
+        ),
+    )
+
+    # ── 5. Plain text, no math → paragraph block ─────────────────────────────
+    check(
+        "5. Plain text → paragraph block",
+        parse_to_blocks("Not applicable (example family)."),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "paragraph" and
+            r[0]["paragraph"]["rich_text"][0]["text"]["content"] == "Not applicable (example family)."
+        ),
+    )
+
+    # ── 6. Multi-line \[...\] → single equation block (no newlines in expr) ──
+    check(
+        r"6. Multi-line \[...\] → collapsed to single equation block",
+        parse_to_blocks("\\[\n\\alpha \\in [0,1]\n\\]"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "\n" not in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 7. Multi-line $$...$$ → single equation block ────────────────────────
+    check(
+        "7. Multi-line $$...$$ → collapsed to single equation block",
+        parse_to_blocks("$$\n\\alpha \\in [0,1]\n$$"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "\n" not in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 8. \[\begin{aligned}...\end{aligned}\] → equation block ──────────────
+    check(
+        r"8. \[\begin{aligned}...\end{aligned}\] → equation block (not wrapped in $$)",
+        parse_to_blocks(r"\[\begin{aligned} f(x) &= 0 \\ g(x) &= 1 \end{aligned}\]"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "begin{aligned}" in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 9. Multi-line \[\begin{aligned}...\end{aligned}\] → collapsed ─────────
+    check(
+        r"9. Multi-line \[\begin{aligned}...\end{aligned}\] → single equation block",
+        parse_to_blocks(
+            "\\[\n\\begin{aligned}\nf(x) &= 0 \\\\\ng(x) &= 1\n\\end{aligned}\n\\]"
+        ),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "begin{aligned}" in r[0]["equation"]["expression"] and
+            "\n" not in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 10. $$\begin{aligned}...\end{aligned}$$ → sanitized to \[...\] ────────
+    check(
+        "10. sanitize_statement_latex: $$\\begin{aligned}...\\end{aligned}$$ → \\[...\\]",
+        parse_to_blocks(
+            sanitize_statement_latex(
+                r"$$\begin{aligned} f(x) &= 0 \\ g(x) &= 1 \end{aligned}$$"
+            )
+        ),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "begin{aligned}" in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 11. $$\[...\]$$ → stripped to \[...\] ────────────────────────────────
+    check(
+        r"11. sanitize_statement_latex: $$\[...\]$$ → \[...\]",
+        parse_to_blocks(sanitize_statement_latex(r"$$\[\alpha \in [0,1]\]$$")),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation"
+        ),
+    )
+
+    # ── 12. bare $$...$$ (no \[) → \[...\] ───────────────────────────────────
+    check(
+        r"12. sanitize_statement_latex: bare $$...$$ → \[...\]",
+        list(map(lambda s: s(sanitize_statement_latex(r"$$\alpha \in [0,1]$$")), [
+            lambda t: t.startswith(r'\['),
+            lambda t: t.endswith(r'\]'),
+        ])),
+        lambda r: all(r),
+    )
+
+    # ── 13. Bare \begin{aligned} (no outer delimiter) → wrapped in \[...\] ───
+    check(
+        r"13. Bare \begin{aligned} → wrapped in \[...\]",
+        parse_to_blocks(
+            "\\begin{aligned}\nf(x) &= 0 \\\\\ng(x) &= 1\n\\end{aligned}"
+        ),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "begin{aligned}" in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── 14. Bare \partial... line → equation block ────────────────────────────
+    check(
+        r"14. Bare \partial... → equation block",
+        parse_to_blocks(r"\partial_\alpha f_\ell(\alpha^*)=0"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation"
+        ),
+    )
+
+    # ── 15. Bare \text{...} line → equation block ─────────────────────────────
+    check(
+        r"15. Bare \text{...} → equation block",
+        parse_to_blocks(r"\text{If (A1)--(A6) hold and there exists }\alpha^*\in(0,1)"),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation"
+        ),
+    )
+
+    # ── 16. Mixed: prose + block eq + prose → 3 blocks ───────────────────────
+    check(
+        "16. Mixed multi-line: paragraph + equation + paragraph",
+        parse_to_blocks(
+            "Assumption: $W \\in \\mathcal{W}_0$.\n"
+            "$$\\rho_N^{-1} W_N \\to 0$$\n"
+            "This holds for all $N$."
+        ),
+        lambda r: (
+            len(r) == 3 and
+            r[0]["type"] == "paragraph" and
+            r[1]["type"] == "equation" and
+            r[2]["type"] == "paragraph"
+        ),
+    )
+
+    # ── 17. rich_text_segments: block_eq demoted to inline ───────────────────
+    check(
+        r"17. rich_text_segments: \[...\] demoted to inline equation segment",
+        rich_text_segments(r"Value: \[\alpha\]"),
+        lambda r: (
+            len(r) >= 1 and
+            any(s["type"] == "equation" for s in r)
+        ),
+    )
+
+    # ── 18. Empty string → empty list ────────────────────────────────────────
+    check(
+        "18. Empty string → empty list",
+        parse_to_blocks(""),
+        lambda r: r == [],
+    )
+
+    # ── 19. Multiple inline equations in one line ─────────────────────────────
+    check(
+        "19. Multiple inline equations → single paragraph with 3 equation segments",
+        parse_to_blocks(r"Let $\alpha \in [0,1]$ and $\beta > 0$ with $\alpha + \beta = 1$."),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "paragraph" and
+            sum(1 for s in r[0]["paragraph"]["rich_text"] if s["type"] == "equation") == 3
+        ),
+    )
+
+    # ── 20. Real-world: graphon statement with \begin{aligned} inside \[...\] ─
+    check(
+        "20. Real-world: \\[\\begin{aligned}...\\end{aligned}\\] → single equation block",
+        parse_to_blocks(
+            "\\[\\begin{aligned}\n"
+            "n\\|W\\|_p &= \\left(\\int_{[0,1]^2} W(x,y)^p\\,dx\\,dy\\right)^{\\frac{1}{p}} \\\\\n"
+            "\\|W\\|_\\infty &:= \\sup_{(x,y)\\in[0,1]^2} |W(x,y)|\n"
+            "\\end{aligned}\\]"
+        ),
+        lambda r: (
+            len(r) == 1 and
+            r[0]["type"] == "equation" and
+            "begin{aligned}" in r[0]["equation"]["expression"] and
+            "\n" not in r[0]["equation"]["expression"]
+        ),
+    )
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    passed = sum(1 for _, ok in results if ok)
+    total  = len(results)
+    print(f"\n{'═'*52}")
+    print(f"  {passed}/{total} tests passed")
+    if passed < total:
+        print("\n  Failed:")
+        for name, ok in results:
+            if not ok:
+                print(f"    ✗ {name}")
+    print(f"{'═'*52}")
