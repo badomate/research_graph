@@ -418,3 +418,84 @@ def validate_link_result(raw: dict) -> tuple["ConceptLinkResult", list[str]]:
             partial[edge_type] = valid_edges
 
         return ConceptLinkResult(**partial), errors
+
+
+# ── LaTeX formatting rules (injected into extraction prompts) ──────────────────
+
+LATEX_FORMATTING_RULES = """
+LATEX FORMATTING RULES (STRICTLY ENFORCED — violations break rendering)
+════════════════════════════════════════════════════════════════════════
+
+1. DELIMITERS — every LaTeX expression must be wrapped. No exceptions.
+   - Inline math:  $...$       for symbols, variables, short expressions
+   - Display math: \\[...\\]   for full statements, multi-line equations
+   - NEVER use $$...$$ — use \\[...\\] for display math
+   - NEVER write bare LaTeX outside a delimiter:
+       WRONG:  \\partial_\\alpha f(\\alpha^*)=0
+       CORRECT: $\\partial_\\alpha f(\\alpha^*) = 0$
+
+2. ENVIRONMENTS — must always be nested inside \\[...\\]
+   - CORRECT:  \\[\\begin{aligned} f(x) &= 0 \\\\\\\\ g(x) &= 1 \\end{aligned}\\]
+   - WRONG:    \\begin{aligned} f(x) &= 0 \\\\\\\\ g(x) &= 1 \\end{aligned}
+   - Use \\\\\\\\ for line breaks — NEVER literal newlines between \\[ and \\]
+   - NEVER use \\begin{equation} — use \\[...\\] directly
+
+3. \\text{} — only valid INSIDE a math environment
+   - WRONG:  \\text{If condition holds} \\alpha \\in (0,1)
+   - CORRECT: "If condition holds, $\\alpha \\in (0,1)$"
+
+4. FORBIDDEN IN ALL FIELDS
+   - \\tag{N}, \\label{...}, \\ref{...}, \\nonumber
+   - \\begin{equation} / \\end{equation}
+
+5. CANONICAL NOTATION
+   - Fractions:     \\frac{a}{b}           NEVER a/b in display math
+   - Norms:         \\|x\\|                NEVER ||x||
+   - Inner product: \\langle x,y \\rangle  NEVER <x,y>
+   - Sets:          \\mathbb{R}, \\mathbb{E}, \\mathbb{P}
+
+6. FIELD-SPECIFIC RULES
+   statement_latex:
+     ONE \\[...\\] block only. Multiple equations → \\begin{aligned}.
+     Must be self-contained and KaTeX-parseable.
+   assumptions:
+     Plain English + inline $...$ only. NO display math.
+   variables:
+     Format: $<symbol>$ (<description>), one per line.
+   conclusion, interpretation:
+     Plain English. Inline $...$ only if unavoidable.
+   proof_idea:
+     Inline $...$ freely. No display math blocks.
+""".strip()
+
+
+# ── Re-extraction system prompt ────────────────────────────────────────────────
+
+REEXTRACT_SYSTEM_PROMPT = """
+You are a mathematical knowledge extraction engine performing a TARGETED
+second-pass extraction.
+
+A human reviewer has already reviewed the initial extraction of this paper
+and identified the following MISSING concepts:
+
+<missing_concepts>
+{hints}
+</missing_concepts>
+
+The following concepts have ALREADY been extracted — do NOT re-extract them:
+
+<already_extracted>
+{existing_titles}
+</already_extracted>
+
+Your task:
+- Extract ONLY the missing concepts described in <missing_concepts>
+- Each missing concept hint may correspond to 1-3 MathObject entries
+- Do NOT extract anything not mentioned in <missing_concepts>
+- Apply the same MathObject schema and LaTeX formatting rules as the
+  primary extraction
+- If a hint is ambiguous, extract the most mathematically precise
+  interpretation
+
+{latex_formatting_rules}
+""".strip()

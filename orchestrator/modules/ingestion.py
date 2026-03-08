@@ -1,7 +1,16 @@
 """
 modules/ingestion.py - Module 1: Core Ingestion Engine
 -------------------------------------------------------
-3-stage pipeline for each paper in the 'Paper Tracker' Notion DB with Status == 's1-process-math':
+3-stage pipeline for each paper in the 'Paper Tracker' Notion DB.
+
+Status flow
+-----------
+  s1-skim           → pipeline picks up (set by human after skimming)
+  s1-processing     → set FIRST on pickup (race-condition guard, REQ-1)
+  s2-extracted      → set after all 3 stages complete successfully
+  blocked-extraction→ set when GPT returns 0 concepts (REQ-4)
+  s1-skim (revert)  → set on any exception (human can retry, REQ-1)
+  s2-reextract      → triggers _reextract_missed_concepts (REQ-5)
 
   PREFLIGHT GATES
   ---------------
@@ -10,34 +19,29 @@ modules/ingestion.py - Module 1: Core Ingestion Engine
   2. Check Koofr zip exists ({attachment_key}.zip); if missing set status "s1b-waiting-attachment".
   3. Download the zip, extract the largest PDF (or "primary_pdf_filename" if set).
   4. Compute pdf_sha256; store in "PDF SHA256" property.
-  5. Idempotency check via JobLedger; if already done set status "s2b-linked-ai" and skip.
-
-  TAG COMPLETENESS GATE
-  ---------------------
-  6. Read "Tags" multi-select; run TagLinter.
-  7. If no valid tags: set status "blocked-tags", store lint report, return.
 
   STAGE 1 - EXTRACT
   -----------------
-  8. Convert PDF to Markdown via marker-api (tenacity retry).
-  9. Extract structured knowledge via GPT-4o (ExtractionResult schema).
-  10. Validate with Pydantic; attempt one repair pass on failure.
-  11. Run latex_sanity_check; downgrade confidence on failure.
-  12. Patch Paper Tracker row to status "s2-extracted".
-  13. Create Knowledge Inbox pages (graph_link_status = "unlinked").
+  5. Convert PDF to Markdown via marker-api (tenacity retry).
+  6. Strip boilerplate (appendix/refs/acks) from markdown (REQ-2).
+  7. Count tokens; dispatch to chunked extraction if > TOKEN_THRESHOLD_CHUNK (REQ-3).
+  8. Extract structured knowledge via GPT (ExtractionResult schema).
+  9. Zero-concept guard → blocked-extraction if no concepts returned (REQ-4).
+  10. Create Knowledge Inbox pages with review checklist prepended (REQ-8).
   Ledger: extract_done
 
   STAGE 2 - RETRIEVE
   ------------------
-  14. For each concept, score all Second Brain concepts by TF-IDF token overlap.
-  15. Keep top-RETRIEVE_CANDIDATES_K candidates.
+  11. For each concept, retrieve top-RETRIEVE_CANDIDATES_K candidates
+      (vector search or TF-IDF fallback).
   Ledger: retrieve_done
 
   STAGE 3 - LINK
   --------------
-  16. For each concept + candidates, call GPT to produce ConceptLinkResult edges.
-  17. Write Edge Suggestions JSON + graph_link_status = "linked-ai" to KI page.
-  18. Patch Paper Tracker row to status "s2b-linked-ai".
+  12. For each concept + candidates, call GPT to produce ConceptLinkResult edges.
+  13. Write Edge Suggestions JSON + graph_link_status = "linked-ai" to KI page.
+  14. Patch paper page body with Extracted Concepts section (REQ-9).
+  15. Advance paper to s2-extracted with Extraction Count + Tokens.
   Ledger: link_done -> notion_done
 
 Design constraints:
@@ -56,6 +60,7 @@ import logging
 import math
 import os
 import re
+import traceback
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -74,6 +79,8 @@ from webdav3.client import Client as WebDAVClient
 from .extraction_schema import (
     EDGE_CAPS,
     EXTRACTION_VERSION,
+    LATEX_FORMATTING_RULES,
+    REEXTRACT_SYSTEM_PROMPT,
     ConceptLinkResult,
     ExtractionResult,
     MathObject,
@@ -112,6 +119,40 @@ _ZOTERO_ATTACH_RE = re.compile(
 
 # -- Maximum validation errors shown in repair prompt --------------------------
 MAX_REPAIR_ERRORS = 5
+
+# -- Token thresholds for chunked extraction (REQ-3) ---------------------------
+TOKEN_THRESHOLD_CHUNK = 30_000   # above this: section-by-section extraction
+TOKEN_THRESHOLD_WARN  = 60_000   # above this: log warning, still chunk
+
+# -- Sections to skip during chunked extraction --------------------------------
+_SKIP_SECTION_KEYWORDS = (
+    "proof of", "proofs of", "deferred", "technical lemma",
+)
+
+# -- Boilerplate stripping regex (REQ-2) ---------------------------------------
+# Matches appendix / references / acknowledgement headings and everything after.
+_BOILERPLATE_RE = re.compile(
+    r'\n#{1,3}\s*('
+    r'Appendix|Appendices|Appendix\s+[A-Z\d]|[A-Z]\.\s+'
+    r'|Supplementary|Supplemental Material|'
+    r'Deferred Proofs?|Proofs? of|Technical Lemmas?|'
+    r'References|Bibliography|Works Cited|'
+    r'Acknowledgements?|Acknowledgments?|'
+    r'Funding|Declaration|Conflicts? of Interest|'
+    r'Author Contributions?'
+    r')[^\n]*\n[\s\S]*$',
+    re.IGNORECASE,
+)
+
+
+def _count_tokens(text: str) -> int:
+    """Approximate token count. Uses tiktoken when available, falls back to 4 chars/token."""
+    try:
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
 
 # -- Stage 3 linking system prompt ---------------------------------------------
 LINKING_SYSTEM_PROMPT_V1 = """\
@@ -286,6 +327,7 @@ then you MAY extract that lemma as its own concept. Otherwise omit it.
 NAMING RULE (CRITICAL)
 Every concept title must be a descriptive canonical name that stands alone.
 Do NOT use numbering.
+The title MUST be straight to the point, very dense. Few words, but still identifiable. 
 Bad: "Theorem 1", "Lemma 2.3", "Equation (5)".
 Good: "Existence of Mean Field Game Equilibrium under Lasry–Lions Monotonicity", "Convergence of Policy Iteration for Finite-State MFG".
 
@@ -396,6 +438,8 @@ class IngestionEngine:
         # Module 7: VectorIndexEngine — only active when VECTOR_INDEX_ENABLED is set.
         # Falls back to TF-IDF silently if Qdrant is unreachable.
         self._vector_index: VectorIndexEngine | None = vector_index if vector_index else None
+        self.koofr_markdown_dir = os.environ.get("KOOFR_MARKDOWN_PATH", "/zotero_markdown")
+        self._ensure_koofr_markdown_dir()
     # -- WebDAV client factory --------------------------------------------------
 
     @staticmethod
@@ -411,24 +455,38 @@ class IngestionEngine:
 
     def run(self) -> None:
         """
-        Poll 'Paper Tracker' for s1-process-math papers and run the full
-        ingestion pipeline on each one.
+        Poll 'Paper Tracker' for papers to process.
+
+        Queries two status values:
+          s1-skim       — primary extraction queue (REQ-3)
+          s2-reextract  — targeted re-extraction of missed concepts (REQ-5)
 
         Hubs and the Second Brain concept index are fetched once per run()
         invocation so that every paper in the same batch uses a consistent
         snapshot.
         """
-        logger.info("Ingestion: polling for s1-process-math papers ...")
+        logger.info("Ingestion: polling for s1-skim and s2-reextract papers ...")
         pages = self.notion.query_database(
             self.paper_tracker_db,
             filter={
                 "property": "Status",
-                "status": {"equals": "s1-process-math"},
+                "status": {"equals": "s1-skim"},
             },
         )
-        logger.info("Ingestion: found %d paper(s) to process.", len(pages))
+        pages_to_reextract = self.notion.query_database(
+            self.paper_tracker_db,
+            filter={
+                "property": "Status",
+                "status": {"equals": "s2-reextract"},
+            },
+        )
+        logger.info(
+            "Ingestion: found %d paper(s) to extract, %d paper(s) to re-extract.",
+            len(pages),
+            len(pages_to_reextract),
+        )
 
-        if not pages:
+        if not pages and not pages_to_reextract:
             return
 
         hubs: dict[str, str] = self._fetch_allowed_hubs()
@@ -444,6 +502,12 @@ class IngestionEngine:
                 self._process_paper(page, hubs, sb_index)
             except Exception:
                 logger.exception("Failed to process page %s", page["id"])
+
+        for page in pages_to_reextract:
+            try:
+                self._reextract_missed_concepts(page, hubs, sb_index)
+            except Exception:
+                logger.exception("Failed re-extraction for page %s", page["id"])
 
     # -- Hub fetching -----------------------------------------------------------
 
@@ -545,23 +609,40 @@ class IngestionEngine:
         page_id = page["id"]
         props = page["properties"]
 
-        # -- Preflight gate 1: Parse Zotero parent key --------------------------
-        zotero_uri = self._get_text_prop(props, "Zotero URI")
-        parent_match = _ZOTERO_PARENT_RE.search(zotero_uri)
-        if not parent_match:
-            logger.warning(
-                "[%s] Missing or invalid Zotero URI: '%s' -- skipping.",
-                page_id,
-                zotero_uri,
-            )
-            return
-        parent_key = parent_match.group(1)
+        # REQ-1: Set s1-processing FIRST — race condition guard.
+        # Must be the very first operation so a second scheduler tick skips this paper.
+        self.notion.update_page(
+            page_id=page_id,
+            properties={"Status": self.notion.status_prop("s1-processing")},
+        )
 
         run_id = uuid.uuid4().hex[:8]
         local_pdf: Path | None = None
         job_id: int | None = None
+        cleaned_tokens: int = 0
 
         try:
+            # -- Preflight gate 1: Parse Zotero parent key --------------------------
+            zotero_uri = self._get_text_prop(props, "Zotero URI")
+            parent_match = _ZOTERO_PARENT_RE.search(zotero_uri)
+            if not parent_match:
+                logger.warning(
+                    "[%s] Missing or invalid Zotero URI: '%s' — reverting to s1-skim.",
+                    page_id,
+                    zotero_uri,
+                )
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Status": self.notion.status_prop("s1-skim"),
+                        "Extraction Error": {"rich_text": self.notion.rich_text(
+                            "Missing or invalid Zotero URI."
+                        )},
+                    },
+                )
+                return
+            parent_key = parent_match.group(1)
+
             # -- Preflight gate 1b: Resolve attachment key ----------------------
             resolved = self._resolve_keys_and_update_notion(
                 page_id, zotero_uri, parent_key, run_id
@@ -580,8 +661,8 @@ class IngestionEngine:
                     },
                 )
                 return
+            
             parent_key, attachment_key = resolved
-
             # -- Preflight gate 2: Check Koofr zip exists ----------------------
             zip_remote = f"{self.koofr_base}/{attachment_key}.zip"
             logger.info("[%s] Checking Koofr zip: %s", run_id, zip_remote)
@@ -597,89 +678,72 @@ class IngestionEngine:
                 )
                 return
 
-            # -- Preflight gate 3: Download zip and extract PDF ----------------
-            TMP_DIR.mkdir(parents=True, exist_ok=True)
-            local_zip = TMP_DIR / f"{run_id}.zip"
-            local_pdf = TMP_DIR / f"{run_id}.pdf"
-
-            self._download_koofr(zip_remote, local_zip)
-
-            primary_filename = self._get_text_prop(props, "primary_pdf_filename")
-            self._extract_pdf_from_zip(
-                local_zip, local_pdf, preferred=primary_filename or None
-            )
-            local_zip.unlink(missing_ok=True)
-
-            # -- Preflight gate 4: Compute SHA256 ------------------------------
-            pdf_sha256 = self._sha256(local_pdf)
-            logger.info("[%s] PDF SHA256: %s", run_id, pdf_sha256)
-            self.notion.update_page(
-                page_id=page_id,
-                properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
-            )
-
-            # -- Preflight gate 5: Idempotency check ---------------------------
-            # if self._ledger.is_already_done(attachment_key, pdf_sha256, EXTRACTION_VERSION):
-            #     logger.info(
-            #         "[%s] Already processed (ledger hit) -- marking s2b-linked-ai.",
-            #         run_id,
-            #     )
-            #     self.notion.update_page(
-            #         page_id=page_id,
-            #         properties={
-            #             "Status": self.notion.status_prop("s2b-linked-ai")
-            #         },
-            #     )
-            #     return
-
-            # -- Tag completeness gate -----------------------------------------
-            # tags = self._get_multi_select_prop(props, "Tags")
-            # lint_report = self._tag_linter.lint(tags)
-            # if not lint_report.valid_tags:
-            #     report_text = lint_report_to_text(lint_report)
-            #     logger.warning("[%s] Tag gate failed -- blocking.", run_id)
-            #     self.notion.update_page(
-            #         page_id=page_id,
-            #         properties={
-            #             "Status": self.notion.status_prop("blocked-tags"),
-            #             "tag_lint_report": {
-            #                 "rich_text": self.notion.rich_text(report_text)
-            #             },
-            #         },
-            #     )
-            #     return
-
-            # if lint_report.errors:
-            #     report_text = lint_report_to_text(lint_report)
-            #     self.notion.update_page(
-            #         page_id=page_id,
-            #         properties={
-            #             "tag_lint_report": {
-            #                 "rich_text": self.notion.rich_text(report_text)
-            #             }
-            #         },
-            #     )
-
-            # -- Start job ledger ----------------------------------------------
-            job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
-            logger.info("[%s] JobLedger job_id=%d", run_id, job_id)
-
             # -- STAGE 1 / Step 1: Convert PDF to Markdown ---------------------
             logger.info("[%s] Stage 1: converting PDF to Markdown ...", run_id)
-            markdown_text = self._pdf_to_markdown(local_pdf)
+            markdown_text, job_id = self._pdf_to_markdown(
+                attachment_key=attachment_key,
+                run_id=run_id,
+                # PDF extraction args — only used on cache miss
+                zip_remote=zip_remote,
+                primary_pdf_filename=self._get_text_prop(props, "primary_pdf_filename") or None,
+                page_id=page_id,
+                props=props,
+            )
+            if markdown_text is None:
+                # _pdf_to_markdown already updated status to s1b-waiting-attachment
+                # or logged the error — just bail.
+                return
+
             self._ledger.update_status(job_id, "marker_done")
 
+
+            # REQ-2: Strip boilerplate BEFORE token counting or any GPT call.
+            markdown_text = self._strip_boilerplate(markdown_text)
+            # REQ-3: Count tokens after stripping; used to decide chunking.
+            cleaned_tokens = _count_tokens(markdown_text)
+
             # -- STAGE 1 / Step 2: Extract via OpenAI --------------------------
-            logger.info("[%s] Stage 1: extracting knowledge via OpenAI ...", run_id)
-            extraction = self._extract_and_validate(markdown_text, hubs, run_id)
+            logger.info(
+                "[%s] Stage 1: extracting knowledge via OpenAI (%d tokens) ...",
+                run_id, cleaned_tokens,
+            )
+            extraction = self._run_extraction(markdown_text, cleaned_tokens, hubs, run_id)
             self._ledger.update_status(job_id, "openai_done")
 
-            # -- STAGE 1 / Step 3: Patch Paper Tracker -> s2-extracted ---------
+            # -- STAGE 1 / Step 3: Patch Paper Tracker metadata ----------------
             logger.info("[%s] Stage 1: patching Notion paper row ...", run_id)
-            self._patch_notion_page(page_id, extraction, run_id)
+            # REQ-9: Set Thesis Relevance = supporting as default if unset.
+            thesis_relevance_set = bool(
+                props.get("Thesis Relevance", {}).get("select", {}).get("name", "")
+            )
+            self._patch_notion_page(
+                page_id, extraction, run_id,
+                set_thesis_relevance=not thesis_relevance_set,
+            )
 
             # -- STAGE 1 / Step 4: Create Knowledge Inbox entries --------------
             concepts = extraction.extracted_concepts
+
+            # REQ-4: Zero concept guard — block paper rather than silently advancing.
+            if len(concepts) == 0:
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Status": self.notion.status_prop("blocked-extraction"),
+                        "Extraction Error": {"rich_text": self.notion.rich_text(
+                            "GPT returned 0 concepts. Check markdown quality or "
+                            "add Re-extract Hints and set status back to s1-skim."
+                        )},
+                        "Extraction Count": {"number": 0},
+                    },
+                )
+                logger.warning(
+                    "Ingestion: zero concepts extracted for paper %s — "
+                    "set to blocked-extraction.",
+                    page_id,
+                )
+                return
+
             logger.info(
                 "[%s] Stage 1: creating %d Knowledge Inbox page(s) ...",
                 run_id,
@@ -748,6 +812,19 @@ class IngestionEngine:
             self._patch_notion_paper_post_linking(page_id, run_id)
             self._ledger.update_status(job_id, "notion_done")
             self._ledger.finish_job(job_id)
+
+            # REQ-9: Patch paper page body (idempotent — checks for existing heading).
+            self._patch_paper_page(page_id, [ki_id for _, ki_id in ki_pages])
+
+            # REQ-1: Advance to s2-extracted with extraction counts.
+            self.notion.update_page(
+                page_id=page_id,
+                properties={
+                    "Status": self.notion.status_prop("s2-extracted"),
+                    "Extraction Count": {"number": len(ki_pages)},
+                    "Extraction Tokens": {"number": cleaned_tokens},
+                },
+            )
             logger.info("[%s] Done.", run_id)
 
         except Exception as exc:
@@ -758,9 +835,10 @@ class IngestionEngine:
                 self.notion.update_page(
                     page_id=page_id,
                     properties={
-                        "Last Error": {
-                            "rich_text": self.notion.rich_text(str(exc)[:2000])
-                        },
+                        "Status": self.notion.status_prop("s1-skim"),
+                        "Extraction Error": {"rich_text": self.notion.rich_text(
+                            traceback.format_exc()[:2000]
+                        )},
                         "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
                     },
                 )
@@ -976,9 +1054,104 @@ class IngestionEngine:
 
     # -- Marker API ------------------------------------------------------------
 
+
+    def _pdf_to_markdown(
+        self,
+        attachment_key: str,
+        run_id: str,
+        zip_remote: str,
+        primary_pdf_filename: str | None,
+        page_id: str,
+        props: dict,
+    ) -> tuple[str, int] | tuple[None, None]:
+        """
+        Return the Markdown text for a paper, using a Koofr cache.
+
+        Cache hit  (fast path):
+            /zotero_markdown/{attachment_key}.md exists on Koofr
+            → download and return immediately, no marker call needed.
+
+        Cache miss (slow path):
+            1. Download zip from Koofr
+            2. Extract PDF
+            3. Compute SHA256, write to Notion
+            4. Start job ledger
+            5. POST to marker-api
+            6. Strip boilerplate
+            7. Upload .md to Koofr cache
+            8. Return markdown
+
+        Returns None if a fatal error occurs (status already updated by caller).
+        """
+        md_remote = f"{self.koofr_markdown_dir}/{attachment_key}.md"
+
+        # ── Cache hit ─────────────────────────────────────────────────────────
+        if self._koofr_exists(md_remote):
+            logger.info(
+                "[%s] Markdown cache hit: %s — skipping marker conversion.",
+                run_id, md_remote,
+            )
+            try:
+                raw = self._koofr_download_bytes(md_remote)
+                return raw.decode("utf-8")
+            except Exception:
+                logger.warning(
+                    "[%s] Markdown cache read failed — falling through to re-conversion.",
+                    run_id,
+                )
+                # Fall through to slow path below.
+
+        # ── Cache miss — full pipeline ────────────────────────────────────────
+        logger.info("[%s] Markdown cache miss — converting PDF via marker.", run_id)
+
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        local_zip = TMP_DIR / f"{run_id}.zip"
+        local_pdf = TMP_DIR / f"{run_id}.pdf"
+
+        try:
+            self._download_koofr(zip_remote, local_zip)
+            self._extract_pdf_from_zip(
+                local_zip, local_pdf, preferred=primary_pdf_filename
+            )
+        finally:
+            local_zip.unlink(missing_ok=True)
+
+        # SHA256 + ledger (only on cache miss — PDF was just extracted)
+        pdf_sha256 = self._sha256(local_pdf)
+        logger.info("[%s] PDF SHA256: %s", run_id, pdf_sha256)
+        self.notion.update_page(
+            page_id=page_id,
+            properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
+        )
+        job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
+        logger.info("[%s] JobLedger job_id=%d", run_id, job_id)
+
+        # Marker conversion
+        markdown_text = self._call_marker(local_pdf)
+        local_pdf.unlink(missing_ok=True)
+
+        # Strip boilerplate before caching — cache stores the clean version
+        markdown_text = self._strip_boilerplate(markdown_text)
+        token_count = _count_tokens(markdown_text)
+        logger.info(
+            "[%s] Markdown ready: %d tokens after boilerplate strip.", run_id, token_count
+        )
+
+        # Upload to Koofr cache
+        try:
+            self._koofr_upload(md_remote, markdown_text.encode("utf-8"))
+            logger.info("[%s] Markdown cached → %s", run_id, md_remote)
+        except Exception:
+            logger.warning(
+                "[%s] Markdown cache upload failed — continuing without cache.",
+                run_id,
+            )
+
+        return markdown_text, job_id
+    
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=60))
-    def _pdf_to_markdown(self, pdf_path: Path) -> str:
-        """Ask the local marker-api container to convert the PDF and return Markdown."""
+    def _call_marker(self, pdf_path: Path) -> str:
+        """POST PDF path to the marker-api container and return raw Markdown."""
         response = requests.post(
             f"{self.marker_url}/marker",
             json={"filepath": str(pdf_path)},
@@ -993,7 +1166,233 @@ class IngestionEngine:
             or response.text
         )
 
-    # -- OpenAI extraction -----------------------------------------------------
+    def _koofr_upload(self, remote_path: str, data: bytes) -> None:
+        """Upload bytes to Koofr via WebDAV. Writes to a temp file first."""
+        tmp = TMP_DIR / f"_upload_{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            self._webdav.upload_sync(
+                remote_path=remote_path,
+                local_path=str(tmp),
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _koofr_download_bytes(self, remote_path: str) -> bytes:
+        """Download a file from Koofr and return raw bytes."""
+        tmp = TMP_DIR / f"_download_{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            self._webdav.download_sync(
+                remote_path=remote_path,
+                local_path=str(tmp),
+            )
+            return tmp.read_bytes()
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    
+    # -- Boilerplate stripping (REQ-2) -----------------------------------------
+
+    def _strip_boilerplate(self, markdown: str) -> str:
+        """
+        Strip appendix, references, acknowledgement sections and everything
+        that follows from the markdown.
+
+        Called BEFORE token counting and GPT calls. Does NOT strip
+        'Related Work' or 'Discussion' sections — those provide positioning
+        context that improves extraction quality.
+        """
+        cleaned = _BOILERPLATE_RE.sub("", markdown).strip()
+        logger.info(
+            "Ingestion: boilerplate stripped — %d → %d tokens.",
+            _count_tokens(markdown),
+            _count_tokens(cleaned),
+        )
+        return cleaned
+
+    # -- Extraction dispatcher (REQ-3) -----------------------------------------
+
+    def _run_extraction(
+        self,
+        markdown: str,
+        token_count: int,
+        hubs: dict[str, str],
+        run_id: str,
+    ) -> ExtractionResult:
+        """
+        Dispatch to single-shot or section-by-section extraction depending on
+        token count vs TOKEN_THRESHOLD_CHUNK.
+        """
+        if token_count > TOKEN_THRESHOLD_WARN:
+            logger.warning(
+                "[%s] Paper is very long (%d tokens) — may risk output truncation.",
+                run_id, token_count,
+            )
+        if token_count <= TOKEN_THRESHOLD_CHUNK:
+            return self._extract_and_validate(markdown, hubs, run_id)
+        logger.info(
+            "[%s] Paper exceeds %d tokens — using section-by-section extraction.",
+            run_id, TOKEN_THRESHOLD_CHUNK,
+        )
+        return self._chunked_extract(markdown, hubs, run_id, token_count)
+
+    def _extract_preamble(self, markdown: str, max_tokens: int = 3000) -> str:
+        """
+        Extract the abstract + introduction + notation as shared context for
+        all section-level extraction calls. Truncated to max_tokens.
+        """
+        lines = markdown.split("\n")
+        preamble_lines: list[str] = []
+        in_intro = True
+        for line in lines:
+            # Stop collecting once we hit a top-level section heading
+            # that is NOT introduction-related.
+            if line.startswith("## ") or line.startswith("# "):
+                heading_lower = line.lstrip("#").strip().lower()
+                intro_keywords = ("abstract", "introduction", "notation", "preliminaries", "setup")
+                if not any(kw in heading_lower for kw in intro_keywords):
+                    # Allow the intro section heading itself but stop at the next.
+                    if not in_intro:
+                        break
+                    in_intro = False
+            preamble_lines.append(line)
+        preamble = "\n".join(preamble_lines)
+        # Truncate to max_tokens.
+        while _count_tokens(preamble) > max_tokens and "\n" in preamble:
+            preamble = preamble[:preamble.rfind("\n")]
+        return preamble.strip()
+
+    def _split_by_sections(self, markdown: str) -> list[tuple[str, str]]:
+        """
+        Split markdown on ``##`` headings.
+
+        Returns list of (heading, content) tuples. Sections matching
+        _SKIP_SECTION_KEYWORDS are excluded.
+        """
+        sections: list[tuple[str, str]] = []
+        current_heading = ""
+        current_lines: list[str] = []
+
+        for line in markdown.split("\n"):
+            if line.startswith("## ") or (line.startswith("# ") and not line.startswith("## ")):
+                if current_lines:
+                    sections.append((current_heading, "\n".join(current_lines)))
+                current_heading = line.lstrip("#").strip()
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+
+        if current_lines:
+            sections.append((current_heading, "\n".join(current_lines)))
+
+        # Filter skip sections.
+        filtered = [
+            (h, c) for h, c in sections
+            if not any(kw in h.lower() for kw in _SKIP_SECTION_KEYWORDS)
+        ]
+        return filtered
+
+    @staticmethod
+    def _normalize_concept_title(title: str) -> str:
+        """Lowercase, strip LaTeX delimiters and punctuation for deduplication."""
+        t = title.lower()
+        t = re.sub(r'\$[^$]*\$', '', t)         # strip inline math
+        t = re.sub(r'\\\[.*?\\\]', '', t, flags=re.DOTALL)  # strip display math
+        t = re.sub(r'[^\w\s]', '', t)
+        return re.sub(r'\s+', ' ', t).strip()
+
+    def _chunked_extract(
+        self,
+        markdown: str,
+        hubs: dict[str, str],
+        run_id: str,
+        token_count: int,
+    ) -> ExtractionResult:
+        """
+        Section-by-section extraction for papers over TOKEN_THRESHOLD_CHUNK tokens.
+
+        Each section is extracted with the paper preamble prepended as shared
+        context. Results are merged and deduplicated by normalised title.
+        """
+        preamble = self._extract_preamble(markdown)
+        sections = self._split_by_sections(markdown)
+        logger.info(
+            "[%s] Chunked extraction: %d sections, preamble %d tokens.",
+            run_id, len(sections), _count_tokens(preamble),
+        )
+
+        all_concepts: list[MathObject] = []
+        seen_titles: set[str] = set()
+        merged_one_liner = ""
+        merged_themes: list[str] = []
+
+        for heading, content in sections:
+            section_tokens = _count_tokens(content)
+            if section_tokens < 100:
+                continue  # Skip nearly-empty sections.
+            chunk = f"{preamble}\n\n{content}" if preamble else content
+            try:
+                result = self._extract_and_validate(chunk, hubs, run_id)
+            except Exception:
+                logger.warning(
+                    "[%s] Chunked extraction failed for section '%s' — skipping.",
+                    run_id, heading,
+                )
+                continue
+
+            if not merged_one_liner and result.one_liner:
+                merged_one_liner = result.one_liner
+            for theme in result.active_themes:
+                if theme not in merged_themes:
+                    merged_themes.append(theme)
+
+            for concept in result.extracted_concepts:
+                norm = self._normalize_concept_title(concept.title)
+                if norm and norm not in seen_titles:
+                    seen_titles.add(norm)
+                    all_concepts.append(concept)
+                else:
+                    logger.debug(
+                        "[%s] Dedup: skipping duplicate concept '%s'.",
+                        run_id, concept.title,
+                    )
+
+        logger.info(
+            "[%s] Chunked extraction complete: %d unique concept(s).",
+            run_id, len(all_concepts),
+        )
+        return ExtractionResult(
+            one_liner=merged_one_liner,
+            active_themes=merged_themes,
+            extracted_concepts=all_concepts,
+        )
+    
+
+    def _ensure_koofr_markdown_dir(self) -> None:
+        """Create the markdown cache directory on Koofr if it does not exist."""
+        try:
+            if not self._webdav.check(self.koofr_markdown_dir):
+                self._webdav.mkdir(self.koofr_markdown_dir)
+                logger.info(
+                    "Ingestion: created Koofr markdown dir: %s",
+                    self.koofr_markdown_dir,
+                )
+            else:
+                logger.debug(
+                    "Ingestion: Koofr markdown dir exists: %s",
+                    self.koofr_markdown_dir,
+                )
+        except Exception:
+            logger.warning(
+                "Ingestion: could not ensure Koofr markdown dir '%s' — "
+                "markdown caching may fail.",
+                self.koofr_markdown_dir,
+                exc_info=True,
+            )
+
+    # -- OpenAI extraction (existing, untouched) --------------------------------
 
     def _extract_and_validate(
         self, markdown: str, hubs: dict[str, str], run_id: str
@@ -1129,41 +1528,43 @@ class IngestionEngine:
     # -- Patch Paper Tracker row -----------------------------------------------
 
     def _patch_notion_page(
-        self, page_id: str, result: ExtractionResult, run_id: str
+        self, page_id: str, result: ExtractionResult, run_id: str,
+        set_thesis_relevance: bool = False,
     ) -> None:
         """
-        Update the Paper Tracker page after a successful extraction.
+        Update the Paper Tracker page metadata after a successful extraction.
 
-        Uses status_prop for the Status field (Notion status type).
+        Note: Status is NOT updated here; it is managed in _process_paper so
+        that the full pipeline (Stages 1-3) completes before advancing.
         """
-        self.notion.update_page(
-            page_id=page_id,
-            properties={
-                "Status": self.notion.status_prop("s2-extracted"),
-                "AI Status": self.notion.select_prop("Unverified-AI"),
-                "One Liner": {"rich_text": self.notion.rich_text(result.one_liner)},
-                "Active Themes": self.notion.multi_select_prop(result.active_themes),
-                "Extraction Version": {
-                    "rich_text": self.notion.rich_text(EXTRACTION_VERSION)
-                },
-                "Processed At": {
-                    "date": {"start": datetime.now(tz=timezone.utc).isoformat()}
-                },
-                "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
-                "Last Error": {"rich_text": self.notion.rich_text("")},
+        properties: dict = {
+            "AI Status": self.notion.select_prop("Unverified-AI"),
+            "One Liner": {"rich_text": self.notion.rich_text(result.one_liner)},
+            "Active Themes": self.notion.multi_select_prop(result.active_themes),
+            "Extraction Version": {
+                "rich_text": self.notion.rich_text(EXTRACTION_VERSION)
             },
-        )
+            "Processed At": {
+                "date": {"start": datetime.now(tz=timezone.utc).isoformat()}
+            },
+            "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
+            "Last Error": {"rich_text": self.notion.rich_text("")},
+        }
+        # REQ-9: Set Thesis Relevance = supporting as a default if the property is empty.
+        if set_thesis_relevance:
+            properties["Thesis Relevance"] = self.notion.select_prop("supporting")
+        self.notion.update_page(page_id=page_id, properties=properties)
 
     def _patch_notion_paper_post_linking(self, page_id: str, run_id: str) -> None:
         """
         Update the Paper Tracker page after the LINK stage completes.
 
-        Uses status_prop for the Status field (Notion status type).
+        Status is NOT updated here; _process_paper sets s2-extracted after
+        all stages complete successfully.
         """
         self.notion.update_page(
             page_id=page_id,
             properties={
-                "Status": self.notion.status_prop("s2b-linked-ai"),
                 "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
             },
         )
@@ -1299,6 +1700,8 @@ class IngestionEngine:
         )
 
         body_blocks: list[dict] = []
+        # REQ-8: Prepend review checklist so human sees guided review flow first.
+        body_blocks.extend(self._review_checklist_blocks())
         body_blocks.append(self._heading_block("Assumptions"))
         body_blocks.extend(paragraph_blocks_from_latex(concept.assumptions))
         body_blocks.append(self._heading_block("Statement"))
@@ -1504,6 +1907,165 @@ class IngestionEngine:
         ) 
         return response.output_parsed
 
+    # -- Re-extraction flow (REQ-5) --------------------------------------------
+
+    def _reextract_missed_concepts(
+        self,
+        page: dict,
+        hubs: dict[str, str],
+        sb_index: list[dict],
+    ) -> None:
+        """
+        Targeted second-pass extraction for concepts flagged as missing by the
+        human reviewer via the 'Re-extract Hints' paper property.
+
+        Steps:
+        1. Read Re-extract Hints from paper page.
+        2. Fetch existing KI concept titles for this paper (dedup guard).
+        3. Run GPT with REEXTRACT_SYSTEM_PROMPT.
+        4. Create KI pages for new concepts only.
+        5. Run Stage 2 + Stage 3 on new concepts.
+        6. Advance paper back to s2-extracted.
+        """
+        page_id = page["id"]
+        props = page["properties"]
+        run_id = uuid.uuid4().hex[:8]
+
+        hints = self._get_text_prop(props, "Re-extract Hints").strip()
+        if not hints:
+            logger.warning(
+                "[%s] s2-reextract: 'Re-extract Hints' is empty for page %s — "
+                "reverting to s2-extracted.",
+                run_id, page_id,
+            )
+            self.notion.update_page(
+                page_id=page_id,
+                properties={"Status": self.notion.status_prop("s2-extracted")},
+            )
+            return
+
+        # Fetch existing KI concept titles to avoid duplicates.
+        existing_ki = self.notion.query_database(
+            self.knowledge_inbox_db,
+            filter={
+                "property": "Source Paper",
+                "relation": {"contains": page_id},
+            },
+        )
+        existing_titles = [self._get_page_title(p) for p in existing_ki if self._get_page_title(p)]
+        existing_titles_str = "\n".join(f"- {t}" for t in existing_titles) or "(none)"
+
+        # Build the targeted extraction prompt.
+        hub_names_str = (
+            ", ".join(f'"{name}"' for name in hubs) if hubs else '"Uncategorized"'
+        )
+        system_prompt = (
+            REEXTRACT_SYSTEM_PROMPT
+            .replace("{hints}", hints)
+            .replace("{existing_titles}", existing_titles_str)
+            .replace("{latex_formatting_rules}", LATEX_FORMATTING_RULES)
+        )
+        # Append hub list so GPT can assign suggested_hub.
+        system_prompt += f"\n\nALLOWED_HUBS:\n[{hub_names_str}]"
+
+        # Fetch the paper's markdown from the Notion page body as context.
+        # Fall back to using hints alone if markdown is unavailable.
+        markdown_context = hints  # minimal context fallback
+
+        logger.info(
+            "[%s] Re-extraction: %d hint(s), %d existing concept(s).",
+            run_id, len(hints.split("\n")), len(existing_titles),
+        )
+
+        try:
+            response = self.openai_client.responses.parse(
+                model=OPENAI_MODEL,
+                text_format=ExtractionResult,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Extract ONLY the missing concepts described above.\n\n"
+                            f"PAPER CONTEXT:\n{markdown_context[:20_000]}"
+                        ),
+                    },
+                ],
+            )
+            reextraction = response.output_parsed
+        except Exception:
+            logger.exception("[%s] Re-extraction OpenAI call failed.", run_id)
+            return
+
+        new_concepts = [
+            c for c in reextraction.extracted_concepts
+            if self._normalize_concept_title(c.title)
+            not in {self._normalize_concept_title(t) for t in existing_titles}
+        ]
+
+        logger.info(
+            "[%s] Re-extraction: %d new concept(s) after dedup.",
+            run_id, len(new_concepts),
+        )
+
+        if not new_concepts:
+            logger.info("[%s] Re-extraction: nothing new — advancing to s2-extracted.", run_id)
+            self.notion.update_page(
+                page_id=page_id,
+                properties={"Status": self.notion.status_prop("s2-extracted")},
+            )
+            return
+
+        # Create KI pages for new concepts.
+        ki_pages: list[tuple[MathObject, str]] = []
+        for concept in new_concepts:
+            try:
+                ki_page_id = self._create_knowledge_item(page_id, concept, hubs)
+                ki_pages.append((concept, ki_page_id))
+                if self._vector_index and self._vector_index.available:
+                    try:
+                        self._vector_index.index_concept(concept, ki_page_id, verified=False)
+                    except Exception:
+                        logger.warning(
+                            "[%s] VectorIndex: failed to index '%s'.", run_id, concept.title
+                        )
+            except Exception:
+                logger.exception(
+                    "[%s] Re-extraction: failed to create KI item '%s'",
+                    run_id, concept.title,
+                )
+
+        self._inject_ki_pages_into_index(ki_pages, sb_index)
+
+        # Stage 2 + 3 on new concepts.
+        concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
+        for concept, ki_page_id in ki_pages:
+            candidates = self._retrieve_candidates_for_concept(
+                concept, sb_index, current_page_id=ki_page_id
+            )
+            self._update_knowledge_item_candidates(ki_page_id, candidates)
+            concept_candidates.append((concept, ki_page_id, candidates))
+
+        for concept, ki_page_id, candidates in concept_candidates:
+            try:
+                link_result = self._run_stage_link(concept, candidates, run_id)
+                self._update_knowledge_item_graph_data(ki_page_id, link_result)
+            except Exception:
+                logger.exception(
+                    "[%s] Re-extraction: link stage failed for '%s'",
+                    run_id, concept.title,
+                )
+
+        # Return paper to s2-extracted.
+        self.notion.update_page(
+            page_id=page_id,
+            properties={"Status": self.notion.status_prop("s2-extracted")},
+        )
+        logger.info(
+            "[%s] Re-extraction complete: %d new concept(s) created.",
+            run_id, len(ki_pages),
+        )
+
     # -- Text chunking ---------------------------------------------------------
 
     def _chunk_text(self, text: str, max_len: int = NOTION_BLOCK_MAX_CHARS) -> list[str]:
@@ -1554,6 +2116,104 @@ class IngestionEngine:
                 "rich_text": [{"type": "text", "text": {"content": text}}],
             },
         }
+
+    @staticmethod
+    def _todo_block(text: str) -> dict:
+        """Build a Notion to_do block (checkbox item)."""
+        return {
+            "object": "block",
+            "type": "to_do",
+            "to_do": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
+                "checked": False,
+            },
+        }
+
+    @staticmethod
+    def _divider_block() -> dict:
+        """Build a Notion divider block."""
+        return {"object": "block", "type": "divider", "divider": {}}
+
+    # -- Review checklist (REQ-8) ----------------------------------------------
+
+    def _review_checklist_blocks(self) -> list[dict]:
+        """
+        Return the guided review checklist blocks prepended to every KI page.
+        """
+        return [
+            self._heading_block("Review"),
+            self._todo_block(
+                "1. Is the title correct? "
+                "(edit Name, or fill Corrected Title property)"
+            ),
+            self._todo_block(
+                "2. Is the formal statement correct? Check the Statement block below."
+            ),
+            self._todo_block(
+                "3. Are the assumptions and variables correct?"
+            ),
+            self._todo_block(
+                "4. Review proposed edges in Edge Suggestions property."
+            ),
+            self._todo_block(
+                "5. Set verification_status → verified or rejected"
+            ),
+            self._divider_block(),
+        ]
+
+    # -- Paper page body patching (REQ-9) --------------------------------------
+
+    def _patch_paper_page(self, paper_page_id: str, ki_page_ids: list[str]) -> None:
+        """
+        Append an '## Extracted Concepts' heading and callout to the paper page.
+
+        Idempotent: checks whether the heading already exists before appending.
+        Also skips if ki_page_ids is empty.
+        """
+        if not ki_page_ids:
+            return
+        try:
+            existing_blocks = self.notion.get_block_children(paper_page_id)
+            for block in existing_blocks:
+                if block.get("type") == "heading_2":
+                    rt = block.get("heading_2", {}).get("rich_text", [])
+                    text = "".join(seg.get("plain_text", "") for seg in rt)
+                    if "Extracted Concepts" in text:
+                        logger.debug(
+                            "PaperPage %s: 'Extracted Concepts' heading already exists — skipping patch.",
+                            paper_page_id,
+                        )
+                        return
+
+            count = len(ki_page_ids)
+            callout_text = (
+                f"{count} concept(s) extracted into Knowledge Inbox. "
+                "Filter KI by Source Paper to review."
+            )
+            blocks: list[dict] = [
+                self._heading_block("Extracted Concepts"),
+                {
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            {"type": "text", "text": {"content": callout_text[:2000]}}
+                        ],
+                        "icon": {"type": "emoji", "emoji": "📚"},
+                        "color": "blue_background",
+                    },
+                },
+            ]
+            self._append_blocks_in_batches(paper_page_id, blocks)
+            logger.info(
+                "PaperPage %s: appended Extracted Concepts section (%d concept(s)).",
+                paper_page_id, count,
+            )
+        except Exception:
+            logger.warning(
+                "PaperPage %s: could not patch paper page body — continuing.",
+                paper_page_id,
+            )
 
     def _append_blocks_in_batches(self, page_id: str, blocks: list[dict]) -> None:
         """Append blocks in batches of 100 to respect the Notion API limit."""

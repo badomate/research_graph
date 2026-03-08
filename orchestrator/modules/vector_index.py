@@ -833,6 +833,12 @@ class VectorIndexEngine:
             "suggested_hub": getattr(concept, "suggested_hub", None) or "",
             "concept_type": concept.type or "",
             "indexed_at": datetime.now(timezone.utc).isoformat(),
+            "setting":           getattr(concept, "setting", None) or [],
+            "result_category":   getattr(concept, "result_category", None) or "",
+            "named_tools":       getattr(concept, "named_tools", None) or [],
+            "canonical_keywords": getattr(concept, "canonical_keywords", None) or [],
+            "prereq_keywords":   getattr(concept, "prereq_keywords", None) or [],
+            "downstream_keywords": getattr(concept, "downstream_keywords", None) or [],
         }
 
     @staticmethod
