@@ -133,17 +133,15 @@ _SKIP_SECTION_KEYWORDS = (
 # Matches appendix / references / acknowledgement headings and everything after.
 _BOILERPLATE_RE = re.compile(
     r'\n#{1,3}\s*('
-    r'Appendix|Appendices|Appendix\s+[A-Z\d]|[A-Z]\.\s+'
-    r'|Supplementary|Supplemental Material|'
-    r'Deferred Proofs?|Proofs? of|Technical Lemmas?|'
-    r'References|Bibliography|Works Cited|'
-    r'Acknowledgements?|Acknowledgments?|'
-    r'Funding|Declaration|Conflicts? of Interest|'
-    r'Author Contributions?'
+    r'References|Bibliography|Works Cited'
+    r'|Acknowledgements?|Acknowledgments?'
+    r'|Appendix|Appendices|Appendix\s+[A-Z0-9]|[A-Z]\.\s+(?:Proofs?|Appendix)'
+    r'|Supplementary\s+Material|Supplemental\s+Material|Supplementary'
+    r'|Deferred\s+Proofs?|Proofs?\s+of\s+\w|Technical\s+Lemmas?'
+    r'|Funding|Declaration\s+of|Conflicts?\s+of\s+Interest|Author\s+Contributions?'
     r')[^\n]*\n[\s\S]*$',
     re.IGNORECASE,
 )
-
 
 def _count_tokens(text: str) -> int:
     """Approximate token count. Uses tiktoken when available, falls back to 4 chars/token."""
@@ -713,12 +711,8 @@ class IngestionEngine:
             # -- STAGE 1 / Step 3: Patch Paper Tracker metadata ----------------
             logger.info("[%s] Stage 1: patching Notion paper row ...", run_id)
             # REQ-9: Set Thesis Relevance = supporting as default if unset.
-            thesis_relevance_set = bool(
-                props.get("Thesis Relevance", {}).get("select", {}).get("name", "")
-            )
             self._patch_notion_page(
                 page_id, extraction, run_id,
-                set_thesis_relevance=not thesis_relevance_set,
             )
 
             # -- STAGE 1 / Step 4: Create Knowledge Inbox entries --------------
@@ -1195,22 +1189,18 @@ class IngestionEngine:
     
     # -- Boilerplate stripping (REQ-2) -----------------------------------------
 
-    def _strip_boilerplate(self, markdown: str) -> str:
-        """
-        Strip appendix, references, acknowledgement sections and everything
-        that follows from the markdown.
-
-        Called BEFORE token counting and GPT calls. Does NOT strip
-        'Related Work' or 'Discussion' sections — those provide positioning
-        context that improves extraction quality.
-        """
-        cleaned = _BOILERPLATE_RE.sub("", markdown).strip()
-        logger.info(
-            "Ingestion: boilerplate stripped — %d → %d tokens.",
-            _count_tokens(markdown),
-            _count_tokens(cleaned),
-        )
-        return cleaned
+    def _strip_boilerplate(self, text: str) -> str:
+        stripped = _BOILERPLATE_RE.sub("", text)
+        ratio = len(stripped) / max(len(text), 1)
+        if ratio < 0.2:
+            logger.warning(
+                "Boilerplate strip removed >80%% of document (%.0f%% remaining) — "
+                "regex may have matched too early. Returning original.",
+                ratio * 100,
+            )
+            return text
+        logger.debug("Boilerplate strip: %.0f%% retained.", ratio * 100)
+        return stripped
 
     # -- Extraction dispatcher (REQ-3) -----------------------------------------
 
@@ -1550,9 +1540,7 @@ class IngestionEngine:
             "Last Run ID": {"rich_text": self.notion.rich_text(run_id)},
             "Last Error": {"rich_text": self.notion.rich_text("")},
         }
-        # REQ-9: Set Thesis Relevance = supporting as a default if the property is empty.
-        if set_thesis_relevance:
-            properties["Thesis Relevance"] = self.notion.select_prop("supporting")
+
         self.notion.update_page(page_id=page_id, properties=properties)
 
     def _patch_notion_paper_post_linking(self, page_id: str, run_id: str) -> None:

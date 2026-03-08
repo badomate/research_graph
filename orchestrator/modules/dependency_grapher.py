@@ -125,6 +125,12 @@ _PHYSICS_OPTIONS = """{
 }"""
 
 
+def _notion_url(page_id: str) -> str:
+    """Return the canonical Notion page URL for a page id."""
+    clean = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean}"
+
+
 class DependencyGrapher:
     """
     Module 5: Builds two interactive concept/paper graphs and an index page.
@@ -216,6 +222,8 @@ class DependencyGrapher:
             pid    = page["id"]
             title  = self._get_title(page["properties"])
             status = self._get_status(page["properties"])
+            arxiv  = self._get_text(page["properties"], "ArXiv ID")
+            authors = self._get_text(page["properties"], "Authors")
             id_to_title[pid] = title
             g.add_node(
                 pid,
@@ -225,6 +233,15 @@ class DependencyGrapher:
                 shape="box",
                 size=20,
                 node_kind="paper",
+                notion_url=_notion_url(pid),
+                meta=json.dumps({
+                    "kind": "paper",
+                    "title": title,
+                    "status": status,
+                    "arxiv": arxiv,
+                    "authors": authors,
+                    "notion_url": _notion_url(pid),
+                }),
             )
 
         # Add SB concept nodes
@@ -233,6 +250,13 @@ class DependencyGrapher:
             title        = self._get_title(page["properties"])
             concept_type = self._get_select(page["properties"], "Type")
             hub          = self._get_text(page["properties"], "Suggested Hub")
+            summary      = self._get_text_full(page["properties"], "Summary")
+            tags_raw     = page["properties"].get("Tags", {})
+            tags: list[str] = []
+            try:
+                tags = [t["name"] for t in tags_raw.get("multi_select", [])]
+            except Exception:
+                pass
             id_to_title[pid] = title
             tooltip = f"{'⬡'} {title}\nType: {concept_type}"
             if hub:
@@ -245,6 +269,16 @@ class DependencyGrapher:
                 shape="ellipse",
                 size=15,
                 node_kind="concept",
+                notion_url=_notion_url(pid),
+                meta=json.dumps({
+                    "kind": "concept",
+                    "title": title,
+                    "type": concept_type,
+                    "hub": hub,
+                    "summary": summary,
+                    "tags": tags,
+                    "notion_url": _notion_url(pid),
+                }),
             )
 
         # Paper → Concept edges (source relation on SB pages)
@@ -261,6 +295,15 @@ class DependencyGrapher:
                         title="source",
                         edge_kind="source",
                         width=1,
+                        notion_url="",
+                        meta=json.dumps({
+                            "kind": "edge",
+                            "relation_type": "source",
+                            "rationale": "",
+                            "confidence": None,
+                            "status": "structural",
+                            "notion_url": "",
+                        }),
                     )
 
         # Concept → Concept edges from Edges DB
@@ -297,6 +340,15 @@ class DependencyGrapher:
                 edge_kind=rel_type,
                 dashes=False,
                 width=2 if status == "verified" else 1,
+                notion_url=_notion_url(edge_page["id"]),
+                meta=json.dumps({
+                    "kind": "edge",
+                    "relation_type": rel_type,
+                    "rationale": rationale,
+                    "confidence": confidence,
+                    "status": status,
+                    "notion_url": _notion_url(edge_page["id"]),
+                }),
             )
 
         return g
@@ -317,6 +369,8 @@ class DependencyGrapher:
             pid    = page["id"]
             title  = self._get_title(page["properties"])
             status = self._get_status(page["properties"])
+            arxiv  = self._get_text(page["properties"], "ArXiv ID")
+            authors = self._get_text(page["properties"], "Authors")
             id_to_title[pid] = title
             g.add_node(
                 pid,
@@ -326,6 +380,15 @@ class DependencyGrapher:
                 shape="box",
                 size=20,
                 node_kind="paper",
+                notion_url=_notion_url(pid),
+                meta=json.dumps({
+                    "kind": "paper",
+                    "title": title,
+                    "status": status,
+                    "arxiv": arxiv,
+                    "authors": authors,
+                    "notion_url": _notion_url(pid),
+                }),
             )
 
         # Add KI concept nodes
@@ -351,6 +414,13 @@ class DependencyGrapher:
                 f"Verification: {v_status}\n"
                 f"Link status: {graph_link_status}"
             )
+            summary = self._get_text_full(props, "Summary")
+            tags_raw = props.get("Tags", {})
+            tags: list[str] = []
+            try:
+                tags = [t["name"] for t in tags_raw.get("multi_select", [])]
+            except Exception:
+                pass
             g.add_node(
                 pid,
                 label=self._truncate(title, 40),
@@ -359,6 +429,17 @@ class DependencyGrapher:
                 shape="ellipse",
                 size=15,
                 node_kind="ki_concept",
+                notion_url=_notion_url(pid),
+                meta=json.dumps({
+                    "kind": "ki_concept",
+                    "title": title,
+                    "type": concept_type,
+                    "verification_status": v_status,
+                    "graph_link_status": graph_link_status,
+                    "summary": summary,
+                    "tags": tags,
+                    "notion_url": _notion_url(pid),
+                }),
             )
 
         # Paper → KI concept edges
@@ -375,6 +456,15 @@ class DependencyGrapher:
                         title="source",
                         edge_kind="source",
                         width=1,
+                        notion_url="",
+                        meta=json.dumps({
+                            "kind": "edge",
+                            "relation_type": "source",
+                            "rationale": "",
+                            "confidence": None,
+                            "status": "structural",
+                            "notion_url": "",
+                        }),
                     )
 
         # KI → KI concept edges from Edge Suggestions JSON (AI-proposed)
@@ -424,6 +514,15 @@ class DependencyGrapher:
                         edge_kind=rel_type,
                         dashes=True,   # dashed = AI-proposed, not human-verified
                         width=1,
+                        notion_url="",
+                        meta=json.dumps({
+                            "kind": "edge",
+                            "relation_type": rel_type,
+                            "rationale": rationale,
+                            "confidence": confidence,
+                            "status": "ai-proposed",
+                            "notion_url": "",
+                        }),
                     )
 
         return g
@@ -438,7 +537,7 @@ class DependencyGrapher:
     ) -> None:
         """Render a NetworkX graph to an interactive PyVis HTML file."""
         net = Network(
-            height="960px",
+            height="100vh",
             width="100%",
             directed=True,
             bgcolor="#1a1a2e",
@@ -446,6 +545,8 @@ class DependencyGrapher:
             notebook=False,
         )
 
+        # Build metadata lookup: node_id -> parsed meta dict
+        node_meta: dict[str, dict] = {}
         for node_id, data in graph.nodes(data=True):
             net.add_node(
                 node_id,
@@ -455,7 +556,14 @@ class DependencyGrapher:
                 shape=data.get("shape", "ellipse"),
                 size=data.get("size", 15),
             )
+            raw_meta = data.get("meta", "{}")
+            try:
+                node_meta[node_id] = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+            except Exception:
+                node_meta[node_id] = {}
 
+        # Build edge metadata lookup: "src||dst" -> parsed meta dict
+        edge_meta: dict[str, dict] = {}
         for src, dst, data in graph.edges(data=True):
             net.add_edge(
                 src,
@@ -466,20 +574,540 @@ class DependencyGrapher:
                 dashes=data.get("dashes", False),
                 width=data.get("width", 1),
             )
+            raw_meta = data.get("meta", "{}")
+            try:
+                em = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+            except Exception:
+                em = {}
+            em["_src"] = node_meta.get(src, {}).get("title", src)
+            em["_dst"] = node_meta.get(dst, {}).get("title", dst)
+            em["_src_id"] = src
+            em["_dst_id"] = dst
+            edge_meta[f"{src}||{dst}"] = em
 
         net.set_options(_PHYSICS_OPTIONS)
-
-        # Inject a title banner into the HTML.
         net.save_graph(str(output_path))
+
+        # ── Build the injected HTML/CSS/JS ────────────────────────────────
+        node_meta_js  = json.dumps(node_meta,  ensure_ascii=False)
+        edge_meta_js  = json.dumps(edge_meta,  ensure_ascii=False)
+
+        inject = f"""
+<!-- ═══════════════ INJECTED PANEL ═══════════════ -->
+<script id="GRAPH_NODE_META" type="application/json">{node_meta_js}</script>
+<script id="GRAPH_EDGE_META" type="application/json">{edge_meta_js}</script>
+
+<style>
+/* ── Side panel ── */
+#kg-panel {{
+  position: fixed;
+  top: 0; right: 0;
+  width: 360px;
+  height: 100vh;
+  background: #1e1e30;
+  border-left: 1px solid #3a3a5e;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.28s cubic-bezier(0.4,0,0.2,1);
+  z-index: 10000;
+  font-family: 'Segoe UI', sans-serif;
+  color: #e0e0f0;
+  overflow: hidden;
+}}
+#kg-panel.open {{
+  transform: translateX(0);
+}}
+#kg-panel-header {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  background: #252540;
+  border-bottom: 1px solid #3a3a5e;
+  flex-shrink: 0;
+}}
+#kg-panel-header h2 {{
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #c7c7e8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}}
+#kg-panel-close {{
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 1.3rem;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  flex-shrink: 0;
+}}
+#kg-panel-close:hover {{ color: #e0e0f0; }}
+#kg-panel-body {{
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}}
+#kg-panel-body::-webkit-scrollbar {{ width: 5px; }}
+#kg-panel-body::-webkit-scrollbar-track {{ background: #1e1e30; }}
+#kg-panel-body::-webkit-scrollbar-thumb {{ background: #444466; border-radius: 3px; }}
+.kg-badge {{
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+  letter-spacing: 0.03em;
+}}
+.kg-row {{
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+  align-items: flex-start;
+}}
+.kg-row .kg-lbl {{
+  color: #888;
+  min-width: 90px;
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  padding-top: 1px;
+}}
+.kg-row .kg-val {{
+  color: #c8c8e8;
+  word-break: break-word;
+}}
+.kg-summary {{
+  background: #252540;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-top: 10px;
+  color: #b0b0d8;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  max-height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}}
+.kg-tags {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}}
+.kg-tag {{
+  background: #2d2d50;
+  border: 1px solid #4a4a72;
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  color: #9898c8;
+}}
+.kg-notion-btn {{
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 14px;
+  padding: 7px 14px;
+  background: #2d2d50;
+  border: 1px solid #5a5a9e;
+  border-radius: 7px;
+  color: #b0b0e8;
+  text-decoration: none;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}}
+.kg-notion-btn:hover {{ background: #3a3a6e; color: #fff; }}
+.kg-neighbours {{
+  margin-top: 14px;
+  border-top: 1px solid #2d2d50;
+  padding-top: 12px;
+}}
+.kg-neighbours h3 {{
+  font-size: 0.78rem;
+  color: #666;
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}}
+.kg-nb-item {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid #252540;
+  cursor: pointer;
+}}
+.kg-nb-item:hover .kg-nb-label {{ color: #fff; }}
+.kg-nb-dot {{
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}}
+.kg-nb-label {{
+  font-size: 0.8rem;
+  color: #aaa;
+  transition: color 0.1s;
+}}
+.kg-nb-dir {{
+  font-size: 0.7rem;
+  color: #555;
+  margin-left: auto;
+  flex-shrink: 0;
+}}
+/* ── Banner ── */
+#kg-banner {{
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2d2d44;
+  color: white;
+  padding: 8px 20px;
+  border-radius: 8px;
+  font-family: sans-serif;
+  font-size: 14px;
+  z-index: 9999;
+  pointer-events: none;
+}}
+/* ── Focus-mode overlay ── */
+#kg-focus-bar {{
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #252540;
+  border: 1px solid #4a4a72;
+  border-radius: 20px;
+  padding: 6px 18px;
+  font-family: sans-serif;
+  font-size: 0.82rem;
+  color: #888;
+  z-index: 9999;
+  display: none;
+  gap: 12px;
+  align-items: center;
+}}
+#kg-focus-bar.visible {{ display: flex; }}
+#kg-focus-exit {{
+  background: none;
+  border: none;
+  color: #9898c8;
+  cursor: pointer;
+  font-size: 0.82rem;
+  padding: 0;
+}}
+#kg-focus-exit:hover {{ color: #fff; }}
+</style>
+
+<!-- Banner -->
+<div id="kg-banner">{title} — {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges</div>
+
+<!-- Side panel -->
+<div id="kg-panel">
+  <div id="kg-panel-header">
+    <h2 id="kg-panel-title">Detail</h2>
+    <button id="kg-panel-close" title="Close">✕</button>
+  </div>
+  <div id="kg-panel-body" id="kg-panel-body"></div>
+</div>
+
+<!-- Focus bar -->
+<div id="kg-focus-bar">
+  <span id="kg-focus-label">Focus mode</span>
+  <button id="kg-focus-exit">✕ Exit focus</button>
+</div>
+
+<script>
+(function(){{
+  var NODE_META = JSON.parse(document.getElementById('GRAPH_NODE_META').textContent);
+  var EDGE_META = JSON.parse(document.getElementById('GRAPH_EDGE_META').textContent);
+
+  var panel      = document.getElementById('kg-panel');
+  var panelTitle = document.getElementById('kg-panel-title');
+  var panelBody  = document.getElementById('kg-panel-body');
+  var focusBar   = document.getElementById('kg-focus-bar');
+  var focusLabel = document.getElementById('kg-focus-label');
+
+  document.getElementById('kg-panel-close').onclick = closePanel;
+  document.getElementById('kg-focus-exit').onclick  = exitFocus;
+
+  var currentFocusId = null;
+
+  // ── Helpers ────────────────────────────────────────────────────────────
+  function badge(text, colour) {{
+    return '<span class="kg-badge" style="background:' + colour + '33;color:' + colour + ';border:1px solid ' + colour + '66">' + esc(text) + '</span>';
+  }}
+  function row(label, value) {{
+    if (!value && value !== 0) return '';
+    return '<div class="kg-row"><span class="kg-lbl">' + esc(label) + '</span><span class="kg-val">' + esc(String(value)) + '</span></div>';
+  }}
+  function esc(s) {{
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }}
+  function notionBtn(url) {{
+    if (!url) return '';
+    return '<a class="kg-notion-btn" href="' + url + '" target="_blank" rel="noopener">'
+      + '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">'
+      + '<path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L17.86 1.968c-.42-.326-.981-.7-2.055-.607L3.01 2.295c-.466.046-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.167V6.354c0-.606-.233-.933-.748-.887l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952L12.21 19s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.14c-.093-.514.28-.887.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z"/>'
+      + '</svg> Open in Notion</a>';
+  }}
+
+  // ── Node colour lookup (from vis-network nodes dataset) ───────────────
+  function getNodeColour(nid) {{
+    try {{
+      var n = network.body.data.nodes.get(nid);
+      if (!n) return '#888';
+      var c = n.color;
+      if (typeof c === 'string') return c;
+      if (c && c.background) return c.background;
+    }} catch(e) {{}}
+    return '#888';
+  }}
+
+  // ── Show node panel ────────────────────────────────────────────────────
+  function showNodePanel(nodeId) {{
+    var m = NODE_META[nodeId];
+    if (!m) return;
+    panelTitle.textContent = m.title || nodeId;
+
+    var html = '';
+    var kind = m.kind || 'node';
+
+    // Badge
+    if (kind === 'paper') {{
+      html += badge('Paper', '#f4a261');
+      html += row('Status', m.status);
+      if (m.arxiv) html += row('ArXiv', m.arxiv);
+      if (m.authors) html += row('Authors', m.authors);
+    }} else if (kind === 'concept') {{
+      html += badge(m.type || 'Concept', '#6c63ff');
+      if (m.hub) html += row('Hub', m.hub);
+      if (m.tags && m.tags.length) {{
+        html += '<div class="kg-row"><span class="kg-lbl">Tags</span><span class="kg-val"><div class="kg-tags">';
+        m.tags.forEach(function(t){{ html += '<span class="kg-tag">' + esc(t) + '</span>'; }});
+        html += '</div></span></div>';
+      }}
+      if (m.summary) html += '<div class="kg-summary">' + esc(m.summary) + '</div>';
+    }} else if (kind === 'ki_concept') {{
+      var vcol = {{verified:'#52b788',unverified:'#f4a261',rejected:'#e63946'}}[m.verification_status] || '#888';
+      html += badge(m.type || 'KI Concept', vcol);
+      html += row('Verification', m.verification_status);
+      html += row('Link status', m.graph_link_status);
+      if (m.tags && m.tags.length) {{
+        html += '<div class="kg-row"><span class="kg-lbl">Tags</span><span class="kg-val"><div class="kg-tags">';
+        m.tags.forEach(function(t){{ html += '<span class="kg-tag">' + esc(t) + '</span>'; }});
+        html += '</div></span></div>';
+      }}
+      if (m.summary) html += '<div class="kg-summary">' + esc(m.summary) + '</div>';
+    }}
+
+    // Neighbours
+    var edges = network.getConnectedEdges(nodeId);
+    var nbMap = {{}}; // nid -> {{dir, edgeKind}}
+    edges.forEach(function(eid) {{
+      try {{
+        var e = network.body.data.edges.get(eid);
+        if (!e) return;
+        var other = (e.from === nodeId) ? e.to : e.from;
+        var dir   = (e.from === nodeId) ? '→' : '←';
+        if (!nbMap[other]) nbMap[other] = [];
+        nbMap[other].push(dir + (e.label ? ' ' + e.label : ''));
+      }} catch(ex) {{}}
+    }});
+
+    var nbIds = Object.keys(nbMap);
+    if (nbIds.length) {{
+      html += '<div class="kg-neighbours"><h3>Neighbours (' + nbIds.length + ')</h3>';
+      nbIds.forEach(function(nid) {{
+        var nm = NODE_META[nid] || {{}};
+        var col = getNodeColour(nid);
+        html += '<div class="kg-nb-item" data-nid="' + esc(nid) + '">';
+        html += '<div class="kg-nb-dot" style="background:' + col + '"></div>';
+        html += '<span class="kg-nb-label">' + esc(nm.title || nid) + '</span>';
+        html += '<span class="kg-nb-dir">' + esc(nbMap[nid].join(', ')) + '</span>';
+        html += '</div>';
+      }});
+      html += '</div>';
+    }}
+
+    html += notionBtn(m.notion_url);
+    panelBody.innerHTML = html;
+
+    // Wire neighbour click → navigate
+    panelBody.querySelectorAll('.kg-nb-item').forEach(function(el) {{
+      el.addEventListener('click', function() {{
+        var nid = el.getAttribute('data-nid');
+        network.selectNodes([nid]);
+        network.focus(nid, {{scale: 1.2, animation: {{duration:400,easingFunction:'easeInOutQuad'}}}} );
+        showNodePanel(nid);
+        applyFocus(nid);
+      }});
+    }});
+
+    openPanel(m.title || nodeId);
+  }}
+
+  // ── Show edge panel ────────────────────────────────────────────────────
+  function showEdgePanel(edgeId) {{
+    try {{
+      var e = network.body.data.edges.get(edgeId);
+      if (!e) return;
+      var key = e.from + '||' + e.to;
+      var m   = EDGE_META[key] || {{}};
+      var srcTitle = (NODE_META[e.from] || {{}}).title || e.from;
+      var dstTitle = (NODE_META[e.to]   || {{}}).title || e.to;
+      var rtype = m.relation_type || e.label || 'edge';
+
+      panelTitle.textContent = rtype;
+
+      var ecols = {{
+        depends_on:'#e63946', enables:'#2a9d8f', generalizes:'#457b9d',
+        special_case_of:'#7b2d8b', related:'#888888', source:'#cccccc'
+      }};
+      var col = ecols[rtype] || '#888888';
+
+      var html = '';
+      html += badge(rtype, col);
+      if (m.status) html += badge(m.status, m.status==='verified'?'#52b788':m.status==='ai-proposed'?'#6c63ff':'#888');
+      html += '<div style="margin:10px 0 4px;">';
+      html += '<div class="kg-row"><span class="kg-lbl">From</span><span class="kg-val">' + esc(srcTitle) + '</span></div>';
+      html += '<div class="kg-row"><span class="kg-lbl">To</span><span class="kg-val">' + esc(dstTitle) + '</span></div>';
+      if (m.confidence !== undefined && m.confidence !== null)
+        html += row('Confidence', (m.confidence * 100).toFixed(0) + '%');
+      if (m.rationale)
+        html += '<div class="kg-summary">' + esc(m.rationale) + '</div>';
+      html += '</div>';
+
+      if (m.notion_url)
+        html += notionBtn(m.notion_url);
+
+      panelBody.innerHTML = html;
+      openPanel(rtype + ': ' + srcTitle.slice(0,20) + ' → ' + dstTitle.slice(0,20));
+    }} catch(ex) {{ console.error(ex); }}
+  }}
+
+  // ── Focus mode ─────────────────────────────────────────────────────────
+  function applyFocus(nodeId) {{
+    if (currentFocusId === nodeId) return;
+    currentFocusId = nodeId;
+
+    var connected = new Set(network.getConnectedNodes(nodeId));
+    connected.add(nodeId);
+
+    var allNodes = network.body.data.nodes.get();
+    var allEdges = network.body.data.edges.get();
+    var nUpdates = [], eUpdates = [];
+
+    allNodes.forEach(function(n) {{
+      var focused = connected.has(n.id);
+      nUpdates.push({{
+        id: n.id,
+        opacity: focused ? 1 : 0.08,
+        font: {{ color: focused ? '#ffffff' : '#ffffff11' }}
+      }});
+    }});
+    allEdges.forEach(function(edge) {{
+      var focused = connected.has(edge.from) && connected.has(edge.to);
+      var baseCol = (edge.color && typeof edge.color === 'object') ? edge.color.color : (edge.color || '#888');
+      eUpdates.push({{
+        id: edge.id,
+        color: focused ? baseCol : {{ color: '#ffffff08', highlight: '#ffffff08', hover: '#ffffff08' }}
+      }});
+    }});
+
+    network.body.data.nodes.update(nUpdates);
+    network.body.data.edges.update(eUpdates);
+
+    var nm = NODE_META[nodeId];
+    focusLabel.textContent = 'Focused: ' + (nm ? nm.title : nodeId);
+    focusBar.classList.add('visible');
+  }}
+
+  function exitFocus() {{
+    if (!currentFocusId) return;
+    currentFocusId = null;
+
+    var allNodes = network.body.data.nodes.get();
+    var allEdges = network.body.data.edges.get();
+    var nUpdates = [], eUpdates = [];
+
+    allNodes.forEach(function(n) {{
+      nUpdates.push({{ id: n.id, opacity: 1, font: {{ color: '#ffffff' }} }});
+    }});
+    allEdges.forEach(function(e) {{
+      // restore original colour by removing override
+      eUpdates.push({{ id: e.id, color: undefined }});
+    }});
+
+    network.body.data.nodes.update(nUpdates);
+    // vis-network doesn't properly un-set color with undefined; reset via edge data
+    // Re-render is enough — colour is from initial options
+    network.setData({{ nodes: network.body.data.nodes, edges: network.body.data.edges }});
+    focusBar.classList.remove('visible');
+    closePanel();
+  }}
+
+  // ── Panel open / close ─────────────────────────────────────────────────
+  function openPanel(headerTitle) {{
+    panelTitle.textContent = headerTitle || 'Detail';
+    panel.classList.add('open');
+    // Shrink graph canvas to leave room for panel
+    var canvas = document.getElementById('mynetwork') || document.querySelector('#mynetwork, .vis-network');
+    if (canvas) canvas.style.width = 'calc(100% - 360px)';
+    try {{ network.redraw(); network.fit(); }} catch(e) {{}}
+  }}
+
+  function closePanel() {{
+    panel.classList.remove('open');
+    var canvas = document.getElementById('mynetwork') || document.querySelector('#mynetwork, .vis-network');
+    if (canvas) canvas.style.width = '100%';
+    try {{ network.redraw(); }} catch(e) {{}}
+    exitFocus();
+  }}
+
+  // ── Wire vis-network events ─────────────────────────────────────────────
+  // PyVis uses a global `network` variable — wait until it's available.
+  function wireEvents() {{
+    if (typeof network === 'undefined') {{
+      setTimeout(wireEvents, 150);
+      return;
+    }}
+    network.on('click', function(params) {{
+      if (params.nodes.length > 0) {{
+        var nodeId = params.nodes[0];
+        applyFocus(nodeId);
+        showNodePanel(nodeId);
+      }} else if (params.edges.length > 0) {{
+        showEdgePanel(params.edges[0]);
+      }} else {{
+        exitFocus();
+        closePanel();
+      }}
+    }});
+    network.on('doubleClick', function(params) {{
+      if (params.nodes.length > 0) {{
+        var nodeId = params.nodes[0];
+        network.focus(nodeId, {{ scale: 1.5, animation: {{ duration: 500, easingFunction: 'easeInOutQuad' }} }});
+      }}
+    }});
+  }}
+  wireEvents();
+}})();
+</script>
+<!-- ═══════════════ END INJECTED PANEL ═══════════════ -->
+"""
+
         html = output_path.read_text(encoding="utf-8")
-        banner = (
-            f'<div style="position:fixed;top:10px;left:50%;transform:translateX(-50%);'
-            f'background:#2d2d44;color:white;padding:8px 20px;border-radius:8px;'
-            f'font-family:sans-serif;font-size:14px;z-index:9999;">'
-            f'{title} — {graph.number_of_nodes()} nodes, '
-            f'{graph.number_of_edges()} edges</div>'
-        )
-        html = html.replace("<body>", f"<body>\n{banner}", 1)
+        html = html.replace("</body>", inject + "</body>", 1)
         output_path.write_text(html, encoding="utf-8")
 
     # ── Index page ────────────────────────────────────────────────────────────
