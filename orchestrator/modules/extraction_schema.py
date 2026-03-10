@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -63,6 +64,103 @@ EDGE_CAPS: dict[str, int] = {
 #         source_anchors, named_tools, setting, result_category,
 #         canonical_keywords, prereq_keywords, downstream_keywords, aliases.
 EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
+
+
+# ── Completeness gate ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class CompletenessVerdict:
+    """
+    Result of ``check_completeness`` for a single :class:`MathObject`.
+
+    status:
+        "accept"  — concept passes all quality gates; create KI page normally.
+        "flag"    — concept has quality concerns; create KI page with ⚠️ callout.
+        "reject"  — concept is too incomplete; skip KI page and Qdrant indexing.
+    reasons:
+        Human-readable explanations for non-accept verdicts.
+    """
+
+    status: Literal["accept", "flag", "reject"]
+    reasons: list = field(default_factory=list)
+
+
+_EMPTY_STATEMENT_VALUES: frozenset[str] = frozenset({"", "none", "n/a"})
+_EMPTY_ASSUMPTIONS_VALUES: frozenset[str] = frozenset({"", "none explicitly stated."})
+
+
+def check_completeness(concept: "MathObject") -> CompletenessVerdict:
+    """
+    Evaluate the quality of a single extracted concept.
+
+    Reject conditions (any → reject):
+    - ``statement_latex`` is empty / "None" / "N/A"
+    - ``len(statement_latex.strip()) < 40``
+    - ``conclusion`` is empty
+    - ``confidence < 0.55``
+
+    Flag conditions (any → flag, evaluated only when not rejected):
+    - ``type in {Theorem, Lemma}`` and ``assumptions`` is empty /
+      "None explicitly stated."
+    - ``confidence < 0.75``
+    - Fewer than 3 ``canonical_keywords``
+    - No ``named_tools`` on a Theorem or Lemma
+
+    Returns a :class:`CompletenessVerdict` with the appropriate status and
+    a list of human-readable reason strings.
+    """
+    reject_reasons: list[str] = []
+
+    stmt = concept.statement_latex.strip()
+    if stmt.lower() in _EMPTY_STATEMENT_VALUES:
+        reject_reasons.append("statement_latex is empty/None/N/A")
+    elif len(stmt) < 40:
+        reject_reasons.append(
+            f"statement_latex is too short ({len(stmt)} chars < 40)"
+        )
+
+    if not concept.conclusion or not concept.conclusion.strip():
+        reject_reasons.append("conclusion is empty")
+
+    if concept.confidence < 0.55:
+        reject_reasons.append(
+            f"confidence {concept.confidence:.2f} is below minimum threshold 0.55"
+        )
+
+    if reject_reasons:
+        return CompletenessVerdict(status="reject", reasons=reject_reasons)
+
+    # ── Flag checks ───────────────────────────────────────────────────────────
+    flag_reasons: list[str] = []
+
+    if concept.type in {"Theorem", "Lemma"}:
+        assumptions = concept.assumptions.strip()
+        if assumptions.lower() in _EMPTY_ASSUMPTIONS_VALUES:
+            flag_reasons.append(
+                f"{concept.type} has no explicit assumptions "
+                "(assumptions is empty or 'None explicitly stated.')"
+            )
+
+    if concept.confidence < 0.75:
+        flag_reasons.append(
+            f"confidence {concept.confidence:.2f} < 0.75"
+        )
+
+    if len(concept.canonical_keywords) < 3:
+        flag_reasons.append(
+            f"only {len(concept.canonical_keywords)} canonical_keywords (< 3 required)"
+        )
+
+    if concept.type in {"Theorem", "Lemma"} and not concept.named_tools:
+        flag_reasons.append(
+            f"{concept.type} has no named_tools"
+        )
+
+    if flag_reasons:
+        return CompletenessVerdict(status="flag", reasons=flag_reasons)
+
+    return CompletenessVerdict(status="accept", reasons=[])
 
 
 # ── Stage 1 sub-models ─────────────────────────────────────────────────────────
@@ -167,6 +265,17 @@ class MathObject(BaseModel):
         default="",
         description="Alternative names for this concept.",
     )
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence_to_float(cls, v: object) -> float:
+        """Cast confidence to float if returned as a string by the LLM."""
+        if isinstance(v, str):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 1.0
+        return v  # type: ignore[return-value]
 
     @field_validator("type")
     @classmethod
@@ -588,3 +697,74 @@ Your task:
 
 {latex_formatting_rules}
 """.strip()
+
+
+# ── Two-pass skeleton models (Layer 3) ────────────────────────────────────────
+
+
+class SkeletonConcept(BaseModel):
+    """
+    Lightweight concept stub produced by Pass 1 of the two-pass extraction.
+
+    Only identification and anchor fields are required; full content is
+    populated in Pass 2.
+    """
+
+    title: str = Field(..., description="Candidate concept title.")
+    type: str = Field(
+        ...,
+        description=(
+            "One of: Definition, Theorem, Lemma, Algorithm, "
+            "Assumption, Proof, ProofTechnique"
+        ),
+    )
+    source_anchors: str = Field(
+        default="",
+        description="Section + theorem/equation number where the concept appears.",
+    )
+    assumption_anchor: Optional[str] = Field(
+        default=None,
+        description=(
+            "Where conditions are defined, e.g. 'Section 2, (H1)-(H4)'. "
+            "Null if no separate assumption block."
+        ),
+    )
+    notation_anchor: Optional[str] = Field(
+        default=None,
+        description="Where key notation is introduced, or null.",
+    )
+    confidence_preliminary: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Preliminary confidence score in [0, 1].",
+    )
+
+    @field_validator("confidence_preliminary", mode="before")
+    @classmethod
+    def coerce_confidence_preliminary(cls, v: object) -> float:
+        """Cast confidence_preliminary to float if returned as a string."""
+        if isinstance(v, str):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 0.5
+        return v  # type: ignore[return-value]
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        if v not in ALLOWED_CONCEPT_TYPES:
+            raise ValueError(
+                f"type must be one of {sorted(ALLOWED_CONCEPT_TYPES)}, got {v!r}"
+            )
+        return v
+
+
+class SkeletonResult(BaseModel):
+    """Top-level result of the Pass 1 skeleton extraction call."""
+
+    concepts: List[SkeletonConcept] = Field(
+        default_factory=list,
+        description="Candidate concepts identified in the paper.",
+    )

@@ -84,11 +84,15 @@ from .extraction_schema import (
     EXTRACTION_VERSION,
     LATEX_FORMATTING_RULES,
     REEXTRACT_SYSTEM_PROMPT,
+    CompletenessVerdict,
     ConceptLinkResult,
     CrossPaperLinkResult,
     EdgeProposal,
     ExtractionResult,
     MathObject,
+    SkeletonConcept,
+    SkeletonResult,
+    check_completeness,
     latex_sanity_check,
     validate_extraction,
     validate_link_result,
@@ -165,6 +169,23 @@ MAX_REPAIR_ERRORS = 5
 TOKEN_THRESHOLD_CHUNK = 30_000   # above this: section-by-section extraction
 TOKEN_THRESHOLD_WARN  = 60_000   # above this: log warning, still chunk
 
+# -- Two-pass extraction feature flag (Layer 3) --------------------------------
+ENABLE_TWO_PASS_EXTRACTION: bool = os.environ.get(
+    "ENABLE_TWO_PASS_EXTRACTION", "false"
+).lower() in ("1", "true", "yes")
+
+# Minimum token count to consider two-pass (all three criteria must be met).
+_TWO_PASS_MIN_TOKENS: int = 15_000
+# LaTeX command density threshold (commands per 1k characters).
+_TWO_PASS_LATEX_DENSITY: float = 8.0
+# Named shorthand pattern (H1), (A2), (C3).
+_TWO_PASS_SHORTHAND_RE = re.compile(r'\(H\d+\)|\(A\d+\)|\(C\d+\)')
+# Preliminary confidence threshold for Pass 2.
+_TWO_PASS_MIN_CONFIDENCE: float = 0.60
+# Token budget for each targeted context block in Pass 2.
+_PASS2_BLOCK_TOKENS: int = 400
+_PASS2_MAX_CONTEXT_TOKENS: int = 4_000
+
 # -- Sections to skip during chunked extraction --------------------------------
 _SKIP_SECTION_KEYWORDS = (
     "proof of", "proofs of", "deferred", "technical lemma",
@@ -192,6 +213,28 @@ def _count_tokens(text: str) -> int:
         return len(enc.encode(text))
     except Exception:
         return len(text) // 4
+
+
+def is_dense_paper(markdown: str, token_count: int) -> bool:
+    """
+    Return True iff the paper is considered "dense" for two-pass extraction.
+
+    All three criteria must hold:
+    - ``token_count >= 15_000``
+    - LaTeX command density > 8.0 per 1k characters
+    - At least one named shorthand like (H1), (A2), or (C3) is present
+    """
+    if token_count < _TWO_PASS_MIN_TOKENS:
+        return False
+    char_count = len(markdown)
+    if char_count == 0:
+        return False
+    latex_density = len(re.findall(r'\\[a-zA-Z]+', markdown)) / (char_count / 1000)
+    if latex_density <= _TWO_PASS_LATEX_DENSITY:
+        return False
+    if not _TWO_PASS_SHORTHAND_RE.search(markdown):
+        return False
+    return True
 
 
 # -- Cross-paper edge scoring dataclasses --------------------------------------
@@ -713,6 +756,42 @@ Return confidence ∈ [0,1]:
 - 0.6-0.8: mostly clear but minor reconstruction
 - 0.0-0.5: extraction uncertain / noisy
 
+SELF-VALIDATION PASS (MANDATORY — run before returning JSON)
+════════════════════════════════════════════════════════════
+
+CHECK 1 — Expand assumption shorthands
+  Scan `assumptions` for (H1), (A2), (C3), "Assumption 4.1" etc.
+  If found: locate the definition in the paper text and expand inline.
+  If you cannot locate it: write "Condition (HN) not reconstructed — see [section]."
+  Never leave a bare shorthand as the sole content of the field.
+
+CHECK 2 — Symbol completeness
+  Every symbol in `statement_latex` must appear in `variables`.
+  If a symbol's meaning is unclear from the visible text: add it to `variables`
+  with "(meaning inferred)" and reduce `confidence` by 0.15.
+
+CHECK 3 — Assumptions on Theorems/Lemmas
+  If type is Theorem or Lemma and assumptions is empty or "None explicitly stated.":
+  re-examine the paper for (a) a numbered hypothesis block, (b) a "suppose that..."
+  clause, (c) a standing assumptions section. If genuinely none exist, write:
+  "No conditions found after search — verify manually."
+
+CHECK 4 — conclusion must be plain English
+  If `conclusion` contains display math or mirrors the LaTeX structure of
+  `statement_latex`: rewrite it. Answer: "What does this result give you and
+  why is it useful?" No display math. Inline $...$ for variable names only.
+
+CHECK 5 — Confidence calibration
+  Set confidence ≤ 0.65 if: statement was reconstructed from prose, shorthands
+  were not fully expanded, or symbols could not be resolved.
+  Set confidence = 0.9–1.0 only if: statement is directly copied from a displayed
+  equation, all assumptions are explicit, all symbols are defined in visible text.
+
+CHECK 6 — Drop weak concepts
+  Drop any concept where confidence after Check 5 is below 0.55, or whose only
+  purpose is to support one other concept in this paper.
+  Return 3 clean concepts rather than 8 partial ones.
+
 OUTPUT FORMAT (STRICT)
 Return ONLY valid JSON matching this schema exactly (no extra keys):
 {
@@ -1081,9 +1160,26 @@ class IngestionEngine:
                 len(concepts),
             )
             ki_pages: list[tuple[MathObject, str]] = []
+            rejected_concepts: list[dict] = []
             for concept in concepts:
+                verdict = check_completeness(concept)
+                if verdict.status == "reject":
+                    logger.info(
+                        "[%s] Concept '%s' rejected by completeness gate: %s",
+                        run_id, concept.title, verdict.reasons,
+                    )
+                    rejected_concepts.append({
+                        "title": concept.title,
+                        "type": concept.type,
+                        "confidence": concept.confidence,
+                        "reasons": verdict.reasons,
+                    })
+                    continue
+                flag_reasons = verdict.reasons if verdict.status == "flag" else None
                 try:
-                    ki_page_id = self._create_knowledge_item(page_id, concept, hubs)
+                    ki_page_id = self._create_knowledge_item(
+                        page_id, concept, hubs, flag_reasons=flag_reasons
+                    )
                     ki_pages.append((concept, ki_page_id))
                     # Module 7: index in Qdrant immediately after KI creation.
                     if self._vector_index and self._vector_index.available:
@@ -1102,8 +1198,55 @@ class IngestionEngine:
                         run_id,
                         concept.title,
                     )
+
+            # Write rejected concepts to Paper Tracker page.
+            if rejected_concepts:
+                try:
+                    rejected_json = json.dumps(rejected_concepts, ensure_ascii=False)
+                    self.notion.update_page(
+                        page_id=page_id,
+                        properties={
+                            "Rejected Concepts": {
+                                "rich_text": self.notion.rich_text(
+                                    rejected_json[:2000]
+                                )
+                            }
+                        },
+                    )
+                    logger.info(
+                        "[%s] Wrote %d rejected concept(s) to Paper Tracker.",
+                        run_id, len(rejected_concepts),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] Could not write Rejected Concepts to Paper Tracker.",
+                        run_id,
+                        exc_info=True,
+                    )
+
             logger.info("[%s] Created %d Knowledge Inbox page(s).", run_id, len(ki_pages))
             self._ledger.update_status(job_id, "extract_done")
+
+            # REQ-4 (extended): If completeness gate rejected ALL concepts, block paper.
+            if len(ki_pages) == 0:
+                self.notion.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Status": self.notion.status_prop("blocked-extraction"),
+                        "Extraction Error": {"rich_text": self.notion.rich_text(
+                            "All extracted concepts were rejected by the completeness "
+                            "gate. Check markdown quality or add Re-extract Hints and "
+                            "set status back to s1-skim."
+                        )},
+                        "Extraction Count": {"number": 0},
+                    },
+                )
+                logger.warning(
+                    "Ingestion: all concepts rejected by completeness gate for paper %s — "
+                    "set to blocked-extraction.",
+                    page_id,
+                )
+                return
 
             # Inject newly created concepts into sb_index so Stage 2/3 can link to them.
             self._inject_ki_pages_into_index(ki_pages, sb_index)
@@ -1554,21 +1697,31 @@ class IngestionEngine:
         run_id: str,
     ) -> ExtractionResult:
         """
-        Dispatch to single-shot or section-by-section extraction depending on
-        token count vs TOKEN_THRESHOLD_CHUNK.
+        Dispatch to single-shot, two-pass, or section-by-section extraction.
+
+        Precedence (highest first):
+          token_count > TOKEN_THRESHOLD_CHUNK  → chunked path (unchanged)
+          ENABLE_TWO_PASS_EXTRACTION and is_dense_paper  → two-pass path
+          else  → single-shot path
         """
         if token_count > TOKEN_THRESHOLD_WARN:
             logger.warning(
                 "[%s] Paper is very long (%d tokens) — may risk output truncation.",
                 run_id, token_count,
             )
-        if token_count <= TOKEN_THRESHOLD_CHUNK:
-            return self._extract_and_validate(markdown, hubs, run_id)
-        logger.info(
-            "[%s] Paper exceeds %d tokens — using section-by-section extraction.",
-            run_id, TOKEN_THRESHOLD_CHUNK,
-        )
-        return self._chunked_extract(markdown, hubs, run_id, token_count)
+        if token_count > TOKEN_THRESHOLD_CHUNK:
+            logger.info(
+                "[%s] Paper exceeds %d tokens — using section-by-section extraction.",
+                run_id, TOKEN_THRESHOLD_CHUNK,
+            )
+            return self._chunked_extract(markdown, hubs, run_id, token_count)
+        if ENABLE_TWO_PASS_EXTRACTION and is_dense_paper(markdown, token_count):
+            logger.info(
+                "[%s] Dense paper detected (%d tokens) — using two-pass extraction.",
+                run_id, token_count,
+            )
+            return self._two_pass_extract(markdown, hubs, run_id, token_count)
+        return self._extract_and_validate(markdown, hubs, run_id)
 
     def _extract_preamble(self, markdown: str, max_tokens: int = 3000) -> str:
         """
@@ -1700,7 +1853,217 @@ class IngestionEngine:
             active_themes=merged_themes,
             extracted_concepts=all_concepts,
         )
-    
+
+    # -- Two-pass extraction (Layer 3) -----------------------------------------
+
+    # System prompt for Pass 1 skeleton call.
+    _SKELETON_SYSTEM_PROMPT: str = (
+        "Scan this paper and identify candidate concepts for extraction.\n"
+        "For each return ONLY:\n"
+        "  - title, type, source_anchors (section + theorem/eq number),\n"
+        "    assumption_anchor (where conditions are defined, e.g. "
+        "\"Section 2, (H1)-(H4)\"),\n"
+        "    notation_anchor (where key notation is introduced, or null),\n"
+        "    confidence_preliminary [0-1]\n"
+        "Apply the same granularity rules as full extraction.\n"
+        "Be conservative with confidence_preliminary.\n"
+        "Return a JSON object with a single key 'concepts' containing a JSON array. "
+        "No other text."
+    )
+
+    def _two_pass_extract(
+        self,
+        markdown: str,
+        hubs: dict[str, str],
+        run_id: str,
+        token_count: int,
+    ) -> ExtractionResult:
+        """
+        Two-pass extraction for dense papers (Layer 3).
+
+        Pass 1: lightweight skeleton call to identify candidates.
+        Pass 2: targeted deep extraction per candidate with focused context.
+        Falls back to single-shot if Pass 1 fails or returns nothing.
+        """
+        logger.info("[%s] Two-pass: starting Pass 1 skeleton call.", run_id)
+        skeleton = self._pass1_skeleton(markdown, run_id)
+
+        if not skeleton:
+            logger.warning(
+                "[%s] Two-pass: Pass 1 returned no candidates — "
+                "falling back to single-shot extraction.",
+                run_id,
+            )
+            return self._extract_and_validate(markdown, hubs, run_id)
+
+        high_conf = [
+            s for s in skeleton
+            if s.confidence_preliminary >= _TWO_PASS_MIN_CONFIDENCE
+        ]
+        logger.info(
+            "[%s] Two-pass: %d skeleton candidate(s), %d above threshold.",
+            run_id, len(skeleton), len(high_conf),
+        )
+
+        all_concepts: list[MathObject] = []
+        seen_titles: set[str] = set()
+        merged_one_liner: str = ""
+        merged_themes: list[str] = []
+
+        for skel in high_conf:
+            logger.info(
+                "[%s] Two-pass Pass 2: extracting '%s' (preliminary conf=%.2f).",
+                run_id, skel.title, skel.confidence_preliminary,
+            )
+            context = self._build_targeted_context(markdown, skel)
+            preamble = (
+                f"Extract ONE concept. "
+                f"Title hint: {skel.title}. "
+                f"Location: {skel.source_anchors}. "
+                "Return a single-element extracted_concepts array or [] if not extractable."
+            )
+            try:
+                result = self._extract_and_validate(
+                    f"{preamble}\n\n{context}", hubs, run_id
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] Two-pass Pass 2: extraction failed for '%s' — skipping.",
+                    run_id, skel.title,
+                )
+                continue
+
+            if not merged_one_liner and result.one_liner:
+                merged_one_liner = result.one_liner
+            for theme in result.active_themes:
+                if theme not in merged_themes:
+                    merged_themes.append(theme)
+
+            for concept in result.extracted_concepts:
+                norm = self._normalize_concept_title(concept.title)
+                if norm and norm not in seen_titles:
+                    seen_titles.add(norm)
+                    all_concepts.append(concept)
+                else:
+                    logger.debug(
+                        "[%s] Two-pass: dedup — skipping duplicate '%s'.",
+                        run_id, concept.title,
+                    )
+
+        logger.info(
+            "[%s] Two-pass complete: %d unique concept(s).",
+            run_id, len(all_concepts),
+        )
+
+        if not all_concepts:
+            logger.warning(
+                "[%s] Two-pass returned no concepts — falling back to single-shot.",
+                run_id,
+            )
+            return self._extract_and_validate(markdown, hubs, run_id)
+
+        return ExtractionResult(
+            one_liner=merged_one_liner,
+            active_themes=merged_themes,
+            extracted_concepts=all_concepts,
+        )
+
+    def _pass1_skeleton(
+        self, markdown: str, run_id: str
+    ) -> list[SkeletonConcept]:
+        """
+        Pass 1: lightweight call to identify candidate concept locations.
+
+        Returns a list of :class:`SkeletonConcept` items, or an empty list
+        on failure.
+        """
+        try:
+            result = self.claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1000,
+                system=self._SKELETON_SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Identify candidate concepts in the following paper.\n\n"
+                            f"PAPER MARKDOWN:\n\n{markdown[:100_000]}"
+                        ),
+                    }
+                ],
+                response_model=SkeletonResult,
+            )
+            return result.concepts
+        except Exception:
+            logger.warning(
+                "[%s] Two-pass Pass 1: skeleton call failed.",
+                run_id,
+                exc_info=True,
+            )
+            return []
+
+    def _build_targeted_context(
+        self, markdown: str, skeleton: SkeletonConcept
+    ) -> str:
+        """
+        Build a focused context string for Pass 2 by slicing three blocks:
+
+        1. Statement block (±_PASS2_BLOCK_TOKENS around source_anchors).
+        2. Assumption block (around assumption_anchor, if set).
+        3. Notation block (around notation_anchor, if set).
+
+        Total is capped at _PASS2_MAX_CONTEXT_TOKENS tokens.
+        Priority: statement > assumptions > notation.
+        """
+        blocks: list[str] = []
+
+        def _slice_around(anchor: str | None, token_budget: int) -> str:
+            """
+            Return a slice of *markdown* near *anchor*, capped at token_budget.
+            Falls back to an empty string if anchor is None or not found.
+            """
+            if not anchor:
+                return ""
+            # Try to find anchor text in markdown (case-insensitive substring).
+            idx = markdown.lower().find(anchor.lower()[:60])
+            if idx < 0:
+                # Anchor not literally present; return empty.
+                return ""
+            # Estimate character budget from token budget (4 chars / token).
+            char_budget = token_budget * 4
+            half = char_budget // 2
+            start = max(0, idx - half)
+            end = min(len(markdown), idx + half)
+            return markdown[start:end]
+
+        # Priority order: statement > assumptions > notation.
+        stmt_block = _slice_around(
+            skeleton.source_anchors or None, _PASS2_BLOCK_TOKENS
+        )
+        if stmt_block:
+            blocks.append(stmt_block)
+
+        remaining_budget = _PASS2_MAX_CONTEXT_TOKENS - _count_tokens(
+            "\n\n".join(blocks)
+        )
+        if remaining_budget > 0 and skeleton.assumption_anchor:
+            assume_block = _slice_around(skeleton.assumption_anchor, remaining_budget)
+            if assume_block:
+                blocks.append(assume_block)
+
+        remaining_budget = _PASS2_MAX_CONTEXT_TOKENS - _count_tokens(
+            "\n\n".join(blocks)
+        )
+        if remaining_budget > 0 and skeleton.notation_anchor:
+            notation_block = _slice_around(skeleton.notation_anchor, remaining_budget)
+            if notation_block:
+                blocks.append(notation_block)
+
+        context = "\n\n".join(blocks)
+        # Final hard cap.
+        while _count_tokens(context) > _PASS2_MAX_CONTEXT_TOKENS and "\n" in context:
+            context = context[: context.rfind("\n")]
+        return context.strip() or markdown[:_PASS2_MAX_CONTEXT_TOKENS * 4]
 
     def _ensure_koofr_markdown_dir(self) -> None:
         """Create the markdown cache directory on Koofr if it does not exist."""
@@ -1931,6 +2294,7 @@ class IngestionEngine:
         paper_page_id: str,
         concept: MathObject,
         hubs: dict[str, str],
+        flag_reasons: list[str] | None = None,
     ) -> str:
         """
         Materialise a single MathObject as a Knowledge Inbox Notion page.
@@ -1938,6 +2302,9 @@ class IngestionEngine:
         Sets graph_link_status = "unlinked" at creation.
         Stage 3 (_update_knowledge_item_graph_data) later writes edges and
         promotes to "linked-ai".
+
+        If ``flag_reasons`` is provided the page body will be prefixed with
+        a ⚠️ yellow callout listing the quality concerns.
 
         Returns the Notion page ID of the created page.
         """
@@ -2027,6 +2394,24 @@ class IngestionEngine:
         )
 
         body_blocks: list[dict] = []
+        # Prepend ⚠️ callout for flagged concepts above the review checklist.
+        if flag_reasons:
+            reasons_text = "\n".join(f"• {r}" for r in flag_reasons)
+            callout_text = (
+                f"⚠️ Quality concerns detected:\n{reasons_text}\n\n"
+                "If fields are missing, add to Re-extract Hints and set s2-reextract."
+            )
+            body_blocks.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": callout_text[:2000]}}
+                    ],
+                    "icon": {"type": "emoji", "emoji": "⚠️"},
+                    "color": "yellow_background",
+                },
+            })
         # REQ-8: Prepend review checklist so human sees guided review flow first.
         body_blocks.extend(self._review_checklist_blocks())
         body_blocks.append(self._heading_block("Assumptions"))
@@ -2803,8 +3188,18 @@ class IngestionEngine:
         # Create KI pages for new concepts.
         ki_pages: list[tuple[MathObject, str]] = []
         for concept in new_concepts:
+            verdict = check_completeness(concept)
+            if verdict.status == "reject":
+                logger.info(
+                    "[%s] Re-extraction: concept '%s' rejected by completeness gate: %s",
+                    run_id, concept.title, verdict.reasons,
+                )
+                continue
+            flag_reasons = verdict.reasons if verdict.status == "flag" else None
             try:
-                ki_page_id = self._create_knowledge_item(page_id, concept, hubs)
+                ki_page_id = self._create_knowledge_item(
+                    page_id, concept, hubs, flag_reasons=flag_reasons
+                )
                 ki_pages.append((concept, ki_page_id))
                 if self._vector_index and self._vector_index.available:
                     try:
