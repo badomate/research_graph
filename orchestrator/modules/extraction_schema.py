@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -467,6 +467,95 @@ LATEX FORMATTING RULES (STRICTLY ENFORCED — violations break rendering)
    proof_idea:
      Inline $...$ freely. No display math blocks.
 """.strip()
+
+
+# ── Cross-paper edge proposal models (Stage 3 v2) ─────────────────────────────
+
+
+class EdgeProposal(BaseModel):
+    """
+    A single cross-paper edge proposal produced by the Stage 3 linking prompt.
+
+    ``pre_filter_signal`` and ``needs_review`` are populated by the pipeline
+    after the LLM call — not by the model itself.
+    """
+
+    source_concept_title: str = Field(
+        ...,
+        description="Title of the source concept (C_A) being extracted.",
+    )
+    target_concept_title: str = Field(
+        ...,
+        description="Title of the target concept (C_B) from the knowledge base.",
+    )
+    target_notion_page_id: str = Field(
+        ...,
+        description="Notion page ID of the target concept.",
+    )
+    relation_type: Literal[
+        "depends_on", "enables", "generalizes", "special_case_of", "related"
+    ] = Field(..., description="Directed relation type from source to target.")
+    direction: Literal["A_to_B", "B_to_A"] = Field(
+        ...,
+        description=(
+            "A_to_B: edge goes FROM C_A TO C_B. "
+            "B_to_A: edge goes FROM C_B TO C_A."
+        ),
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in [0, 1].",
+    )
+    justification: str = Field(
+        ...,
+        description=(
+            "One sentence referencing specific field content (not just titles)."
+        ),
+    )
+    driving_fields: List[
+        Literal[
+            "named_tools",
+            "assumptions",
+            "conclusion",
+            "setting",
+            "keywords",
+            "statement_latex",
+        ]
+    ] = Field(
+        default_factory=list,
+        description=(
+            "Fields from either concept that drove the relation decision. "
+            "Must contain at least one entry."
+        ),
+    )
+    # Populated by pipeline after the LLM call.
+    pre_filter_signal: Optional[str] = Field(
+        default=None,
+        description=(
+            "Dominant pre-filter signal: 'named_tool_match', "
+            "'assumption_conclusion_overlap', 'setting_containment', "
+            "'keyword_jaccard', or 'none'."
+        ),
+    )
+    needs_review: bool = Field(
+        default=False,
+        description="True = written to Edges DB with review flag set.",
+    )
+
+
+class CrossPaperLinkResult(BaseModel):
+    """
+    All edge proposals produced for a single concept during Stage 3.
+
+    ``proposals`` contains edges with confidence >= EDGE_REVIEW_FLAG_CONFIDENCE
+    (written to Edges DB).  ``low_confidence_suggestions`` holds edges below
+    that threshold (rendered on KI page as informational hints only).
+    """
+
+    proposals: List[EdgeProposal] = Field(default_factory=list)
+    low_confidence_suggestions: List[EdgeProposal] = Field(default_factory=list)
 
 
 # ── Re-extraction system prompt ────────────────────────────────────────────────
