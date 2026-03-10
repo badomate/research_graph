@@ -102,6 +102,7 @@ _EDGE_COLOURS: dict[str, str] = {
 # Shared PyVis physics options.
 _PHYSICS_OPTIONS = """{
   "physics": {
+    "enabled": true,
     "barnesHut": {
       "gravitationalConstant": -35000,
       "centralGravity": 0.04,
@@ -110,8 +111,14 @@ _PHYSICS_OPTIONS = """{
       "damping": 0.14,
       "avoidOverlap": 0.6
     },
-    "minVelocity": 0.3,
-    "stabilization": { "iterations": 350 }
+    "minVelocity": 0.75,
+    "stabilization": {
+      "enabled": true,
+      "iterations": 350,
+      "updateInterval": 25,
+      "onlyDynamicEdges": false,
+      "fit": true
+    }
   },
   "interaction": {
     "hover": true,
@@ -1234,7 +1241,9 @@ class DependencyGrapher:
     panel.classList.remove('open');
     exitFocus();
   }}
-
+  network.once("stabilized", function() {{
+    network.setOptions({{physics: {{ enabled: false }} }});
+  }});
   // ── Wire vis-network events ─────────────────────────────────────────────
   // PyVis uses a global `network` variable — wait until it's available.
   var EDGE_ORIG_COLORS = {{}};
@@ -1305,6 +1314,8 @@ class DependencyGrapher:
   }}
   wireEvents();
 }})();
+
+
 </script>
 <!-- ═══════════════ END INJECTED PANEL ═══════════════ -->
 """

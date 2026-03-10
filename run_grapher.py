@@ -25,7 +25,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # ── Make `orchestrator/` importable ──────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent / "orchestrator"))
 
-from modules.dependency_grapher import DependencyGrapher  # noqa: E402
+from orchestrator.modules.dependency_grapher import DependencyGrapher  # noqa: E402
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Generate knowledge-graph HTML locally.")

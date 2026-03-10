@@ -15,11 +15,11 @@ from pathlib import Path
 # ── Load .env before any module import ───────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
-
+from orchestrator.modules.vector_index import VectorIndexEngine
 # ── Make `orchestrator/` importable ──────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent / "orchestrator"))
 
-from modules.promotion import PromotionEngine  # noqa: E402
+from orchestrator.modules.promotion import PromotionEngine  # noqa: E402
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -27,6 +27,6 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-
+index = VectorIndexEngine()
 # ── Run (no Qdrant — pass None for vector_index) ──────────────────────────────
-PromotionEngine(vector_index=None).run()
+PromotionEngine(vector_index=index).run()

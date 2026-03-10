@@ -53,19 +53,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-
+from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ── Environment-driven defaults ───────────────────────────────────────────────
 
-_QDRANT_URL: str = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+_QDRANT_URL: str = os.environ.get("QDRANT_URL", "http://localhost:6333")
 _EMBEDDING_BACKEND: str = os.environ.get("VECTOR_EMBEDDING_BACKEND", "openai").lower()
 _EMBEDDING_MODEL: str = os.environ.get(
     "VECTOR_EMBEDDING_MODEL", "text-embedding-3-small"
 )
-_EMBEDDING_DIM: int = int(os.environ.get("VECTOR_EMBEDDING_DIM", "1536"))
+_EMBEDDING_DIM: int = int(os.environ.get("VECTOR_EMBEDDING_DIM", "768"))
 _SB_CONCEPT_LEVEL: str = os.environ.get("SB_CONCEPT_LEVEL", "Concept")
 
 # Retrieval cap applied after deduplication.
@@ -1341,12 +1343,10 @@ def _cli_rebuild() -> None:
         sys.exit(0)
 
     # Load .env if present (useful when running outside Docker).
-    try:
-        from dotenv import load_dotenv
+    from dotenv import load_dotenv
 
-        load_dotenv()
-    except ImportError:
-        pass
+    load_dotenv()
+
 
     engine = VectorIndexEngine()
 
