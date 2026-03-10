@@ -16,13 +16,13 @@ import json
 import logging
 import os
 
-import openai
+import anthropic
 
 from .notion_client_wrapper import NotionClientWrapper
 
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL = "gpt-4o"
+CLAUDE_FAST_MODEL = os.environ.get("CLAUDE_FAST_MODEL", "claude-haiku-3-5")
 
 # ── Conflict detection prompt ─────────────────────────────────────────────────
 CONFLICT_SYSTEM_PROMPT = """You are a rigorous mathematical consistency checker for a PhD researcher in applied mathematics.
@@ -49,7 +49,7 @@ class ConflictDetector:
 
     def __init__(self) -> None:
         self.notion = NotionClientWrapper()
-        self.openai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self.claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.knowledge_inbox_db = os.environ["NOTION_KNOWLEDGE_INBOX_DB_ID"]
         self.second_brain_db = os.environ["NOTION_SECOND_BRAIN_DB_ID"]
 
@@ -147,15 +147,15 @@ class ConflictDetector:
             f"NEW ITEM:\n[{new_label}]\n{new_content}\n\n"
             f"EXISTING ITEMS:\n{existing_text}"
         )
-        response = self.openai.chat.completions.create(
-            model=OPENAI_MODEL,
+        response = self.claude.messages.create(
+            model=CLAUDE_FAST_MODEL,
             max_tokens=1024,
+            system=CONFLICT_SYSTEM_PROMPT,
             messages=[
-                {"role": "system", "content": CONFLICT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
         )
-        raw = response.choices[0].message.content.strip()
+        raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):

@@ -21,13 +21,13 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree
 
-import openai
+import anthropic
 
 from .notion_client_wrapper import NotionClientWrapper
 
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL = "gpt-4o"
+CLAUDE_FAST_MODEL = os.environ.get("CLAUDE_FAST_MODEL", "claude-sonnet-4-6")
 
 # ── Relevance scoring prompt ──────────────────────────────────────────────────
 RELEVANCE_SYSTEM_PROMPT = """You are a research relevance scorer for a PhD student specialising in Mean Field Games, McKean-Vlasov stochastic control, Hamilton-Jacobi-Bellman PDEs, and related applied mathematics.
@@ -56,7 +56,7 @@ class ArXivSniper:
 
     def __init__(self) -> None:
         self.notion = NotionClientWrapper()
-        self.openai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self.claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.paper_tracker_db = os.environ["NOTION_PAPER_TRACKER_DB_ID"]
 
         raw_keywords = os.environ.get(
@@ -169,19 +169,19 @@ class ArXivSniper:
     # ── OpenAI scoring ────────────────────────────────────────────────────────
 
     def _score_relevance(self, title: str, abstract: str) -> tuple[int, str]:
-        """Ask ChatGPT to score relevance; return (score, justification)."""
-        response = self.openai.chat.completions.create(
-            model=OPENAI_MODEL,
+        """Ask Claude to score relevance; return (score, justification)."""
+        response = self.claude.messages.create(
+            model=CLAUDE_FAST_MODEL,
             max_tokens=256,
+            system=RELEVANCE_SYSTEM_PROMPT,
             messages=[
-                {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"Title: {title}\n\nAbstract: {abstract}",
                 },
             ],
         )
-        raw = response.choices[0].message.content.strip()
+        raw = response.content[0].text.strip()
 
         # Strip accidental markdown fences
         if raw.startswith("```"):

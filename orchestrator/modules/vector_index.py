@@ -250,6 +250,10 @@ class VectorIndexEngine:
         self._backend: str = _EMBEDDING_BACKEND
         self._openai_client: Any = None
         self._local_model: Any = None
+        # Notion client (lazily initialised on first rebuild() call).
+        self._notion: Any = None
+        self._sb_db: str = os.environ.get("NOTION_SECOND_BRAIN_DB_ID", "")
+        self._ki_db: str = os.environ.get("NOTION_KNOWLEDGE_INBOX_DB_ID", "")
 
         # ── Connect to Qdrant ─────────────────────────────────────────────────
         try:
@@ -672,24 +676,32 @@ class VectorIndexEngine:
 
     # ── Private: collection management ───────────────────────────────────────
 
-    def _ensure_collections(self) -> None:
-        """Create collections if they don't exist. Called in __init__."""
+    def _ensure_collections(self, force_recreate: bool = False) -> None:
+        """
+        Create collections if they don't exist.
+
+        When ``force_recreate=True``, each existing collection is deleted before
+        recreation — providing an atomic clean slate for rebuild operations.
+        Called with ``force_recreate=False`` in ``__init__``.
+        """
         from qdrant_client.models import Distance, VectorParams
 
-        existing = {c.name for c in self._client.get_collections().collections}
-        for name in self.COLLECTIONS:
-            if name not in existing:
+        for name, size in zip(self.COLLECTIONS, self._embedding_dims()):
+            exists = self._client.collection_exists(name)
+            if exists and force_recreate:
+                self._client.delete_collection(name)
+                logger.info(
+                    "VectorIndexEngine: dropped collection '%s' for force_recreate.", name
+                )
+                exists = False
+            if not exists:
                 self._client.create_collection(
                     collection_name=name,
-                    vectors_config=VectorParams(
-                        size=self._vector_dim,
-                        distance=Distance.COSINE,
-                    ),
+                    vectors_config=VectorParams(size=size, distance=Distance.COSINE),
                 )
+                self._create_payload_indexes(name)
                 logger.info(
-                    "VectorIndexEngine: created collection '%s' (dim=%d).",
-                    name,
-                    self._vector_dim,
+                    "VectorIndexEngine: created collection '%s' (dim=%d).", name, size
                 )
             else:
                 logger.debug(
@@ -705,6 +717,39 @@ class VectorIndexEngine:
             except Exception:
                 logger.debug(
                     "VectorIndexEngine: could not drop '%s' (may not exist).", name
+                )
+
+    def _embedding_dims(self) -> list[int]:
+        """Return the embedding dimension for each collection (same for all three)."""
+        return [self._vector_dim] * len(self.COLLECTIONS)
+
+    def _create_payload_indexes(self, collection_name: str) -> None:
+        """
+        Create keyword payload indexes on the collection to accelerate
+        filtered queries (``suggested_hub``, ``concept_type``, ``setting``,
+        ``verified``).
+
+        Failures are logged at DEBUG level and silently skipped — indexes are
+        optional for correctness.
+        """
+        try:
+            from qdrant_client.models import PayloadSchemaType
+        except ImportError:
+            return
+
+        for field_name in ("suggested_hub", "concept_type", "setting", "verified"):
+            try:
+                self._client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                logger.debug(
+                    "VectorIndexEngine: payload index '%s' on '%s' skipped "
+                    "(may already exist or be unsupported).",
+                    field_name,
+                    collection_name,
                 )
 
     def _safe_upsert(self, collection_name: str, points: list[Any]) -> None:
@@ -1010,27 +1055,24 @@ class VectorIndexEngine:
         seed = f"{notion_page_id}:{role}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
-    # ── Private: SB page → pseudo-MathObject for rebuild ─────────────────────
+    # ── Private: SB/KI page → MathObject for rebuild ─────────────────────────
 
     @staticmethod
-    def _math_object_from_sb_page(page: dict) -> Any | None:
+    def _math_object_from_page(props: dict) -> Any | None:
         """
-        Extract available fields from an SB Concept page and return a
-        lightweight object suitable for embedding via the _build_*_text methods.
+        Reconstruct a MathObject from a Notion page properties dict.
 
-        Returns None if the page has no usable title.
+        Reads: Name (title), Type, Assumptions, Statement LaTeX, Keywords,
+        Setting, Named Tools, Conclusion, Interpretation, Suggested Hub,
+        Prereq Keywords, Downstream Keywords.
+
+        Returns None and logs a warning when the title is empty.
+        Logs DEBUG warnings for empty Assumptions or Statement LaTeX so that
+        degraded embeddings are visible in logs without crashing the rebuild.
+
+        Must not import from ingestion.py — uses MathObject from
+        extraction_schema.py only.
         """
-        props = page.get("properties", {})
-
-        def _title() -> str:
-            for v in props.values():
-                if v.get("type") == "title":
-                    try:
-                        return v["title"][0]["plain_text"]
-                    except (KeyError, IndexError):
-                        return ""
-            return ""
-
         def _text(key: str) -> str:
             try:
                 segs = props[key]["rich_text"]
@@ -1050,39 +1092,234 @@ class VectorIndexEngine:
             except (KeyError, TypeError):
                 return []
 
-        title = _title()
+        # Title comes from the Notion title-type property named "Name".
+        try:
+            title = props["Name"]["title"][0]["plain_text"] or ""
+        except (KeyError, IndexError, TypeError):
+            title = ""
+
         if not title:
+            logger.warning(
+                "VectorIndexEngine._math_object_from_page: page has empty title — skipping."
+            )
             return None
 
-        # Strip [Type] prefix if present.
-        title_clean = re.sub(r"^\[[^\]]+\]\s*", "", title)
+        # Strip [Type] prefix if present (e.g. "[Theorem] Foo" → "Foo").
+        title = re.sub(r"^\[[^\]]+\]\s*", "", title)
 
-        # Build a simple namespace object — no Pydantic overhead needed here.
-        class _SBConcept:
+        assumptions = _text("Assumptions")
+        statement_latex = _text("Statement LaTeX")
+
+        if not assumptions:
+            logger.debug(
+                "VectorIndexEngine._math_object_from_page: 'Assumptions' empty for '%s' — "
+                "degraded concept_assumptions embedding.",
+                title,
+            )
+        if not statement_latex:
+            logger.debug(
+                "VectorIndexEngine._math_object_from_page: 'Statement LaTeX' empty for '%s' — "
+                "degraded concept_conclusions embedding.",
+                title,
+            )
+
+        concept_type = _select("Type") or _select("Concept Type") or "Definition"
+
+        # Import MathObject locally to avoid any top-level circular-import risk.
+        try:
+            from .extraction_schema import ALLOWED_CONCEPT_TYPES, MathObject
+        except ImportError:
+            from extraction_schema import ALLOWED_CONCEPT_TYPES, MathObject  # type: ignore[no-redef]
+
+        if concept_type not in ALLOWED_CONCEPT_TYPES:
+            concept_type = "Definition"
+
+        # Use model_construct() to bypass Pydantic validators — Notion data may
+        # not satisfy all field constraints (e.g. confidence, source_pages).
+        return MathObject.model_construct(
+            type=concept_type,
+            title=title,
+            statement_latex=statement_latex,
+            assumptions=assumptions,
+            variables="",
+            conclusion=_text("Conclusion") or _text("Interpretation"),
+            interpretation=_text("Interpretation"),
+            proof_idea=_text("Proof Idea"),
+            canonical_keywords=_multi("Keywords"),
+            prereq_keywords=_multi("Prereq Keywords"),
+            downstream_keywords=_multi("Downstream Keywords"),
+            named_tools=_multi("Named Tools"),
+            suggested_hub=_select("Suggested Hub") or _text("Suggested Hub"),
+            setting=_multi("Setting"),
+            result_category="",
+            aliases="",
+            source_pages=[],
+            source_quotes=None,
+            confidence=1.0,
+        )
+
+    @staticmethod
+    def _math_object_from_sb_page(page: dict) -> Any | None:
+        """
+        Reconstruct a MathObject from a Second Brain Concept page dict.
+
+        Returns None if the page has no usable title.
+        Delegates all field reading to _math_object_from_page.
+        """
+        props = page.get("properties", {})
+        return VectorIndexEngine._math_object_from_page(props)
+
+    @staticmethod
+    def _math_object_from_ki_page(page: dict) -> Any | None:
+        """
+        Reconstruct a MathObject from a Knowledge Inbox page dict.
+
+        Uses ``Corrected Title`` (rich_text) over ``Name`` (title) when the
+        corrected value is non-empty.  All other fields are read identically
+        to the SB path via _math_object_from_page.
+
+        Returns None if the page has no usable title.
+        """
+        props = page.get("properties", {})
+
+        # Read the human-corrected title before delegating.
+        corrected_title = ""
+        try:
+            segs = props.get("Corrected Title", {}).get("rich_text", [])
+            corrected_title = "".join(
+                s.get("plain_text", "") for s in segs
+            ).strip()
+        except (KeyError, TypeError):
             pass
 
-        obj = _SBConcept()
-        obj.title = title_clean
-        obj.type = _select("Type") or "Definition"
-        obj.statement_latex = _text("Statement LaTeX")
-        obj.assumptions = _text("Assumptions")
-        obj.conclusion = _text("One Liner") or _text("Interpretation")
-        obj.interpretation = _text("Interpretation")
-        obj.proof_idea = _text("Proof Idea")
-        obj.canonical_keywords = _multi("Keywords")
-        obj.prereq_keywords = _multi("Prereq Keywords")
-        obj.downstream_keywords = _multi("Downstream Keywords")
-        obj.named_tools = _multi("Named Tools")
-        obj.suggested_hub = _text("Suggested Hub")
-        obj.setting = _multi("Setting")
-        return obj
+        mo = VectorIndexEngine._math_object_from_page(props)
+        if mo is None:
+            return None
+
+        if corrected_title:
+            # Override title with the human-corrected value; strip type prefix.
+            mo.title = re.sub(r"^\[[^\]]+\]\s*", "", corrected_title).strip()
+
+        return mo
+
+    # ── Public: rebuild ───────────────────────────────────────────────────────
+
+    def rebuild(self) -> None:
+        """
+        Drop and recreate all three Qdrant collections, then re-index:
+          - All Second Brain pages (verified=True)
+          - All unverified Knowledge Inbox pages (verified=False)
+
+        Verified KI pages are skipped — they have already been promoted to SB
+        and their SB point is the canonical one.
+
+        Partial failure policy: log per-concept errors, continue.
+
+        This is a manual operation only.  It is NEVER called automatically
+        during startup or the scheduler loop.
+        """
+        if not self._available:
+            logger.warning(
+                "VectorIndexEngine.rebuild: Qdrant not available — aborting."
+            )
+            return
+
+        if not self._sb_db:
+            logger.error(
+                "VectorIndexEngine.rebuild: NOTION_SECOND_BRAIN_DB_ID not set — aborting."
+            )
+            return
+
+        if not self._ki_db:
+            logger.error(
+                "VectorIndexEngine.rebuild: NOTION_KNOWLEDGE_INBOX_DB_ID not set — aborting."
+            )
+            return
+
+        # Lazy Notion client initialisation — only needed for rebuild().
+        if self._notion is None:
+            try:
+                from .notion_client_wrapper import NotionClientWrapper
+            except ImportError:
+                from notion_client_wrapper import NotionClientWrapper  # type: ignore[no-redef]
+            self._notion = NotionClientWrapper()
+
+        # 1. Drop and recreate all three collections atomically.
+        logger.info(
+            "VectorIndexEngine.rebuild: dropping and recreating collections ..."
+        )
+        self._ensure_collections(force_recreate=True)
+
+        # 2. Index all Second Brain pages (verified=True).
+        logger.info("VectorIndexEngine.rebuild: querying Second Brain DB ...")
+        sb_pages = self._notion.query_database(self._sb_db)
+        logger.info(
+            "VectorIndexEngine.rebuild: found %d Second Brain page(s).",
+            len(sb_pages),
+        )
+
+        sb_count = 0
+        for page in sb_pages:
+            try:
+                concept = self._math_object_from_sb_page(page)
+                if concept is None:
+                    continue
+                self.index_concept(concept, page["id"], verified=True)
+                sb_count += 1
+            except Exception:
+                logger.error(
+                    "VectorIndexEngine.rebuild: failed to index SB page %s.",
+                    page.get("id", "?"),
+                    exc_info=True,
+                )
+
+        # 3. Index unverified Knowledge Inbox pages (verified=False).
+        # Verified KI pages are already canonical in the SB collection.
+        logger.info("VectorIndexEngine.rebuild: querying Knowledge Inbox DB ...")
+        ki_pages = self._notion.query_database(
+            self._ki_db,
+            filter={
+                "property": "verification_status",
+                "status": {"does_not_equal": "verified"},
+            },
+        )
+        logger.info(
+            "VectorIndexEngine.rebuild: found %d unverified KI page(s).",
+            len(ki_pages),
+        )
+
+        ki_count = 0
+        for page in ki_pages:
+            try:
+                concept = self._math_object_from_ki_page(page)
+                if concept is None:
+                    continue
+                self.index_concept(concept, page["id"], verified=False)
+                ki_count += 1
+            except Exception:
+                logger.error(
+                    "VectorIndexEngine.rebuild: failed to index KI page %s.",
+                    page.get("id", "?"),
+                    exc_info=True,
+                )
+
+        logger.info(
+            "VectorIndexEngine.rebuild: Rebuild complete: %d SB + %d KI concepts indexed.",
+            sb_count,
+            ki_count,
+        )
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 
 def _cli_rebuild() -> None:
-    """Rebuild the vector index from the Second Brain (CLI entry point)."""
+    """
+    Rebuild the vector index from both Second Brain (verified=True) and
+    unverified Knowledge Inbox concepts (verified=False).
+
+    CLI entry point — invoked via ``python -m modules.vector_index --rebuild``.
+    """
     import argparse
     import sys
 
@@ -1092,7 +1329,10 @@ def _cli_rebuild() -> None:
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Drop and recreate all Qdrant collections from Second Brain.",
+        help=(
+            "Drop and recreate all Qdrant collections from Second Brain "
+            "(verified=True) and unverified Knowledge Inbox concepts."
+        ),
     )
     args = parser.parse_args()
 
@@ -1100,7 +1340,7 @@ def _cli_rebuild() -> None:
         parser.print_help()
         sys.exit(0)
 
-    # Load .env if present.
+    # Load .env if present (useful when running outside Docker).
     try:
         from dotenv import load_dotenv
 
@@ -1108,27 +1348,16 @@ def _cli_rebuild() -> None:
     except ImportError:
         pass
 
-    sb_db_id = os.environ.get("NOTION_SECOND_BRAIN_DB_ID")
-    if not sb_db_id:
-        print("ERROR: NOTION_SECOND_BRAIN_DB_ID not set.", file=sys.stderr)
-        sys.exit(1)
-
-    # Import here to get fresh env vars after load_dotenv.
-    try:
-        from modules.notion_client_wrapper import NotionClientWrapper
-    except ModuleNotFoundError:
-        # Running from orchestrator/ directory.
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from notion_client_wrapper import NotionClientWrapper  # type: ignore[no-redef]
-
-    notion = NotionClientWrapper()
     engine = VectorIndexEngine()
 
     if not engine.available:
-        print("ERROR: VectorIndexEngine is not available (Qdrant unreachable?).", file=sys.stderr)
+        print(
+            "ERROR: VectorIndexEngine is not available (Qdrant unreachable?).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    engine.rebuild_index_from_second_brain(notion, sb_db_id)
+    engine.rebuild()
     print("Rebuild complete.")
 
 

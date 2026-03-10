@@ -67,7 +67,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import openai
+import anthropic
+import instructor
 import requests
 from tenacity import (
     retry,
@@ -98,8 +99,8 @@ logger = logging.getLogger(__name__)
 # -- Scratch directory inside the Docker volume ---------------------------------
 TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
 
-# -- OpenAI model ---------------------------------------------------------------
-OPENAI_MODEL = "gpt-5.2"
+# -- Claude model ---------------------------------------------------------------
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 # -- Notion hard limits ---------------------------------------------------------
 NOTION_BLOCK_MAX_CHARS = 1900
@@ -419,7 +420,9 @@ class IngestionEngine:
 
     def __init__(self, vector_index: Optional[VectorIndexEngine]) -> None:
         self.notion = NotionClientWrapper()
-        self.openai_client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        _anthropic = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.claude_client = instructor.from_anthropic(_anthropic)
+        self.anthropic_raw = _anthropic
         self._webdav = self._build_webdav_client()
         self.marker_url = os.environ.get("MARKER_API_URL", "http://marker-api:8080")
         self.paper_tracker_db = os.environ["NOTION_PAPER_TRACKER_DB_ID"]
@@ -1460,11 +1463,11 @@ class IngestionEngine:
         #         },
         #     ],
         # )
-        response = self.openai_client.responses.parse(
-            model="gpt-5.2",
-            text_format=ExtractionResult,
-            input=[
-                {"role": "system", "content": system_prompt},
+        result = self.claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=8192,
+            system=system_prompt,
+            messages=[
                 {
                     "role": "user",
                     "content": (
@@ -1480,28 +1483,25 @@ class IngestionEngine:
                         f"{markdown[:100_000]}"
                     ),
                 },
-            ]) 
-        
-        logger.info("OpenAI response: %s", response)
-        return response.output_parsed
+            ],
+            response_model=ExtractionResult,
+        )
+        logger.info("Claude extraction response received.")
+        return result
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=30))
     def _call_openai_repair(
         self, invalid_output: dict[str, Any], error_summary: str
     ) -> dict[str, Any]:
-        """Send the invalid output back to OpenAI with a repair instruction."""
-        response = self.openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
+        """Send the invalid output back to Claude with a repair instruction."""
+        response = self.anthropic_raw.messages.create(
+            model=CLAUDE_MODEL,
             max_tokens=4096,
-            response_format={"type": "json_object"},
+            system=(
+                "You are a JSON repair assistant. Fix the following JSON to match "
+                "the required schema. Return only valid JSON, no explanation."
+            ),
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a JSON repair assistant. Fix the following JSON to match "
-                        "the required schema. Return only valid JSON, no explanation."
-                    ),
-                },
                 {
                     "role": "user",
                     "content": (
@@ -1513,7 +1513,7 @@ class IngestionEngine:
                 },
             ],
         )
-        return json.loads(response.choices[0].message.content)
+        return json.loads(response.content[0].text)
 
     # -- Patch Paper Tracker row -----------------------------------------------
 
@@ -1860,7 +1860,7 @@ class IngestionEngine:
             return ConceptLinkResult()
         return result
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
+    @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=2, min=10, max=120))
     def _call_openai_link(
         self, concept: MathObject, candidates: list[dict]
     ) -> ConceptLinkResult:
@@ -1885,15 +1885,16 @@ class IngestionEngine:
             f"CANDIDATES:\n{candidate_lines}\n\n"
             "Identify relationships. Return JSON only."
         )
-        response = self.openai_client.responses.parse(
-            model="gpt-5.2",
-            text_format=ConceptLinkResult,
-            input=[
-                {"role": "system", "content": LINKING_SYSTEM_PROMPT_V1},
+        result = self.claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            system=LINKING_SYSTEM_PROMPT_V1,
+            messages=[
                 {"role": "user", "content": user_message},
             ],
-        ) 
-        return response.output_parsed
+            response_model=ConceptLinkResult,
+        )
+        return result
 
     # -- Re-extraction flow (REQ-5) --------------------------------------------
 
@@ -1966,11 +1967,11 @@ class IngestionEngine:
         )
 
         try:
-            response = self.openai_client.responses.parse(
-                model=OPENAI_MODEL,
-                text_format=ExtractionResult,
-                input=[
-                    {"role": "system", "content": system_prompt},
+            reextraction = self.claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[
                     {
                         "role": "user",
                         "content": (
@@ -1979,10 +1980,10 @@ class IngestionEngine:
                         ),
                     },
                 ],
+                response_model=ExtractionResult,
             )
-            reextraction = response.output_parsed
         except Exception:
-            logger.exception("[%s] Re-extraction OpenAI call failed.", run_id)
+            logger.exception("[%s] Re-extraction Claude call failed.", run_id)
             return
 
         new_concepts = [

@@ -1045,12 +1045,20 @@ class PromotionEngine:
         if concept_type:
             sb_props["Type"] = self.notion.select_prop(concept_type)
 
+        # Assumptions and Statement LaTeX are always written — even when empty —
+        # so that rebuild() can read them back from Notion and log debug warnings
+        # for degraded embeddings rather than silently missing properties.
+        sb_props["Assumptions"] = {
+            "rich_text": self.notion.rich_text(self._get_text(props, "Assumptions"))
+        }
+        sb_props["Statement LaTeX"] = {
+            "rich_text": self.notion.rich_text(self._get_text(props, "Statement LaTeX"))
+        }
+
         for ki_key, sb_key in [
             ("Interpretation",  "Interpretation"),
             ("Proof Idea",      "Proof Idea"),
             ("Aliases",         "Aliases"),
-            ("Assumptions",     "Assumptions"),
-            ("Statement LaTeX", "Statement LaTeX"),
         ]:
             text = self._get_text(props, ki_key)
             if text:
