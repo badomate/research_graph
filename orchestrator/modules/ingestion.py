@@ -129,7 +129,7 @@ KEYWORD_JACCARD_DROP_THRESHOLD: float = float(
     os.environ.get("KEYWORD_JACCARD_DROP_THRESHOLD", "0.10")
 )
 QDRANT_SIMILARITY_DROP_THRESHOLD: float = float(
-    os.environ.get("QDRANT_SIMILARITY_DROP_THRESHOLD", "0.75")
+    os.environ.get("QDRANT_SIMILARITY_DROP_THRESHOLD", "0.45")
 )
 
 # -- Composite score weights (must sum to 1.0) ----------------------------------
@@ -138,7 +138,7 @@ WEIGHT_NAMED_TOOL: float = float(os.environ.get("WEIGHT_NAMED_TOOL", "0.25"))
 WEIGHT_ASSUMPTION_OVERLAP: float = float(os.environ.get("WEIGHT_ASSUMPTION_OVERLAP", "0.20"))
 WEIGHT_SETTING_CONTAINMENT: float = float(os.environ.get("WEIGHT_SETTING_CONTAINMENT", "0.10"))
 WEIGHT_KEYWORD_JACCARD: float = float(os.environ.get("WEIGHT_KEYWORD_JACCARD", "0.05"))
-
+COMPOSITE_DROP_THRESHOLD = 0.12
 # -- Edge creation thresholds --------------------------------------------------
 EDGE_AUTO_CREATE_CONFIDENCE: float = float(
     os.environ.get("EDGE_AUTO_CREATE_CONFIDENCE", "0.80")
@@ -146,7 +146,7 @@ EDGE_AUTO_CREATE_CONFIDENCE: float = float(
 EDGE_REVIEW_FLAG_CONFIDENCE: float = float(
     os.environ.get("EDGE_REVIEW_FLAG_CONFIDENCE", "0.65")
 )
-EDGE_MAX_CANDIDATES_TO_GPT: int = int(os.environ.get("EDGE_MAX_CANDIDATES_TO_GPT", "10"))
+EDGE_MAX_CANDIDATES_TO_GPT: int = int(os.environ.get("EDGE_MAX_CANDIDATES_TO_GPT", "20"))
 
 # -- Candidate hydration -------------------------------------------------------
 NOTION_HYDRATION_CONCURRENCY: int = int(
@@ -190,6 +190,14 @@ _PASS2_MAX_CONTEXT_TOKENS: int = 4_000
 _SKIP_SECTION_KEYWORDS = (
     "proof of", "proofs of", "deferred", "technical lemma",
 )
+
+_RELATION_CANDIDATE_MAP: dict[str, str] = {
+    "depends_on":    "depends_on",   # candidates from assumption embedding query
+    "enables":       "enables",      # candidates from conclusion embedding query
+    "related":       "related",      # candidates from full embedding query
+    "special_case_of": "related",    # broad pool — let GPT decide
+    "generalizes":   "related",
+}
 
 # -- Boilerplate stripping regex (REQ-2) ---------------------------------------
 # Matches appendix / references / acknowledgement headings and everything after.
@@ -418,10 +426,8 @@ def score_candidate_pair(
         should_drop = False
     else:
         should_drop = (
-            assumption_conclusion_overlap < ASSUMPTION_OVERLAP_DROP_THRESHOLD
-            and setting_containment is None
-            and keyword_jaccard < KEYWORD_JACCARD_DROP_THRESHOLD
-            and qdrant_similarity < QDRANT_SIMILARITY_DROP_THRESHOLD
+            composite_score < COMPOSITE_DROP_THRESHOLD
+            and not named_tool_match 
         )
 
     return CandidateScore(
@@ -2886,23 +2892,12 @@ class IngestionEngine:
             response_model=ConceptLinkResult,
         )
         return result
-
-    @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=2, min=10, max=120))
-    def _call_claude_link_v2(
+    
+    def _build_link_v2_user_message(
         self, concept: MathObject, candidates: list[dict]
-    ) -> CrossPaperLinkResult:
-        """
-        Invoke the enriched Stage 3 cross-paper edge confirmation prompt (v2).
-
-        Builds a detailed user message with full concept fields for C_A and
-        every candidate, including pre-filter signal annotations.  Parses the
-        response into CrossPaperLinkResult, applying the review-flag routing
-        logic to each EdgeProposal.
-
-        On parse failure, logs the raw response and returns an empty
-        CrossPaperLinkResult (pipeline continues in degraded mode).
-        """
-        # ── Build user message ────────────────────────────────────────────────
+    ) -> str:
+        """Extract the user message construction from _call_claude_link_v2."""
+       # ── Build user message ────────────────────────────────────────────────
         _MAX_LATEX = 800
 
         def _fmt_latex(s: str) -> str:
@@ -3007,54 +3002,211 @@ class IngestionEngine:
         ]
 
         user_message = "\n".join(src_lines)
+        return user_message
+    
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=10, max=60))
+    def _call_claude_link_single_relation(
+        self,
+        concept: MathObject,
+        candidates: list[dict],
+        relation_type: str,
+    ) -> CrossPaperLinkResult:
+        """
+        Targeted call: ask Claude to find edges of ONE specific relation type only.
+        The focused scope prevents cross-type suppression and forces the model
+        to reason specifically about the relation's logical criterion.
+        """
+        # Build same user message as _call_claude_link_v2 (factored out)
+        user_message = self._build_link_v2_user_message(concept, candidates)
 
-        # ── Claude call with structured output ────────────────────────────────
+        # Inject relation-specific instruction at the end
+        relation_criteria = {
+            "depends_on": (
+                "Focus ONLY on depends_on edges. "
+                "A depends_on edge exists if: C_A's assumptions, proof, or definition "
+                "explicitly requires an object, condition, or result provided by C_B. "
+                "Concretely: C_A's assumption field should reference what C_B concludes, "
+                "OR C_A's named_tools should include C_B's name."
+            ),
+            "enables": (
+                "Focus ONLY on enables edges. "
+                "A enables edge exists if: C_A's conclusion or output is used as an "
+                "assumption or input by C_B. "
+                "Concretely: C_B's assumption field should reference what C_A concludes."
+            ),
+            "special_case_of": (
+                "Focus ONLY on special_case_of edges. "
+                "C_A is a special case of C_B if: C_B's setting or assumption set "
+                "strictly contains C_A's (C_B is more general). "
+                "State which field shows the containment."
+            ),
+            "generalizes": (
+                "Focus ONLY on generalizes edges. "
+                "C_A generalizes C_B if: C_A's setting or assumption set strictly "
+                "contains C_B's (C_A is more general). "
+                "State which field shows the containment."
+            ),
+            "related": (
+                "Focus ONLY on related edges. "
+                "A related edge exists if: C_A and C_B share at least one concrete "
+                "structural element — same operator class, same PDE type, same "
+                "named tool, overlapping assumption sets, or same equilibrium notion. "
+                "Topic similarity alone is NOT sufficient."
+            ),
+        }
+
+        instruction = relation_criteria[relation_type]
+        focused_prompt = (
+            f"{LINKING_SYSTEM_PROMPT_V2}\n\n"
+            f"CURRENT TASK — {relation_type.upper()} EDGES ONLY\n"
+            f"{instruction}\n\n"
+            "If no candidates qualify, return {\"proposals\": []}. "
+            "Do not propose edges of other types in this call."
+        )
+
         try:
             result: CrossPaperLinkResult = self.claude_client.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=4096,
-                system=LINKING_SYSTEM_PROMPT_V2,
+                max_tokens=2048,  # smaller budget per call is fine
+                system=focused_prompt,
                 messages=[{"role": "user", "content": user_message}],
                 response_model=CrossPaperLinkResult,
             )
+            return result
         except Exception:
             logger.warning(
-                "_call_claude_link_v2: Claude call failed for '%s'.", concept.title,
-                exc_info=True,
+                "_call_claude_link_single_relation: failed for '%s' / %s.",
+                concept.title, relation_type, exc_info=True,
             )
             return CrossPaperLinkResult()
+    def _audit_missing_edges(
+        self,
+        concept: MathObject,
+        candidates: list[dict],
+        existing_proposals: list[EdgeProposal],
+    ) -> list[EdgeProposal]:
+        """
+        Ask Claude: given what was already proposed, what obvious edges are missing?
+        Cheap call — 512 tokens max. Returns additional proposals only.
+        """
+        if not candidates:
+            return []
 
-        # ── Build a lookup from candidate notion_page_id → CandidateScore ────
-        scores_by_id: Dict[str, CandidateScore] = {}
-        for cand in candidates:
-            score_obj = cand.get("_score_obj")
-            if score_obj is not None:
-                scores_by_id[cand.get("id", "")] = score_obj
+        proposed_ids = {p.target_notion_page_id for p in existing_proposals}
+        proposed_summary = "\n".join(
+            f"- {p.relation_type} → {p.target_concept_title} ({p.confidence:.0%})"
+            for p in existing_proposals
+        ) or "(none)"
 
-        # ── Apply post-call routing: confidence tiers, pre_filter_signal ──────
-        proposals: list[EdgeProposal] = []
-        low_confidence: list[EdgeProposal] = []
+        # Only audit candidates not already linked.
+        unlinked = [c for c in candidates
+                    if c.get("id") not in proposed_ids
+                    and c.get("_concept_data") is not None]
+        if not unlinked:
+            return []
 
-        for proposal in result.proposals:
-            pid = proposal.target_notion_page_id
+        unlinked_titles = "\n".join(
+            f"- [{c['_concept_data'].notion_page_id}] {c['_concept_data'].title}"
+            for c in unlinked[:10]
+        )
 
-            # Look up the dominant signal for this candidate.
-            # Fall back to scanning candidates by title if ID not in scores_by_id.
-            score_obj = scores_by_id.get(pid)
+        audit_prompt = f"""\
+    You previously proposed these edges for concept '{concept.title}':
+    {proposed_summary}
+
+    The following candidates were NOT linked. For each, state briefly whether 
+    a relationship clearly exists and was missed, or was correctly excluded:
+    {unlinked_titles}
+
+    If a clearly missed edge exists, return it as an EdgeProposal in 'proposals'.
+    If all exclusions were correct, return {{"proposals": []}}.
+    Only propose edges with confidence >= 0.70 and specific field-level evidence.
+    """
+        try:
+            result: CrossPaperLinkResult = self.claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=512,
+                system=LINKING_SYSTEM_PROMPT_V2,
+                messages=[{"role": "user", "content": audit_prompt}],
+                response_model=CrossPaperLinkResult,
+            )
+            return result.proposals
+        except Exception:
+            return []
+        
+    def _call_claude_link_v2(
+        self, concept: MathObject, candidates: list[dict]
+    ) -> CrossPaperLinkResult:
+        all_proposals: list[EdgeProposal] = []
+        all_low_conf: list[EdgeProposal] = []
+        seen_edges: set[tuple[str, str]] = set()
+
+        # Build relation → subset mapping upfront
+        relation_subsets: dict[str, list[dict]] = {}
+        for relation_type in ("depends_on", "enables", "special_case_of",
+                            "generalizes", "related"):
+            hint_key = _RELATION_CANDIDATE_MAP[relation_type]
+            subset = [
+                c for c in candidates
+                if hint_key in c.get("edge_type_hint", "related")
+            ] or candidates
+            if subset:
+                relation_subsets[relation_type] = subset
+
+        # Parallel execution — collapses latency to ~slowest single call
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {
+                pool.submit(
+                    self._call_claude_link_single_relation,
+                    concept, subset, rel_type
+                ): rel_type
+                for rel_type, subset in relation_subsets.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                rel_type = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.warning(
+                        "_call_claude_link_v2: sub-call failed for '%s' / %s — skipping.",
+                        concept.title, rel_type,
+                    )
+                    continue
+
+                for p in result.proposals:
+                    key = (p.target_notion_page_id, p.relation_type)
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        all_proposals.append(p)
+
+                for p in result.low_confidence_suggestions:
+                    key = (p.target_notion_page_id, p.relation_type)
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        all_low_conf.append(p)
+
+        # Audit pass — catches structurally obvious missed edges
+        audit_additions = self._audit_missing_edges(concept, candidates, all_proposals)
+        for p in audit_additions:
+            key = (p.target_notion_page_id, p.relation_type)
+            if key not in seen_edges:
+                seen_edges.add(key)
+                all_proposals.append(p)
+
+        # Apply review flag routing to all collected proposals
+        scores_by_id: dict[str, CandidateScore] = {
+            cand.get("id", ""): cand["_score_obj"]
+            for cand in candidates
+            if cand.get("_score_obj") is not None
+        }
+        final_proposals: list[EdgeProposal] = []
+        final_low_conf: list[EdgeProposal] = []
+
+        for proposal in all_proposals:
+            score_obj = scores_by_id.get(proposal.target_notion_page_id)
             if score_obj is None:
-                for cand in candidates:
-                    if cand.get("_concept_data") and cand["_concept_data"].notion_page_id == pid:
-                        score_obj = cand.get("_score_obj")
-                        break
-
-            if score_obj is not None:
-                proposal.pre_filter_signal = _dominant_signal(score_obj)
-            else:
-                # No score available (same-paper or un-hydrated).
-                proposal.pre_filter_signal = "none"
-                # Provide a neutral CandidateScore for review-flag logic.
                 score_obj = CandidateScore(
-                    candidate_id=pid,
+                    candidate_id=proposal.target_notion_page_id,
                     qdrant_similarity=0.0,
                     named_tool_match=False,
                     assumption_conclusion_overlap=0.0,
@@ -3063,19 +3215,18 @@ class IngestionEngine:
                     composite_score=0.0,
                     should_drop=False,
                 )
+            proposal.pre_filter_signal = _dominant_signal(score_obj)
 
             if proposal.confidence < EDGE_REVIEW_FLAG_CONFIDENCE:
-                # Below creation threshold — informational hint only.
-                low_confidence.append(proposal)
+                final_low_conf.append(proposal)
             else:
                 _assign_review_flag(proposal, score_obj)
-                proposals.append(proposal)
+                final_proposals.append(proposal)
 
         return CrossPaperLinkResult(
-            proposals=proposals,
-            low_confidence_suggestions=low_confidence,
+            proposals=final_proposals,
+            low_confidence_suggestions=final_low_conf + all_low_conf,
         )
-
     # -- Re-extraction flow (REQ-5) --------------------------------------------
 
     def _reextract_missed_concepts(

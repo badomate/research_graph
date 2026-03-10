@@ -520,6 +520,7 @@ class VectorIndexEngine:
             ("concept_full",        full_emb,        "related"),
             ("concept_full",        assumption_emb,  "depends_on"),
             ("concept_assumptions", conclusion_emb,  "enables"),
+            ("concept_conclusions", full_emb, "enables"),
         ]
 
         all_hits: list[tuple[str, Any]] = []  # (hint, ScoredPoint)
