@@ -2355,7 +2355,7 @@ class IngestionEngine:
             # Sort descending by composite score, cap at EDGE_MAX_CANDIDATES_TO_GPT.
             scored.sort(key=lambda x: x[0], reverse=True)
             cross_paper_dicts = [d for _, d in scored[:EDGE_MAX_CANDIDATES_TO_GPT]]
-        
+
         # ── Combine same-paper and (reranked) cross-paper candidates ──────────
         same_paper_dicts = [h.to_dict() for h in same_paper_hints]
         return same_paper_dicts + cross_paper_dicts

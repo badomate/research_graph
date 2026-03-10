@@ -197,18 +197,24 @@ class TestHelpers(unittest.TestCase):
 class TestScoreCandidatePair(unittest.TestCase):
 
     def test_named_tool_match_fires_when_title_in_named_tools(self):
-        """C_A.named_tools contains a title very close to C_B.title."""
+        """C_A.named_tools contains a title very close to C_B.title.
+
+        With token_sort_ratio, "schauder fixed point" vs "schauder fixed
+        point theorem" scores ~83%, which is below threshold 85.  The test
+        verifies the signal does not spuriously fire (false positive check)
+        and that the concept is not dropped (qdrant_similarity=0.8 is high).
+        """
         ca = _make_concept("a", "Convergence Theorem",
                            named_tools=["Schauder Fixed Point"])
         cb = _make_concept("b", "Schauder Fixed Point Theorem",
                            named_tools=[])
-        # Schauder Fixed Point vs Schauder Fixed Point Theorem → 83% with
-        # token_sort_ratio.  Below threshold 85 so we should not fire.
         score = score_candidate_pair(ca, cb, 0.8)
-        # Exact match test: adjust to pass with real token_sort_ratio result.
-        # The important thing is we can verify the signal logic end-to-end.
-        self.assertIsInstance(score.named_tool_match, bool)
-        self.assertFalse(score.should_drop)  # qdrant_similarity=0.8 → no drop
+        # "Schauder Fixed Point" vs "Schauder Fixed Point Theorem" → ~83%,
+        # below the threshold of 85, so named_tool_match should be False.
+        self.assertFalse(score.named_tool_match)
+        # qdrant_similarity=0.8 is above QDRANT_SIMILARITY_DROP_THRESHOLD
+        # so the candidate is kept regardless of other signal values.
+        self.assertFalse(score.should_drop)
 
     def test_named_tool_match_fires_exact(self):
         """C_A.named_tools matches C_B.title exactly (after normalization)."""
@@ -293,7 +299,7 @@ class TestScoreCandidatePair(unittest.TestCase):
         ca = _make_concept("a", "A", keywords=["foo", "bar", "baz"])
         cb = _make_concept("b", "B", keywords=["foo", "bar", "qux"])
         score = score_candidate_pair(ca, cb, 0.7)
-        # |{"foo","bar"} ∩ {"foo","bar","baz","qux"}| / |union| = 2/4 = 0.5
+        # |{"foo","bar"}| / |{"foo","bar","baz","qux"}| = 2/4 = 0.5
         self.assertAlmostEqual(score.keyword_jaccard, 0.5, places=5)
 
     def test_assumption_conclusion_overlap(self):

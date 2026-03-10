@@ -638,12 +638,13 @@ class PromotionEngine:
                     target_sb_id = target_page_id
             if not target_sb_id:
                 target_sb_id = self._sb_title_cache.get(target_title)
+            effective_rationale = rationale or justification
             if not target_sb_id:
                 self._defer_edge(
                     from_sb_id=from_sb_id,
                     target_title=target_title,
                     relation_type=rel_type,
-                    rationale=rationale or justification,
+                    rationale=effective_rationale,
                     confidence=confidence,
                     source_paper_ids=source_paper_ids,
                     needs_review=needs_review,
@@ -657,7 +658,7 @@ class PromotionEngine:
                     from_sb_id=from_sb_id,
                     to_sb_id=target_sb_id,
                     relation_type=rel_type,
-                    rationale=rationale or justification,
+                    rationale=effective_rationale,
                     confidence=confidence,
                     source_paper_ids=source_paper_ids,
                     needs_review=needs_review,
