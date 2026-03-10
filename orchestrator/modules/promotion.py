@@ -333,7 +333,22 @@ class PromotionEngine:
                 self._mark_deferred_stale(row["id"])
                 continue
 
-            to_sb_id = self._sb_title_cache.get(target_title)
+            # Try all title variants (hub-suffixed, type-prefixed, both stripped).
+            _hub_re = re.compile(r'\s*\[[^\]]+\]\s*$')
+            candidates = []
+            for t in (
+                target_title,
+                _hub_re.sub("", target_title).strip(),
+                re.sub(r'^\[[^\]]+\]\s*', '', target_title).strip(),
+                re.sub(r'^\[[^\]]+\]\s*', '', _hub_re.sub("", target_title)).strip(),
+            ):
+                if t and t not in candidates:
+                    candidates.append(t)
+
+            to_sb_id = next(
+                (self._sb_title_cache[c] for c in candidates if c in self._sb_title_cache),
+                None,
+            )
             if not to_sb_id:
                 continue  # Target still not promoted — leave pending
 
@@ -552,15 +567,20 @@ class PromotionEngine:
             )
 
         # Inject into cache so pass 2 (and later items in pass 1) can resolve
-        # edges pointing to this concept by title.  Store both the full title
-        # (e.g. "[Theorem] Foo") and the stripped form ("Foo") so that edge
-        # target_title values without a type-prefix still resolve.
-        self._sb_title_cache[title] = sb_page_id
-        self._sb_title_cache[re.sub(r'^\[[^\]]+\]\s*', '', title).strip()] = sb_page_id
+        # edges pointing to this concept by title.  Store all variants so that
+        # hub-suffixed target_title values also resolve.
+        _hub_re = re.compile(r'\s*\[[^\]]+\]\s*$')
+        stripped_hub  = _hub_re.sub("", title).strip()
+        stripped_type = re.sub(r'^\[[^\]]+\]\s*', '', title).strip()
+        stripped_both = re.sub(r'^\[[^\]]+\]\s*', '', stripped_hub).strip()
+        for t in (title, stripped_hub, stripped_type, stripped_both):
+            if t:
+                self._sb_title_cache[t] = sb_page_id
 
         # Resolve any edges that were waiting for this concept
-        self._resolve_deferred_edges(title, sb_page_id)
-        self._resolve_deferred_edges(re.sub(r'^\[[^\]]+\]\s*', '', title).strip(), sb_page_id)
+        for t in (title, stripped_hub, stripped_type, stripped_both):
+            if t:
+                self._resolve_deferred_edges(t, sb_page_id)
 
         # Module 7: migrate the vector index entry from KI to SB.
         if self._vector_index and self._vector_index.available:
@@ -1000,13 +1020,20 @@ class PromotionEngine:
                 "select": {"equals": _SB_CONCEPT_LEVEL},
             },
         )
+        _hub_suffix_re = re.compile(r'\s*\[[^\]]+\]\s*$')
         cache: dict[str, str] = {}
         for page in pages:
             title = self._get_page_title(page)
             if not title:
                 continue
-            cache[title] = page["id"]
-            cache[re.sub(r'^\[[^\]]+\]\s*', '', title).strip()] = page["id"]
+            # Store every variant so edge resolution works regardless of how
+            # the target_title was formatted by the linking stage.
+            stripped_hub  = _hub_suffix_re.sub("", title).strip()
+            stripped_type = re.sub(r'^\[[^\]]+\]\s*', '', title).strip()
+            stripped_both = re.sub(r'^\[[^\]]+\]\s*', '', stripped_hub).strip()
+            for t in (title, stripped_hub, stripped_type, stripped_both):
+                if t:
+                    cache[t] = page["id"]
         return cache
 
     def _create_sb_concept(self, ki_item: dict) -> str | None:

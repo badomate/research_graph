@@ -103,14 +103,15 @@ _EDGE_COLOURS: dict[str, str] = {
 _PHYSICS_OPTIONS = """{
   "physics": {
     "barnesHut": {
-      "gravitationalConstant": -12000,
-      "centralGravity": 0.1,
-      "springLength": 220,
-      "springConstant": 0.04,
-      "damping": 0.09
+      "gravitationalConstant": -35000,
+      "centralGravity": 0.04,
+      "springLength": 420,
+      "springConstant": 0.025,
+      "damping": 0.14,
+      "avoidOverlap": 0.6
     },
-    "minVelocity": 0.5,
-    "stabilization": { "iterations": 200 }
+    "minVelocity": 0.3,
+    "stabilization": { "iterations": 350 }
   },
   "interaction": {
     "hover": true,
@@ -119,8 +120,9 @@ _PHYSICS_OPTIONS = """{
     "keyboard": true
   },
   "edges": {
-    "smooth": { "type": "dynamic" },
-    "arrows": { "to": { "enabled": true, "scaleFactor": 0.7 } }
+    "smooth": { "type": "continuous" },
+    "arrows": { "to": { "enabled": true, "scaleFactor": 0.7 } },
+    "font": { "size": 0 }
   }
 }"""
 
@@ -251,6 +253,7 @@ class DependencyGrapher:
             concept_type = self._get_select(page["properties"], "Type")
             hub          = self._get_text(page["properties"], "Suggested Hub")
             summary      = self._get_text_full(page["properties"], "Summary")
+            body_sections = self._parse_page_blocks(pid)
             tags_raw     = page["properties"].get("Tags", {})
             tags: list[str] = []
             try:
@@ -278,6 +281,7 @@ class DependencyGrapher:
                     "summary": summary,
                     "tags": tags,
                     "notion_url": _notion_url(pid),
+                    "body_sections": body_sections,
                 }),
             )
 
@@ -415,6 +419,7 @@ class DependencyGrapher:
                 f"Link status: {graph_link_status}"
             )
             summary = self._get_text_full(props, "Summary")
+            body_sections = self._parse_page_blocks(pid)
             tags_raw = props.get("Tags", {})
             tags: list[str] = []
             try:
@@ -439,6 +444,7 @@ class DependencyGrapher:
                     "summary": summary,
                     "tags": tags,
                     "notion_url": _notion_url(pid),
+                    "body_sections": body_sections,
                 }),
             )
 
@@ -547,20 +553,26 @@ class DependencyGrapher:
 
         # Build metadata lookup: node_id -> parsed meta dict
         node_meta: dict[str, dict] = {}
+        degree_map = dict(graph.degree())
         for node_id, data in graph.nodes(data=True):
+            deg = degree_map.get(node_id, 0)
+            base_size = data.get("size", 15)
+            scaled_size = round(base_size + min(deg * 1.5, 22))
             net.add_node(
                 node_id,
                 label=data.get("label", str(node_id)),
                 title=data.get("title", str(node_id)),
                 color=data.get("color", "#6c63ff"),
                 shape=data.get("shape", "ellipse"),
-                size=data.get("size", 15),
+                size=scaled_size,
             )
             raw_meta = data.get("meta", "{}")
             try:
-                node_meta[node_id] = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                m = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                m["degree"] = deg
+                node_meta[node_id] = m
             except Exception:
-                node_meta[node_id] = {}
+                node_meta[node_id] = {"degree": deg}
 
         # Build edge metadata lookup: "src||dst" -> parsed meta dict
         edge_meta: dict[str, dict] = {}
@@ -602,7 +614,7 @@ class DependencyGrapher:
 #kg-panel {{
   position: fixed;
   top: 0; right: 0;
-  width: 360px;
+  width: 400px;
   height: 100vh;
   background: #1e1e30;
   border-left: 1px solid #3a3a5e;
@@ -629,13 +641,12 @@ class DependencyGrapher:
 }}
 #kg-panel-header h2 {{
   margin: 0;
-  font-size: 0.95rem;
+  font-size: 0.92rem;
   font-weight: 600;
   color: #c7c7e8;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 260px;
+  line-height: 1.3;
+  max-width: 340px;
+  word-break: break-word;
 }}
 #kg-panel-close {{
   background: none;
@@ -695,6 +706,33 @@ class DependencyGrapher:
   max-height: 220px;
   overflow-y: auto;
   white-space: pre-wrap;
+}}
+.kg-sections {{
+  margin-top: 14px;
+  border-top: 1px solid #2d2d50;
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}}
+.kg-section-label {{
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #6666aa;
+  margin-bottom: 3px;
+  font-weight: 600;
+}}
+.kg-section-body {{
+  background: #252540;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #b0b0d8;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow-y: auto;
 }}
 .kg-tags {{
   display: flex;
@@ -766,17 +804,18 @@ class DependencyGrapher:
 /* ── Banner ── */
 #kg-banner {{
   position: fixed;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #2d2d44;
-  color: white;
-  padding: 8px 20px;
-  border-radius: 8px;
+  bottom: 14px;
+  right: 14px;
+  background: #1e1e30cc;
+  color: #666;
+  padding: 4px 13px;
+  border-radius: 20px;
+  border: 1px solid #2d2d50;
   font-family: sans-serif;
-  font-size: 14px;
-  z-index: 9999;
+  font-size: 0.73rem;
+  z-index: 9998;
   pointer-events: none;
+  backdrop-filter: blur(4px);
 }}
 /* ── Focus-mode overlay ── */
 #kg-focus-bar {{
@@ -806,6 +845,89 @@ class DependencyGrapher:
   padding: 0;
 }}
 #kg-focus-exit:hover {{ color: #fff; }}
+/* ── Colour legend ── */
+#kg-legend {{
+  position: fixed;
+  bottom: 50px;
+  left: 14px;
+  background: #1e1e30ee;
+  border: 1px solid #3a3a5e;
+  border-radius: 8px;
+  padding: 10px 13px;
+  font-family: 'Segoe UI', sans-serif;
+  font-size: 0.74rem;
+  color: #aaa;
+  z-index: 9998;
+  backdrop-filter: blur(4px);
+  min-width: 136px;
+}}
+.kg-leg-title {{
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #555;
+  margin-bottom: 7px;
+  font-weight: 700;
+}}
+.kg-leg-group {{ display: flex; flex-direction: column; gap: 4px; }}
+.kg-leg-divider {{ border-top: 1px solid #2d2d50; margin: 7px 0; }}
+.kg-leg-row {{ display: flex; align-items: center; gap: 7px; color: #9898c0; }}
+.kg-leg-node {{ width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }}
+.kg-leg-edge {{ width: 16px; height: 2px; border-radius: 1px; flex-shrink: 0; }}
+/* ── Search bar ── */
+#kg-search-wrap {{
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}}
+#kg-search {{
+  background: #1e1e30cc;
+  border: 1px solid #3a3a5e;
+  border-radius: 20px;
+  padding: 7px 14px;
+  font-size: 0.82rem;
+  color: #e0e0f0;
+  outline: none;
+  width: 180px;
+  backdrop-filter: blur(4px);
+  font-family: 'Segoe UI', sans-serif;
+  transition: border-color 0.15s, width 0.2s;
+}}
+#kg-search::placeholder {{ color: #445; }}
+#kg-search:focus {{ border-color: #6c63ff; width: 240px; }}
+#kg-search-count {{
+  font-size: 0.73rem;
+  color: #556;
+  font-family: sans-serif;
+  white-space: nowrap;
+}}
+/* ── Loading overlay ── */
+#kg-loading {{
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: #1a1a2eee;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  z-index: 20000;
+  font-family: 'Segoe UI', sans-serif;
+  font-size: 0.88rem;
+  color: #888;
+  pointer-events: none;
+}}
+.kg-spinner {{
+  width: 22px; height: 22px;
+  border: 2px solid #2d2d50;
+  border-top-color: #6c63ff;
+  border-radius: 50%;
+  animation: kg-spin 0.7s linear infinite;
+}}
+@keyframes kg-spin {{ to {{ transform: rotate(360deg); }} }}
 </style>
 
 <!-- Banner -->
@@ -824,6 +946,39 @@ class DependencyGrapher:
 <div id="kg-focus-bar">
   <span id="kg-focus-label">Focus mode</span>
   <button id="kg-focus-exit">✕ Exit focus</button>
+</div>
+
+<!-- Search bar -->
+<div id="kg-search-wrap">
+  <input id="kg-search" type="text" placeholder="🔍 Search nodes…" autocomplete="off" />
+  <span id="kg-search-count"></span>
+</div>
+
+<!-- Colour legend -->
+<div id="kg-legend">
+  <div class="kg-leg-title">Concepts</div>
+  <div class="kg-leg-group">
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#6c63ff"></span>Theorem</div>
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#2a9d8f"></span>Definition</div>
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#f4a261"></span>Lemma</div>
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#e9c46a"></span>Algorithm</div>
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#e63946"></span>Assumption</div>
+    <div class="kg-leg-row"><span class="kg-leg-node" style="background:#457b9d"></span>Proof Technique</div>
+  </div>
+  <div class="kg-leg-divider"></div>
+  <div class="kg-leg-group">
+    <div class="kg-leg-row"><span class="kg-leg-edge" style="background:#e63946"></span>depends_on</div>
+    <div class="kg-leg-row"><span class="kg-leg-edge" style="background:#2a9d8f"></span>enables</div>
+    <div class="kg-leg-row"><span class="kg-leg-edge" style="background:#457b9d"></span>generalizes</div>
+    <div class="kg-leg-row"><span class="kg-leg-edge" style="background:#7b2d8b"></span>special_case_of</div>
+    <div class="kg-leg-row"><span class="kg-leg-edge" style="background:#888888"></span>related</div>
+  </div>
+</div>
+
+<!-- Loading overlay -->
+<div id="kg-loading">
+  <div class="kg-spinner"></div>
+  <span>Stabilizing graph…</span>
 </div>
 
 <script>
@@ -897,6 +1052,16 @@ class DependencyGrapher:
         html += '</div></span></div>';
       }}
       if (m.summary) html += '<div class="kg-summary">' + esc(m.summary) + '</div>';
+      if (m.body_sections && Object.keys(m.body_sections).length) {{
+        html += '<div class="kg-sections">';
+        Object.keys(m.body_sections).forEach(function(sec) {{
+          var txt = m.body_sections[sec];
+          if (!txt) return;
+          html += '<div><div class="kg-section-label">' + esc(sec) + '</div>';
+          html += '<div class="kg-section-body">' + esc(txt) + '</div></div>';
+        }});
+        html += '</div>';
+      }}
     }} else if (kind === 'ki_concept') {{
       var vcol = {{verified:'#52b788',unverified:'#f4a261',rejected:'#e63946'}}[m.verification_status] || '#888';
       html += badge(m.type || 'KI Concept', vcol);
@@ -908,6 +1073,16 @@ class DependencyGrapher:
         html += '</div></span></div>';
       }}
       if (m.summary) html += '<div class="kg-summary">' + esc(m.summary) + '</div>';
+      if (m.body_sections && Object.keys(m.body_sections).length) {{
+        html += '<div class="kg-sections">';
+        Object.keys(m.body_sections).forEach(function(sec) {{
+          var txt = m.body_sections[sec];
+          if (!txt) return;
+          html += '<div><div class="kg-section-label">' + esc(sec) + '</div>';
+          html += '<div class="kg-section-body">' + esc(txt) + '</div></div>';
+        }});
+        html += '</div>';
+      }}
     }}
 
     // Neighbours
@@ -939,6 +1114,7 @@ class DependencyGrapher:
       html += '</div>';
     }}
 
+    if (m.degree !== undefined) html += row('Connections', m.degree);
     html += notionBtn(m.notion_url);
     panelBody.innerHTML = html;
 
@@ -1036,51 +1212,41 @@ class DependencyGrapher:
     if (!currentFocusId) return;
     currentFocusId = null;
 
-    var allNodes = network.body.data.nodes.get();
-    var allEdges = network.body.data.edges.get();
-    var nUpdates = [], eUpdates = [];
-
-    allNodes.forEach(function(n) {{
+    var nUpdates = [], eRestores = [];
+    network.body.data.nodes.get().forEach(function(n) {{
       nUpdates.push({{ id: n.id, opacity: 1, font: {{ color: '#ffffff' }} }});
     }});
-    allEdges.forEach(function(e) {{
-      // restore original colour by removing override
-      eUpdates.push({{ id: e.id, color: undefined }});
+    network.body.data.edges.get().forEach(function(e) {{
+      eRestores.push({{ id: e.id, color: EDGE_ORIG_COLORS[e.id] || '#888888' }});
     }});
-
     network.body.data.nodes.update(nUpdates);
-    // vis-network doesn't properly un-set color with undefined; reset via edge data
-    // Re-render is enough — colour is from initial options
-    network.setData({{ nodes: network.body.data.nodes, edges: network.body.data.edges }});
+    network.body.data.edges.update(eRestores);
     focusBar.classList.remove('visible');
-    closePanel();
   }}
 
   // ── Panel open / close ─────────────────────────────────────────────────
   function openPanel(headerTitle) {{
     panelTitle.textContent = headerTitle || 'Detail';
     panel.classList.add('open');
-    // Shrink graph canvas to leave room for panel
-    var canvas = document.getElementById('mynetwork') || document.querySelector('#mynetwork, .vis-network');
-    if (canvas) canvas.style.width = 'calc(100% - 360px)';
-    try {{ network.redraw(); network.fit(); }} catch(e) {{}}
   }}
 
   function closePanel() {{
     panel.classList.remove('open');
-    var canvas = document.getElementById('mynetwork') || document.querySelector('#mynetwork, .vis-network');
-    if (canvas) canvas.style.width = '100%';
-    try {{ network.redraw(); }} catch(e) {{}}
     exitFocus();
   }}
 
   // ── Wire vis-network events ─────────────────────────────────────────────
   // PyVis uses a global `network` variable — wait until it's available.
+  var EDGE_ORIG_COLORS = {{}};
   function wireEvents() {{
     if (typeof network === 'undefined') {{
       setTimeout(wireEvents, 150);
       return;
     }}
+    network.body.data.edges.get().forEach(function(e) {{
+      var c = e.color;
+      EDGE_ORIG_COLORS[e.id] = (c && typeof c === 'object') ? (c.color || '#888888') : (c || '#888888');
+    }});
     network.on('click', function(params) {{
       if (params.nodes.length > 0) {{
         var nodeId = params.nodes[0];
@@ -1099,6 +1265,43 @@ class DependencyGrapher:
         network.focus(nodeId, {{ scale: 1.5, animation: {{ duration: 500, easingFunction: 'easeInOutQuad' }} }});
       }}
     }});
+    // Fit once after initial stabilisation (safe: does not run on click)
+    network.on('stabilizationIterationsDone', function() {{
+      network.fit({{ animation: {{ duration: 600, easingFunction: 'easeInOutQuad' }} }});
+      setTimeout(function() {{
+        var el = document.getElementById('kg-loading');
+        if (el) el.style.display = 'none';
+      }}, 650);
+    }});
+    // Escape closes panel
+    document.addEventListener('keydown', function(e) {{
+      if (e.key === 'Escape') closePanel();
+    }});
+    // Search / highlight
+    var _si = document.getElementById('kg-search');
+    var _sc = document.getElementById('kg-search-count');
+    if (_si) {{
+      _si.addEventListener('input', function() {{
+        var q = this.value.trim().toLowerCase();
+        var all = network.body.data.nodes.get();
+        if (!q) {{
+          network.body.data.nodes.update(all.map(function(n) {{
+            return {{ id: n.id, opacity: 1, font: {{ color: '#ffffff' }} }};
+          }}));
+          _sc.textContent = '';
+          return;
+        }}
+        var hits = 0;
+        network.body.data.nodes.update(all.map(function(n) {{
+          var meta = NODE_META[n.id] || {{}};
+          var match = (meta.title || '').toLowerCase().indexOf(q) !== -1;
+          if (match) hits++;
+          return {{ id: n.id, opacity: match ? 1 : 0.07,
+                   font: {{ color: match ? '#ffffff' : '#ffffff11' }} }};
+        }}));
+        _sc.textContent = hits + ' match' + (hits !== 1 ? 'es' : '');
+      }});
+    }}
   }}
   wireEvents();
 }})();
@@ -1272,3 +1475,36 @@ class DependencyGrapher:
     @staticmethod
     def _truncate(text: str, max_len: int) -> str:
         return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+    def _parse_page_blocks(self, page_id: str) -> dict[str, str]:
+        """Fetch page body blocks and extract labelled section text."""
+        _SECTIONS = frozenset({
+            "Assumptions", "Statement", "Variables",
+            "Conclusion", "Source Quote", "Interpretation", "Proof Idea",
+        })
+        try:
+            blocks = self.notion.get_block_children(page_id)
+        except Exception:
+            return {}
+        sections: dict[str, list[str]] = {}
+        current: str | None = None
+        for block in blocks:
+            btype = block.get("type", "")
+            if btype == "heading_2":
+                rt = block.get("heading_2", {}).get("rich_text", [])
+                heading = "".join(seg.get("plain_text", "") for seg in rt).strip()
+                if heading in _SECTIONS:
+                    current = heading
+                    sections.setdefault(current, [])
+                else:
+                    current = None
+            elif btype == "paragraph" and current is not None:
+                rt = block.get("paragraph", {}).get("rich_text", [])
+                text = "".join(seg.get("plain_text", "") for seg in rt)
+                if text.strip():
+                    sections[current].append(text)
+            elif btype == "equation" and current is not None:
+                expr = block.get("equation", {}).get("expression", "")
+                if expr.strip():
+                    sections[current].append(f"$${expr}$$")
+        return {k: "\n".join(v).strip() for k, v in sections.items() if v}
