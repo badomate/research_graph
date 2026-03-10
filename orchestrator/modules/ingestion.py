@@ -54,6 +54,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -63,9 +64,10 @@ import re
 import traceback
 import uuid
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import anthropic
 import instructor
@@ -83,6 +85,8 @@ from .extraction_schema import (
     LATEX_FORMATTING_RULES,
     REEXTRACT_SYSTEM_PROMPT,
     ConceptLinkResult,
+    CrossPaperLinkResult,
+    EdgeProposal,
     ExtractionResult,
     MathObject,
     latex_sanity_check,
@@ -108,6 +112,42 @@ NOTION_BLOCKS_PER_REQUEST = 100000
 
 # -- Stage 2 candidate retrieval limit -----------------------------------------
 RETRIEVE_CANDIDATES_K: int = int(os.environ.get("RETRIEVE_CANDIDATES_K", "30"))
+
+# -- Cross-paper pre-filter thresholds -----------------------------------------
+# rapidfuzz score thresholds (0–100 integer scale).
+NAMED_TOOL_MATCH_THRESHOLD: int = int(os.environ.get("NAMED_TOOL_MATCH_THRESHOLD", "85"))
+SETTING_CONTAINMENT_THRESHOLD: int = int(os.environ.get("SETTING_CONTAINMENT_THRESHOLD", "80"))
+# Float thresholds for Jaccard / overlap signals.
+ASSUMPTION_OVERLAP_DROP_THRESHOLD: float = float(
+    os.environ.get("ASSUMPTION_OVERLAP_DROP_THRESHOLD", "0.05")
+)
+KEYWORD_JACCARD_DROP_THRESHOLD: float = float(
+    os.environ.get("KEYWORD_JACCARD_DROP_THRESHOLD", "0.10")
+)
+QDRANT_SIMILARITY_DROP_THRESHOLD: float = float(
+    os.environ.get("QDRANT_SIMILARITY_DROP_THRESHOLD", "0.75")
+)
+
+# -- Composite score weights (must sum to 1.0) ----------------------------------
+WEIGHT_QDRANT: float = float(os.environ.get("WEIGHT_QDRANT", "0.40"))
+WEIGHT_NAMED_TOOL: float = float(os.environ.get("WEIGHT_NAMED_TOOL", "0.25"))
+WEIGHT_ASSUMPTION_OVERLAP: float = float(os.environ.get("WEIGHT_ASSUMPTION_OVERLAP", "0.20"))
+WEIGHT_SETTING_CONTAINMENT: float = float(os.environ.get("WEIGHT_SETTING_CONTAINMENT", "0.10"))
+WEIGHT_KEYWORD_JACCARD: float = float(os.environ.get("WEIGHT_KEYWORD_JACCARD", "0.05"))
+
+# -- Edge creation thresholds --------------------------------------------------
+EDGE_AUTO_CREATE_CONFIDENCE: float = float(
+    os.environ.get("EDGE_AUTO_CREATE_CONFIDENCE", "0.80")
+)
+EDGE_REVIEW_FLAG_CONFIDENCE: float = float(
+    os.environ.get("EDGE_REVIEW_FLAG_CONFIDENCE", "0.65")
+)
+EDGE_MAX_CANDIDATES_TO_GPT: int = int(os.environ.get("EDGE_MAX_CANDIDATES_TO_GPT", "10"))
+
+# -- Candidate hydration -------------------------------------------------------
+NOTION_HYDRATION_CONCURRENCY: int = int(
+    os.environ.get("NOTION_HYDRATION_CONCURRENCY", "5")
+)
 
 # -- Zotero --------------------------------------------------------------------
 ZOTERO_API_BASE = "https://api.zotero.org"
@@ -152,6 +192,255 @@ def _count_tokens(text: str) -> int:
         return len(enc.encode(text))
     except Exception:
         return len(text) // 4
+
+
+# -- Cross-paper edge scoring dataclasses --------------------------------------
+
+
+@dataclass
+class ConceptData:
+    """
+    Fully-hydrated concept data fetched from a Notion page.
+    Used by score_candidate_pair and the new edge-confirmation prompt.
+    """
+
+    notion_page_id: str
+    title: str
+    concept_type: str
+    statement_latex: str
+    assumptions: str
+    conclusion: str
+    setting: list
+    named_tools: list
+    keywords: list
+
+
+@dataclass
+class CandidateScore:
+    """Structural pre-filter scores for a single (C_A, C_B) candidate pair."""
+
+    candidate_id: str           # Notion page ID of C_B
+    qdrant_similarity: float    # raw cosine similarity from Qdrant
+    named_tool_match: bool      # Signal 1
+    assumption_conclusion_overlap: float   # Signal 2, [0, 1]
+    setting_containment: Optional[str]     # Signal 3: "A_in_B" | "B_in_A" | None
+    keyword_jaccard: float                 # Signal 4, [0, 1]
+    composite_score: float                 # weighted combination
+    should_drop: bool                      # True = exclude from GPT call
+
+
+# -- Cross-paper pre-filter helpers --------------------------------------------
+
+# Strip punctuation, lowercase, collapse whitespace for fuzzy string matching.
+_PUNCT_RE = re.compile(r'[^\w\s]')
+_WS_RE = re.compile(r'\s+')
+
+
+def _normalize_for_fuzzy(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    s = s.lower()
+    s = _PUNCT_RE.sub(' ', s)
+    s = _WS_RE.sub(' ', s).strip()
+    return s
+
+
+# LaTeX command pattern — used to strip \command tokens before overlap scoring.
+_LATEX_CMD_RE = re.compile(r'\\[a-zA-Z]+')
+_TOKEN_SEP_RE = re.compile(r'[\s\{\}\[\]\(\)\$,;:\.\|]+')
+
+
+def _tokenize_for_overlap(text: str) -> set:
+    """
+    Tokenize text for assumption/conclusion overlap scoring.
+
+    - Lowercases.
+    - Removes LaTeX command tokens (\\forall, \\mathbb, etc.) to prevent
+      LaTeX boilerplate from inflating scores.
+    - Splits on whitespace and punctuation.
+    - Removes single-character tokens.
+    """
+    text = text.lower()
+    text = _LATEX_CMD_RE.sub(' ', text)
+    tokens = _TOKEN_SEP_RE.split(text)
+    return {t for t in tokens if t and len(t) > 1}
+
+
+def _jaccard(s1: set, s2: set) -> float:
+    """Compute Jaccard similarity between two sets."""
+    union = s1 | s2
+    if not union:
+        return 0.0
+    return len(s1 & s2) / len(union)
+
+
+def score_candidate_pair(
+    concept_a: ConceptData,
+    concept_b: ConceptData,
+    qdrant_similarity: float,
+) -> CandidateScore:
+    """
+    Compute four structural signals for a (C_A, C_B) candidate pair and return
+    a CandidateScore with composite score and drop flag.
+
+    Signal 1 — Named Tool Match (rapidfuzz token_sort_ratio, threshold 85).
+    Signal 2 — Assumption-Conclusion Overlap (token Jaccard, max of both
+                directions).
+    Signal 3 — Setting Containment (rapidfuzz partial_ratio, threshold 80).
+    Signal 4 — Keyword Jaccard (exact match after normalisation).
+    """
+    try:
+        from rapidfuzz import fuzz as _fuzz
+    except ImportError:
+        # rapidfuzz not installed — return a neutral score so the pipeline
+        # degrades gracefully without crashing.
+        logger.warning(
+            "score_candidate_pair: rapidfuzz not installed — returning neutral score."
+        )
+        composite = WEIGHT_QDRANT * qdrant_similarity
+        return CandidateScore(
+            candidate_id=concept_b.notion_page_id,
+            qdrant_similarity=qdrant_similarity,
+            named_tool_match=False,
+            assumption_conclusion_overlap=0.0,
+            setting_containment=None,
+            keyword_jaccard=0.0,
+            composite_score=composite,
+            should_drop=(qdrant_similarity < QDRANT_SIMILARITY_DROP_THRESHOLD),
+        )
+
+    # ── Signal 1: Named Tool Match ────────────────────────────────────────────
+    a_title_norm = _normalize_for_fuzzy(concept_a.title)
+    b_title_norm = _normalize_for_fuzzy(concept_b.title)
+    named_tool_match = False
+
+    for tool in concept_a.named_tools:
+        if _fuzz.token_sort_ratio(
+            _normalize_for_fuzzy(tool), b_title_norm
+        ) >= NAMED_TOOL_MATCH_THRESHOLD:
+            named_tool_match = True
+            break
+
+    if not named_tool_match:
+        for tool in concept_b.named_tools:
+            if _fuzz.token_sort_ratio(
+                _normalize_for_fuzzy(tool), a_title_norm
+            ) >= NAMED_TOOL_MATCH_THRESHOLD:
+                named_tool_match = True
+                break
+
+    # ── Signal 2: Assumption-Conclusion Overlap ───────────────────────────────
+    a_assumptions = _tokenize_for_overlap(concept_a.assumptions)
+    b_conclusion = _tokenize_for_overlap(concept_b.conclusion)
+    b_assumptions = _tokenize_for_overlap(concept_b.assumptions)
+    a_conclusion = _tokenize_for_overlap(concept_a.conclusion)
+
+    overlap1 = _jaccard(a_assumptions, b_conclusion)
+    overlap2 = _jaccard(b_assumptions, a_conclusion)
+    assumption_conclusion_overlap = max(overlap1, overlap2)
+
+    # ── Signal 3: Setting Containment ────────────────────────────────────────
+    setting_containment: Optional[str] = None
+    a_setting_str = " ".join(concept_a.setting) if isinstance(concept_a.setting, list) else str(concept_a.setting or "")
+    b_setting_str = " ".join(concept_b.setting) if isinstance(concept_b.setting, list) else str(concept_b.setting or "")
+
+    if a_setting_str.strip() and b_setting_str.strip():
+        ratio_a_in_b = _fuzz.partial_ratio(
+            a_setting_str.lower(), b_setting_str.lower()
+        )
+        ratio_b_in_a = _fuzz.partial_ratio(
+            b_setting_str.lower(), a_setting_str.lower()
+        )
+        if ratio_a_in_b >= SETTING_CONTAINMENT_THRESHOLD:
+            setting_containment = "A_in_B"
+        elif ratio_b_in_a >= SETTING_CONTAINMENT_THRESHOLD:
+            setting_containment = "B_in_A"
+
+    # ── Signal 4: Keyword Jaccard ─────────────────────────────────────────────
+    kw_a = {k.lower().strip() for k in concept_a.keywords if k}
+    kw_b = {k.lower().strip() for k in concept_b.keywords if k}
+    keyword_jaccard = _jaccard(kw_a, kw_b)
+
+    # ── Composite score ───────────────────────────────────────────────────────
+    composite_score = (
+        WEIGHT_QDRANT * qdrant_similarity
+        + WEIGHT_NAMED_TOOL * float(named_tool_match)
+        + WEIGHT_ASSUMPTION_OVERLAP * assumption_conclusion_overlap
+        + WEIGHT_SETTING_CONTAINMENT * float(setting_containment is not None)
+        + WEIGHT_KEYWORD_JACCARD * keyword_jaccard
+    )
+
+    # ── Drop condition ────────────────────────────────────────────────────────
+    # Named tool match prevents dropping regardless of other signals.
+    if named_tool_match:
+        should_drop = False
+    else:
+        should_drop = (
+            assumption_conclusion_overlap < ASSUMPTION_OVERLAP_DROP_THRESHOLD
+            and setting_containment is None
+            and keyword_jaccard < KEYWORD_JACCARD_DROP_THRESHOLD
+            and qdrant_similarity < QDRANT_SIMILARITY_DROP_THRESHOLD
+        )
+
+    return CandidateScore(
+        candidate_id=concept_b.notion_page_id,
+        qdrant_similarity=qdrant_similarity,
+        named_tool_match=named_tool_match,
+        assumption_conclusion_overlap=assumption_conclusion_overlap,
+        setting_containment=setting_containment,
+        keyword_jaccard=keyword_jaccard,
+        composite_score=composite_score,
+        should_drop=should_drop,
+    )
+
+
+def _dominant_signal(score: CandidateScore) -> str:
+    """Return the name of the highest-firing pre-filter signal, or 'none'."""
+    if score.named_tool_match:
+        return "named_tool_match"
+    if score.assumption_conclusion_overlap >= ASSUMPTION_OVERLAP_DROP_THRESHOLD:
+        return "assumption_conclusion_overlap"
+    if score.setting_containment is not None:
+        return "setting_containment"
+    if score.keyword_jaccard >= KEYWORD_JACCARD_DROP_THRESHOLD:
+        return "keyword_jaccard"
+    return "none"
+
+
+def _assign_review_flag(proposal: EdgeProposal, score: CandidateScore) -> EdgeProposal:
+    """
+    Determine whether an edge should be auto-created cleanly or flagged for
+    human review.  Mutates ``proposal.needs_review`` in place and returns it.
+
+    Routing logic:
+    - High confidence (>= 0.80) + structural signal → needs_review = False
+    - High confidence (>= 0.80) + no signal         → needs_review = True
+    - Medium confidence (0.65–0.80) + structural     → needs_review = True
+    - Otherwise (low confidence or no grounding)     → needs_review = True
+    """
+    has_structural_signal = (
+        score.named_tool_match
+        or score.assumption_conclusion_overlap >= 0.10
+        or score.setting_containment is not None
+    )
+    fields_are_grounded = len(proposal.driving_fields) >= 1
+
+    if not fields_are_grounded:
+        proposal.needs_review = True
+        return proposal
+
+    high_confidence = proposal.confidence >= EDGE_AUTO_CREATE_CONFIDENCE
+    medium_confidence = EDGE_REVIEW_FLAG_CONFIDENCE <= proposal.confidence < EDGE_AUTO_CREATE_CONFIDENCE
+
+    if high_confidence and has_structural_signal:
+        proposal.needs_review = False
+    elif high_confidence and not has_structural_signal:
+        proposal.needs_review = True
+    elif medium_confidence and has_structural_signal:
+        proposal.needs_review = True
+    else:
+        proposal.needs_review = True
+
+    return proposal
 
 # -- Stage 3 linking system prompt ---------------------------------------------
 LINKING_SYSTEM_PROMPT_V1 = """\
@@ -209,6 +498,51 @@ Return ONLY valid JSON matching EXACTLY this schema (all keys required, lists ma
     {"target_concept_id": "string", "target_title": "string", "rationale": "string", "confidence": number}
   ]
 }
+"""
+
+# -- Stage 3 cross-paper edge confirmation system prompt (v2) ------------------
+# Used when Qdrant vector search is active (the "new" enriched prompt path).
+LINKING_SYSTEM_PROMPT_V2 = """\
+You are a mathematical concept relationship analyst. Your job is to determine
+whether a directed logical relationship exists between pairs of mathematical
+concepts.
+
+You will be given:
+- One SOURCE concept (C_A): a concept freshly extracted from a paper.
+- A list of TARGET concepts (C_B, C_C, ...): existing concepts in a mathematical
+  knowledge base.
+
+For each target concept, you must decide:
+1. Does a meaningful logical relationship exist between C_A and this target?
+2. If yes: what is the relation type and direction?
+3. What is your confidence, and which specific fields drove your decision?
+
+CRITICAL RULES:
+- Base your decision ONLY on the mathematical content of the fields provided.
+  Do not use the titles alone to infer relationships.
+- The `justification` field must reference actual content from the concept
+  fields (e.g., specific assumptions, conclusions, or tool names), not just
+  topic labels.
+- The `driving_fields` list must contain the names of the fields from either
+  concept that were the primary evidence. If you cannot identify specific
+  fields as evidence, do not propose the edge.
+- Do not propose an edge of type `related` unless you can identify at least
+  one shared structural element (shared assumption, shared tool, overlapping
+  setting). Topic similarity alone does not justify `related`.
+- For `generalizes` / `special_case_of`: the settings or assumption sets must
+  have a clear containment relationship. State which is more general.
+- For `depends_on` / `enables`: one concept's conclusion must appear
+  (exactly or approximately) in the other's assumptions, OR one concept's
+  named_tools must reference the other.
+- Return an empty proposals list if no relationships meet these criteria. Do not
+  fabricate relationships to be helpful.
+
+DIRECTION CONVENTION:
+- "A_to_B" means the edge goes FROM C_A TO C_B.
+  Example: if C_A depends_on C_B, direction is "A_to_B".
+  Example: if C_A generalizes C_B, direction is "A_to_B".
+- "B_to_A" means the edge goes FROM C_B TO C_A.
+  Example: if C_B depends_on C_A, direction is "B_to_A".
 """
 
 # -- System prompt template -----------------------------------------------------
@@ -776,10 +1110,15 @@ class IngestionEngine:
 
             # -- STAGE 2: Retrieve candidates ----------------------------------
             logger.info("[%s] Stage 2: retrieving candidates from Second Brain ...", run_id)
+            # Build the set of same-paper KI IDs so the pre-filter can skip them.
+            all_ki_ids = {ki_id for _, ki_id in ki_pages}
             concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
             for concept, ki_page_id in ki_pages:
+                same_paper_ids = all_ki_ids - {ki_page_id}
                 candidates = self._retrieve_candidates_for_concept(
-                    concept, sb_index, current_page_id=ki_page_id
+                    concept, sb_index,
+                    current_page_id=ki_page_id,
+                    same_paper_ids=same_paper_ids,
                 )
                 self._update_knowledge_item_candidates(ki_page_id, candidates)
                 concept_candidates.append((concept, ki_page_id, candidates))
@@ -1716,12 +2055,29 @@ class IngestionEngine:
     # -- Stage 3: write edge data to Knowledge Inbox page ----------------------
 
     def _update_knowledge_item_graph_data(
-        self, ki_page_id: str, link_result: ConceptLinkResult
+        self,
+        ki_page_id: str,
+        link_result: ConceptLinkResult | CrossPaperLinkResult,
     ) -> None:
         """
-        Write ConceptLinkResult edges to the KI page and set graph_link_status
-        to "linked-ai". No-op if link_result is empty.
+        Write edge results to the KI page property and append the 3-tier
+        cross-paper edge section to the page body.
+
+        Handles both the legacy ConceptLinkResult (intra-paper / TF-IDF path)
+        and the new CrossPaperLinkResult (cross-paper Qdrant path).
+
+        Sets graph_link_status = "linked-ai" only when at least one edge is
+        produced.
         """
+        if isinstance(link_result, CrossPaperLinkResult):
+            self._update_ki_cross_paper(ki_page_id, link_result)
+        else:
+            self._update_ki_legacy(ki_page_id, link_result)
+
+    def _update_ki_legacy(
+        self, ki_page_id: str, link_result: ConceptLinkResult
+    ) -> None:
+        """Write legacy ConceptLinkResult edges (old format) to KI page."""
         edge_dict = link_result.model_dump(exclude_none=True)
         edge_dict = {k: v for k, v in edge_dict.items() if v}
         if not edge_dict:
@@ -1746,7 +2102,160 @@ class IngestionEngine:
             },
         )
 
+    def _update_ki_cross_paper(
+        self, ki_page_id: str, link_result: CrossPaperLinkResult
+    ) -> None:
+        """
+        Write CrossPaperLinkResult to the KI page:
+
+        1. Serialise proposals (confidence >= EDGE_REVIEW_FLAG_CONFIDENCE) as
+           JSON in the 'Edge Suggestions' property for PromotionEngine.
+        2. Append the 3-tier '## Proposed Cross-Paper Edges' section to the
+           page body.
+        """
+        all_proposals = link_result.proposals
+        low_conf = link_result.low_confidence_suggestions
+
+        if not all_proposals and not low_conf:
+            logger.debug(
+                "KI page %s: no cross-paper edges produced -- remaining 'unlinked'.",
+                ki_page_id,
+            )
+            return
+
+        # -- Write Edge Suggestions property (for PromotionEngine) ------------
+        payload = {
+            "proposals": [p.model_dump() for p in all_proposals],
+        }
+        edge_json = json.dumps(payload, ensure_ascii=False)
+        # Truncate if necessary (Notion 2000-char limit per rich_text segment).
+        if len(edge_json) > NOTION_BLOCK_MAX_CHARS:
+            while all_proposals and len(
+                json.dumps({"proposals": [p.model_dump() for p in all_proposals]},
+                           ensure_ascii=False)
+            ) > NOTION_BLOCK_MAX_CHARS:
+                all_proposals.pop()
+            edge_json = json.dumps(
+                {"proposals": [p.model_dump() for p in all_proposals]},
+                ensure_ascii=False,
+            )
+
+        self.notion.update_page(
+            page_id=ki_page_id,
+            properties={
+                "Edge Suggestions": {
+                    "rich_text": self.notion.rich_text(edge_json)
+                },
+                "Graph Link Status": self._ki_prop("Graph Link Status", "linked-ai"),
+            },
+        )
+
+        # -- Append 3-tier edge section to page body --------------------------
+        edge_blocks = self._render_cross_paper_edges_blocks(
+            proposals=all_proposals,
+            low_confidence_suggestions=low_conf,
+        )
+        if edge_blocks:
+            try:
+                self._append_blocks_in_batches(ki_page_id, edge_blocks)
+            except Exception:
+                logger.warning(
+                    "KI page %s: failed to append cross-paper edge blocks — "
+                    "edge JSON is still stored in Edge Suggestions property.",
+                    ki_page_id,
+                )
+
     # -- Stage 2: candidate retrieval (dispatcher) ----------------------------
+
+    def hydrate_candidates(
+        self,
+        candidate_ids: list[str],
+    ) -> Dict[str, ConceptData]:
+        """
+        Fetch full Notion page data for a list of concept page IDs concurrently.
+
+        Uses a ThreadPoolExecutor with a semaphore of NOTION_HYDRATION_CONCURRENCY
+        to avoid rate-limiting the Notion API.
+
+        Returns a dict mapping notion_page_id → ConceptData.  Any page that
+        cannot be fetched or parsed is silently omitted (missing fields default
+        to empty string / empty list, not an exception).
+        """
+        if not candidate_ids:
+            return {}
+
+        def _fetch_one(page_id: str) -> tuple[str, ConceptData | None]:
+            try:
+                page = self.notion.get_page(page_id)
+                props = page.get("properties", {})
+
+                def _text(key: str) -> str:
+                    try:
+                        segs = props[key]["rich_text"]
+                        return "".join(s.get("plain_text", "") for s in segs)
+                    except (KeyError, TypeError):
+                        return ""
+
+                def _select(key: str) -> str:
+                    try:
+                        return props[key]["select"]["name"] or ""
+                    except (KeyError, TypeError):
+                        return ""
+
+                def _multi(key: str) -> list[str]:
+                    try:
+                        return [o["name"] for o in props[key]["multi_select"]]
+                    except (KeyError, TypeError):
+                        return []
+
+                # Title — try "Name" (SB) then the first title-type property (KI).
+                title = ""
+                try:
+                    title = props["Name"]["title"][0]["plain_text"] or ""
+                except (KeyError, IndexError, TypeError):
+                    pass
+                if not title:
+                    for v in props.values():
+                        if v.get("type") == "title":
+                            try:
+                                title = v["title"][0]["plain_text"] or ""
+                                break
+                            except (KeyError, IndexError, TypeError):
+                                pass
+
+                import re as _re
+                title = _re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
+
+                concept_data = ConceptData(
+                    notion_page_id=page_id,
+                    title=title or "(unknown)",
+                    concept_type=_select("Type") or _select("Concept Type") or "Definition",
+                    statement_latex=_text("Statement LaTeX"),
+                    assumptions=_text("Assumptions"),
+                    conclusion=_text("Conclusion") or _text("Interpretation"),
+                    setting=_multi("Setting"),
+                    named_tools=_multi("Named Tools"),
+                    keywords=_multi("Keywords"),
+                )
+                return page_id, concept_data
+            except Exception:
+                logger.debug(
+                    "hydrate_candidates: failed to fetch page %s — skipping.",
+                    page_id,
+                    exc_info=True,
+                )
+                return page_id, None
+
+        results: Dict[str, ConceptData] = {}
+        max_workers = min(NOTION_HYDRATION_CONCURRENCY, len(candidate_ids))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one, pid): pid for pid in candidate_ids}
+            for future in concurrent.futures.as_completed(futures):
+                pid, data = future.result()
+                if data is not None:
+                    results[pid] = data
+
+        return results
 
     def _retrieve_candidates_for_concept(
         self,
@@ -1754,25 +2263,102 @@ class IngestionEngine:
         sb_index: list[dict],
         k: int = RETRIEVE_CANDIDATES_K,
         current_page_id: str | None = None,
+        same_paper_ids: set | None = None,
     ) -> list[dict]:
         """
         Return top-k candidate concepts for linking.
 
         When VECTOR_INDEX_ENABLED is set and Qdrant is reachable, delegates to
-        VectorIndexEngine.retrieve_candidates (semantic ANN search).
-        Otherwise falls back to TF-IDF token-overlap scoring.
+        VectorIndexEngine.retrieve_candidates (semantic ANN search) and then
+        applies cross-paper pre-filter scoring and reranking.
 
-        ``current_page_id`` — if provided, the concept's own KI page ID is
-        filtered out of the results to prevent self-links.
+        Pre-filter scoring is ONLY applied to cross-paper candidates (concepts
+        whose Notion page ID is not in ``same_paper_ids``).  Same-paper
+        candidates bypass the filter and pass through unchanged.
+
+        Falls back to TF-IDF token-overlap scoring when Qdrant is unavailable.
+
+        ``current_page_id`` — the concept's own KI page ID; excluded from
+        results to prevent self-links.
+        ``same_paper_ids``  — KI page IDs of other concepts from the same paper;
+        these bypass the pre-filter and use existing logic.
         """
-        if self._vector_index and self._vector_index.available:
-            hints = self._vector_index.retrieve_candidates(concept, verified_only=False)
-            # Exclude self.
-            if current_page_id:
-                hints = [h for h in hints if h.notion_page_id != current_page_id]
-            # Convert to the dict format expected by Stage 3.
-            return [h.to_dict() for h in hints[:k]]
-        return self._tfidf_retrieve(concept, sb_index, k)
+        if not (self._vector_index and self._vector_index.available):
+            return self._tfidf_retrieve(concept, sb_index, k)
+
+        # ── Qdrant path ───────────────────────────────────────────────────────
+        hints = self._vector_index.retrieve_candidates(concept, verified_only=False)
+        # Exclude self.
+        if current_page_id:
+            hints = [h for h in hints if h.notion_page_id != current_page_id]
+
+        same_paper_ids = same_paper_ids or set()
+
+        # Separate same-paper and cross-paper candidates.
+        same_paper_hints = [h for h in hints if h.notion_page_id in same_paper_ids]
+        cross_paper_hints = [h for h in hints if h.notion_page_id not in same_paper_ids]
+
+        # ── Apply pre-filter scoring to cross-paper candidates ────────────────
+        cross_paper_dicts: list[dict] = []
+        if cross_paper_hints:
+            cross_ids = [h.notion_page_id for h in cross_paper_hints]
+            logger.debug(
+                "Pre-filter: hydrating %d cross-paper candidate(s) for '%s'.",
+                len(cross_ids), concept.title,
+            )
+            hydrated = self.hydrate_candidates(cross_ids)
+
+            # Build ConceptData for C_A from the MathObject.
+            concept_a_data = ConceptData(
+                notion_page_id=current_page_id or "",
+                title=concept.title,
+                concept_type=concept.type,
+                statement_latex=concept.statement_latex,
+                assumptions=concept.assumptions or "",
+                conclusion=concept.conclusion or "",
+                setting=list(concept.setting) if concept.setting else [],
+                named_tools=list(concept.named_tools) if concept.named_tools else [],
+                keywords=list(concept.canonical_keywords) if concept.canonical_keywords else [],
+            )
+
+            scored: list[tuple[float, dict]] = []
+            n_before = len(cross_paper_hints)
+            dropped = 0
+
+            for hint in cross_paper_hints:
+                concept_b_data = hydrated.get(hint.notion_page_id)
+                if concept_b_data is None:
+                    # Could not hydrate — include with raw Qdrant similarity.
+                    d = hint.to_dict()
+                    d["_pre_filter_signal"] = "none"
+                    scored.append((hint.score, d))
+                    continue
+
+                score = score_candidate_pair(concept_a_data, concept_b_data, hint.score)
+
+                if score.should_drop:
+                    dropped += 1
+                    continue
+
+                d = hint.to_dict()
+                # Attach scoring metadata for use in the GPT prompt.
+                d["_concept_data"] = concept_b_data
+                d["_pre_filter_signal"] = _dominant_signal(score)
+                d["_score_obj"] = score
+                scored.append((score.composite_score, d))
+
+            logger.debug(
+                "Pre-filter '%s': %d → %d candidate(s) (%d dropped).",
+                concept.title, n_before, len(scored), dropped,
+            )
+
+            # Sort descending by composite score, cap at EDGE_MAX_CANDIDATES_TO_GPT.
+            scored.sort(key=lambda x: x[0], reverse=True)
+            cross_paper_dicts = [d for _, d in scored[:EDGE_MAX_CANDIDATES_TO_GPT]]
+
+        # ── Combine same-paper and (reranked) cross-paper candidates ──────────
+        same_paper_dicts = [h.to_dict() for h in same_paper_hints]
+        return same_paper_dicts + cross_paper_dicts
 
     def _tfidf_retrieve(
         self,
@@ -1823,8 +2409,16 @@ class IngestionEngine:
     def _update_knowledge_item_candidates(
         self, ki_page_id: str, candidates: list[dict]
     ) -> None:
-        """Write the Stage 2 candidate list to the KI 'Candidate Matches' property."""
-        slim = candidates[:]
+        """Write the Stage 2 candidate list to the KI 'Candidate Matches' property.
+
+        Private keys (prefixed with '_') attached by the pre-filter scorer are
+        stripped before serialisation — they hold non-JSON-serialisable objects.
+        """
+        # Strip private metadata (ConceptData objects, CandidateScore objects).
+        slim = [
+            {k: v for k, v in c.items() if not k.startswith("_")}
+            for c in candidates
+        ]
         s = json.dumps(slim, ensure_ascii=False)
         while len(s) > NOTION_BLOCK_MAX_CHARS and len(slim) > 1:
             slim.pop()
@@ -1843,19 +2437,31 @@ class IngestionEngine:
         concept: MathObject,
         candidates: list[dict],
         run_id: str,
-    ) -> ConceptLinkResult:
+    ) -> ConceptLinkResult | CrossPaperLinkResult:
         """
-        Call the OpenAI linking prompt and validate the result.
-        Returns an empty ConceptLinkResult if there are no candidates or
-        if the LLM response cannot be validated.
+        Call the LLM linking prompt and return edge proposals.
+
+        When candidates include pre-filter metadata (Qdrant path), the new
+        enriched prompt (v2) is used and a CrossPaperLinkResult is returned.
+        Otherwise the legacy prompt is used and a ConceptLinkResult is returned.
+
+        Returns an empty ConceptLinkResult on failure or when there are no
+        candidates.
         """
         if not candidates:
             return ConceptLinkResult()
+
+        # Check whether any cross-paper candidates have been hydrated.
+        has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
+
         try:
-            result = self._call_openai_link(concept, candidates)
+            if has_cross_paper:
+                result = self._call_claude_link_v2(concept, candidates)
+            else:
+                result = self._call_openai_link(concept, candidates)
         except Exception:
             logger.warning(
-                "[%s] _call_openai_link failed for '%s'.", run_id, concept.title
+                "[%s] LLM linking failed for '%s'.", run_id, concept.title
             )
             return ConceptLinkResult()
         return result
@@ -1864,7 +2470,7 @@ class IngestionEngine:
     def _call_openai_link(
         self, concept: MathObject, candidates: list[dict]
     ) -> ConceptLinkResult:
-        """Invoke the Stage 3 linking prompt via OpenAI."""
+        """Invoke the Stage 3 linking prompt (legacy v1) via Claude."""
         candidate_lines = "\n".join(
             f"{i + 1}. [id:{r.get('id', '')}] {r['title']}"
             + (f" [{r['hub']}]" if r.get("hub") else "")
@@ -1895,6 +2501,195 @@ class IngestionEngine:
             response_model=ConceptLinkResult,
         )
         return result
+
+    @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=2, min=10, max=120))
+    def _call_claude_link_v2(
+        self, concept: MathObject, candidates: list[dict]
+    ) -> CrossPaperLinkResult:
+        """
+        Invoke the enriched Stage 3 cross-paper edge confirmation prompt (v2).
+
+        Builds a detailed user message with full concept fields for C_A and
+        every candidate, including pre-filter signal annotations.  Parses the
+        response into CrossPaperLinkResult, applying the review-flag routing
+        logic to each EdgeProposal.
+
+        On parse failure, logs the raw response and returns an empty
+        CrossPaperLinkResult (pipeline continues in degraded mode).
+        """
+        # ── Build user message ────────────────────────────────────────────────
+        _MAX_LATEX = 800
+
+        def _fmt_latex(s: str) -> str:
+            if not s:
+                return "(not recorded)"
+            if len(s) > _MAX_LATEX:
+                return s[:_MAX_LATEX] + " [truncated]"
+            return s
+
+        def _fmt_field(s: str) -> str:
+            return s if s else "(not recorded)"
+
+        # Source concept (C_A)
+        src_lines = [
+            "## Source Concept (C_A)",
+            "",
+            f"Title: {concept.title}",
+            f"Type: {concept.type}",
+            f"Setting: {_fmt_field(', '.join(concept.setting) if concept.setting else '')}",
+            f"Statement (LaTeX): {_fmt_latex(concept.statement_latex)}",
+            f"Assumptions: {_fmt_field(concept.assumptions)}",
+            f"Conclusion: {_fmt_field(concept.conclusion)}",
+            f"Named Tools: {', '.join(concept.named_tools) if concept.named_tools else 'none'}",
+            f"Keywords: {', '.join(concept.canonical_keywords)}",
+            "",
+            "---",
+            "",
+            "## Target Concepts",
+            "",
+        ]
+
+        for i, cand in enumerate(candidates, start=1):
+            cd: ConceptData | None = cand.get("_concept_data")
+            sig = cand.get("_pre_filter_signal", "")
+            score_obj: CandidateScore | None = cand.get("_score_obj")
+
+            if cd is not None:
+                # Cross-paper candidate — full context available.
+                setting_str = (
+                    ", ".join(cd.setting)
+                    if isinstance(cd.setting, list)
+                    else str(cd.setting or "")
+                )
+                named_tools_str = (
+                    ", ".join(cd.named_tools) if cd.named_tools else "none"
+                )
+                keywords_str = (
+                    ", ".join(cd.keywords) if cd.keywords else "none"
+                )
+                signal_desc = ""
+                if score_obj is not None:
+                    parts = []
+                    if score_obj.named_tool_match:
+                        parts.append("named_tool_match=True")
+                    if score_obj.assumption_conclusion_overlap > 0:
+                        parts.append(
+                            f"assumption_conclusion_overlap="
+                            f"{score_obj.assumption_conclusion_overlap:.2f}"
+                        )
+                    if score_obj.setting_containment:
+                        parts.append(f"setting_containment={score_obj.setting_containment}")
+                    if score_obj.keyword_jaccard > 0:
+                        parts.append(f"keyword_jaccard={score_obj.keyword_jaccard:.2f}")
+                    signal_desc = ", ".join(parts) if parts else "no signals fired"
+
+                target_lines = [
+                    f"### Target {i}: {cd.title}",
+                    f"Notion Page ID: {cd.notion_page_id}",
+                    f"Type: {cd.concept_type}",
+                    f"Setting: {_fmt_field(setting_str)}",
+                    f"Statement (LaTeX): {_fmt_latex(cd.statement_latex)}",
+                    f"Assumptions: {_fmt_field(cd.assumptions)}",
+                    f"Conclusion: {_fmt_field(cd.conclusion)}",
+                    f"Named Tools: {named_tools_str}",
+                    f"Keywords: {keywords_str}",
+                ]
+                if signal_desc:
+                    target_lines.append(f"[Pre-filter signals: {signal_desc}]")
+            else:
+                # Same-paper candidate or un-hydrated candidate — basic info.
+                target_lines = [
+                    f"### Target {i}: {cand.get('title', '(unknown)')}",
+                    f"Notion Page ID: {cand.get('id', '')}",
+                    f"Type: {cand.get('concept_type', '')}",
+                    f"Setting: (not recorded)",
+                    f"Statement (LaTeX): (not recorded)",
+                    f"Assumptions: (not recorded)",
+                    f"Conclusion: (not recorded)",
+                    f"Named Tools: none",
+                    f"Keywords: {cand.get('edge_type_hint', 'none')}",
+                ]
+
+            src_lines.extend(target_lines)
+            src_lines.append("")
+
+        src_lines += [
+            "---",
+            "",
+            "Return a JSON object with a 'proposals' key containing a list of "
+            "EdgeProposal objects. Return {\"proposals\": []} if no relationships "
+            "are warranted. Do not include any text outside the JSON.",
+        ]
+
+        user_message = "\n".join(src_lines)
+
+        # ── Claude call with structured output ────────────────────────────────
+        try:
+            result: CrossPaperLinkResult = self.claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=4096,
+                system=LINKING_SYSTEM_PROMPT_V2,
+                messages=[{"role": "user", "content": user_message}],
+                response_model=CrossPaperLinkResult,
+            )
+        except Exception:
+            logger.warning(
+                "_call_claude_link_v2: Claude call failed for '%s'.", concept.title,
+                exc_info=True,
+            )
+            return CrossPaperLinkResult()
+
+        # ── Build a lookup from candidate notion_page_id → CandidateScore ────
+        scores_by_id: Dict[str, CandidateScore] = {}
+        for cand in candidates:
+            score_obj = cand.get("_score_obj")
+            if score_obj is not None:
+                scores_by_id[cand.get("id", "")] = score_obj
+
+        # ── Apply post-call routing: confidence tiers, pre_filter_signal ──────
+        proposals: list[EdgeProposal] = []
+        low_confidence: list[EdgeProposal] = []
+
+        for proposal in result.proposals:
+            pid = proposal.target_notion_page_id
+
+            # Look up the dominant signal for this candidate.
+            # Fall back to scanning candidates by title if ID not in scores_by_id.
+            score_obj = scores_by_id.get(pid)
+            if score_obj is None:
+                for cand in candidates:
+                    if cand.get("_concept_data") and cand["_concept_data"].notion_page_id == pid:
+                        score_obj = cand.get("_score_obj")
+                        break
+
+            if score_obj is not None:
+                proposal.pre_filter_signal = _dominant_signal(score_obj)
+            else:
+                # No score available (same-paper or un-hydrated).
+                proposal.pre_filter_signal = "none"
+                # Provide a neutral CandidateScore for review-flag logic.
+                score_obj = CandidateScore(
+                    candidate_id=pid,
+                    qdrant_similarity=0.0,
+                    named_tool_match=False,
+                    assumption_conclusion_overlap=0.0,
+                    setting_containment=None,
+                    keyword_jaccard=0.0,
+                    composite_score=0.0,
+                    should_drop=False,
+                )
+
+            if proposal.confidence < EDGE_REVIEW_FLAG_CONFIDENCE:
+                # Below creation threshold — informational hint only.
+                low_confidence.append(proposal)
+            else:
+                _assign_review_flag(proposal, score_obj)
+                proposals.append(proposal)
+
+        return CrossPaperLinkResult(
+            proposals=proposals,
+            low_confidence_suggestions=low_confidence,
+        )
 
     # -- Re-extraction flow (REQ-5) --------------------------------------------
 
@@ -2122,6 +2917,112 @@ class IngestionEngine:
     def _divider_block() -> dict:
         """Build a Notion divider block."""
         return {"object": "block", "type": "divider", "divider": {}}
+
+    # -- Cross-paper edge rendering (Part 3) -----------------------------------
+    #
+    # Human review workflow for flagged edges:
+    #
+    #   ✅ Auto-Created (needs_review=False):
+    #      The edge already exists in Edges DB.  No action required.
+    #      The callout is informational — it shows WHY the edge was created.
+    #
+    #   ⚠️  Flagged — Requires Your Decision (needs_review=True):
+    #      The edge EXISTS in Edges DB but is flagged for human confirmation.
+    #      - Accept: open the edge page in Edges DB, uncheck 'needs_review'.
+    #      - Reject: delete the edge page from Edges DB.
+    #      The checkbox in Notion is a VISUAL PROMPT only — checking it does
+    #      NOT automatically update the Edges DB.
+    #
+    #   💡 Low-Confidence Suggestions (confidence < EDGE_REVIEW_FLAG_CONFIDENCE):
+    #      These edges were NOT written to Edges DB.  They are similarity hints
+    #      only.  If you want to create one, do so manually in the Edges DB.
+
+    def _render_cross_paper_edges_blocks(
+        self,
+        proposals: list[EdgeProposal],
+        low_confidence_suggestions: list[EdgeProposal],
+    ) -> list[dict]:
+        """
+        Build Notion block children for the '## Proposed Cross-Paper Edges'
+        section appended to every KI page that has cross-paper edge proposals.
+
+        Three subsections:
+          1. Auto-Created Edges (needs_review=False)  — green callout blocks
+          2. Flagged Edges (needs_review=True)         — to-do blocks
+          3. Low-Confidence Suggestions               — bulleted list (gray)
+        """
+        if not proposals and not low_confidence_suggestions:
+            return []
+
+        blocks: list[dict] = [
+            self._divider_block(),
+            self._heading_block("Proposed Cross-Paper Edges"),
+        ]
+
+        # ── Sub-section 1: Auto-Created ────────────────────────────────────────
+        auto_created = [p for p in proposals if not p.needs_review]
+        if auto_created:
+            blocks.append(self._heading_block("Auto-Created Edges"))
+            for p in auto_created:
+                text = (
+                    f"✅ {p.relation_type} → {p.target_concept_title}\n"
+                    f"   Confidence: {p.confidence:.0%}\n"
+                    f"   Why: {p.justification}\n"
+                    f"   Fields: {', '.join(p.driving_fields)}\n"
+                    f"   Signal: {p.pre_filter_signal or 'none'}"
+                )
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            {"type": "text", "text": {"content": text[:2000]}}
+                        ],
+                        "icon": {"type": "emoji", "emoji": "✅"},
+                        "color": "green_background",
+                    },
+                })
+
+        # ── Sub-section 2: Flagged — Requires Decision ─────────────────────────
+        flagged = [p for p in proposals if p.needs_review]
+        if flagged:
+            blocks.append(self._heading_block("Flagged Edges — Requires Your Decision"))
+            for p in flagged:
+                text = (
+                    f"⚠️ {p.relation_type} → {p.target_concept_title}  "
+                    f"Confidence: {p.confidence:.0%}\n"
+                    f"   Why: {p.justification}\n"
+                    f"   Fields: {', '.join(p.driving_fields)}\n"
+                    f"   Signal: {p.pre_filter_signal or 'none'}\n"
+                    f"   → Accept: open edge in Edges DB, uncheck needs_review. "
+                    f"Reject: delete edge from Edges DB."
+                )
+                blocks.append(self._todo_block(text))
+
+        # ── Sub-section 3: Low-Confidence Suggestions ─────────────────────────
+        if low_confidence_suggestions:
+            blocks.append(self._heading_block("Low-Confidence Suggestions"))
+            for p in low_confidence_suggestions:
+                text = (
+                    f"💡 {p.relation_type} → {p.target_concept_title}  "
+                    f"Confidence: {p.confidence:.0%}  [NOT auto-created — similarity hint only]\n"
+                    f"   Why: {p.justification}"
+                )
+                blocks.append({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": text[:2000]},
+                                "annotations": {"color": "gray"},
+                            }
+                        ]
+                    },
+                })
+
+        return blocks
 
     # -- Review checklist (REQ-8) ----------------------------------------------
 

@@ -47,3 +47,9 @@ qdrant-client>=1.9.0
 sentence-transformers>=2.7.0
 
 peft
+
+# ── Fuzzy string matching (Module 7 pre-filters) ─────────────────────────────
+# Used for named-tool match and setting-containment signals in cross-paper
+# edge quality scoring.  Drop-in replacement for fuzzywuzzy with no
+# Levenshtein C-extension dependency and significantly better performance.
+rapidfuzz>=3.0.0

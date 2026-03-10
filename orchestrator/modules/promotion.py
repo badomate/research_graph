@@ -179,6 +179,10 @@ class PromotionEngine:
         rationale: str,
         confidence: float,
         source_paper_ids: list[str],
+        needs_review: bool = False,
+        driving_fields: list | None = None,
+        pre_filter_signal: str = "",
+        justification: str = "",
     ) -> None:
         if not self.deferred_edges_db:
             logger.warning(
@@ -612,16 +616,41 @@ class PromotionEngine:
         edges            = self._parse_edge_suggestions(props, ki_page_id)
 
         edges_created = 0
-        for rel_type, target_title, rationale, confidence in edges:
-            target_sb_id = self._sb_title_cache.get(target_title)
+        for edge_entry in edges:
+            rel_type        = edge_entry["relation_type"]
+            target_title    = edge_entry["target_title"]
+            rationale       = edge_entry["rationale"]
+            confidence      = edge_entry["confidence"]
+            needs_review    = edge_entry.get("needs_review", False)
+            driving_fields  = edge_entry.get("driving_fields", [])
+            pre_filter_signal = edge_entry.get("pre_filter_signal", "")
+            justification   = edge_entry.get("justification", rationale)
+            target_page_id  = edge_entry.get("target_notion_page_id", "")
+
+            # Resolve target SB page ID.
+            # 1. If we have a direct target_notion_page_id, check if it maps to
+            #    a promoted SB concept via the title cache (may already be SB).
+            # 2. Fall back to title lookup.
+            target_sb_id = None
+            if target_page_id:
+                # Check if it's already an SB ID (in cache values).
+                if target_page_id in self._sb_title_cache.values():
+                    target_sb_id = target_page_id
+            if not target_sb_id:
+                target_sb_id = self._sb_title_cache.get(target_title)
+            effective_rationale = rationale or justification
             if not target_sb_id:
                 self._defer_edge(
                     from_sb_id=from_sb_id,
                     target_title=target_title,
                     relation_type=rel_type,
-                    rationale=rationale,
+                    rationale=effective_rationale,
                     confidence=confidence,
                     source_paper_ids=source_paper_ids,
+                    needs_review=needs_review,
+                    driving_fields=driving_fields,
+                    pre_filter_signal=pre_filter_signal,
+                    justification=justification,
                 )
                 continue
             try:
@@ -629,9 +658,13 @@ class PromotionEngine:
                     from_sb_id=from_sb_id,
                     to_sb_id=target_sb_id,
                     relation_type=rel_type,
-                    rationale=rationale,
+                    rationale=effective_rationale,
                     confidence=confidence,
                     source_paper_ids=source_paper_ids,
+                    needs_review=needs_review,
+                    driving_fields=driving_fields,
+                    pre_filter_signal=pre_filter_signal,
+                    justification=justification,
                 )
                 edges_created += 1
             except Exception:
@@ -650,23 +683,30 @@ class PromotionEngine:
 
     def _parse_edge_suggestions(
         self, props: dict, ki_page_id: str
-    ) -> list[_EdgeEntry]:
+    ) -> list[dict]:
         """
-        Parse the Edge Suggestions JSON property into a flat list of
-        (relation_type, target_title, rationale, confidence) tuples.
+        Parse the Edge Suggestions JSON property into a flat list of edge
+        entry dicts.
 
-        Handles the ConceptLinkResult format written by Stage 3:
-            {
-              "depends_on": [
-                {"target_concept_id": "...", "target_title": "...",
-                 "rationale": "...", "confidence": 0.9},
-                ...
-              ],
-              ...
-            }
+        Handles three formats:
 
-        Also handles the legacy flat-list format for backward compatibility:
-            [{"relation_type": "...", "target_name": "..."}]
+        1. New CrossPaperLinkResult format (written by Stage 3 v2):
+           {"proposals": [{source_concept_title, target_concept_title,
+                           target_notion_page_id, relation_type, direction,
+                           confidence, justification, driving_fields,
+                           pre_filter_signal, needs_review}, ...]}
+
+        2. Legacy ConceptLinkResult dict format (written by Stage 3 v1):
+           {"depends_on": [{"target_concept_id": "...", "target_title": "...",
+                            "rationale": "...", "confidence": 0.9}], ...}
+
+        3. Legacy flat-list format (very old):
+           [{"relation_type": "...", "target_name": "..."}]
+
+        Returns a list of dicts with at least:
+          relation_type, target_title, rationale, confidence,
+          needs_review, driving_fields, pre_filter_signal,
+          justification, target_notion_page_id.
         """
         raw = self._get_text(props, "Edge Suggestions")
         if not raw:
@@ -681,27 +721,72 @@ class PromotionEngine:
             )
             return []
 
-        edges: list[_EdgeEntry] = []
+        edges: list[dict] = []
 
+        # ── Format 1: New CrossPaperLinkResult ────────────────────────────────
+        if isinstance(parsed, dict) and "proposals" in parsed:
+            for entry in parsed.get("proposals", []):
+                if not isinstance(entry, dict):
+                    continue
+                target_title = (
+                    entry.get("target_concept_title", "").strip()
+                    or entry.get("target_title", "").strip()
+                )
+                if not target_title:
+                    continue
+                edges.append({
+                    "relation_type":      entry.get("relation_type", "related"),
+                    "target_title":       target_title,
+                    "rationale":          entry.get("justification", ""),
+                    "justification":      entry.get("justification", ""),
+                    "confidence":         float(entry.get("confidence", 0.0)),
+                    "needs_review":       bool(entry.get("needs_review", False)),
+                    "driving_fields":     entry.get("driving_fields", []),
+                    "pre_filter_signal":  entry.get("pre_filter_signal", ""),
+                    "target_notion_page_id": entry.get("target_notion_page_id", ""),
+                })
+            return edges
+
+        # ── Format 2: Legacy ConceptLinkResult dict ───────────────────────────
         if isinstance(parsed, dict):
             for rel_type, targets in parsed.items():
                 if not isinstance(targets, list):
                     continue
                 for entry in targets:
                     if isinstance(entry, str):
-                        # Bare string — no rationale or confidence available.
                         t = entry.strip()
                         if t:
-                            edges.append((rel_type, t, "", 0.0))
+                            edges.append({
+                                "relation_type": rel_type,
+                                "target_title": t,
+                                "rationale": "",
+                                "justification": "",
+                                "confidence": 0.0,
+                                "needs_review": False,
+                                "driving_fields": [],
+                                "pre_filter_signal": "",
+                                "target_notion_page_id": "",
+                            })
                     elif isinstance(entry, dict):
                         target_title = entry.get("target_title", "").strip()
                         rationale    = entry.get("rationale", "")
                         confidence   = float(entry.get("confidence", 0.0))
                         if target_title:
-                            edges.append((rel_type, target_title, rationale, confidence))
+                            edges.append({
+                                "relation_type":      rel_type,
+                                "target_title":       target_title,
+                                "rationale":          rationale,
+                                "justification":      rationale,
+                                "confidence":         confidence,
+                                "needs_review":       False,
+                                "driving_fields":     [],
+                                "pre_filter_signal":  "",
+                                "target_notion_page_id": entry.get("target_concept_id", ""),
+                            })
+            return edges
 
-        elif isinstance(parsed, list):
-            # Legacy flat-list fallback.
+        # ── Format 3: Legacy flat-list ────────────────────────────────────────
+        if isinstance(parsed, list):
             for entry in parsed:
                 if not isinstance(entry, dict):
                     continue
@@ -710,7 +795,17 @@ class PromotionEngine:
                 rationale  = entry.get("rationale", "")
                 confidence = float(entry.get("confidence", 0.0))
                 if target:
-                    edges.append((rel_type, target.strip(), rationale, confidence))
+                    edges.append({
+                        "relation_type":      rel_type,
+                        "target_title":       target.strip(),
+                        "rationale":          rationale,
+                        "justification":      rationale,
+                        "confidence":         confidence,
+                        "needs_review":       False,
+                        "driving_fields":     [],
+                        "pre_filter_signal":  "",
+                        "target_notion_page_id": "",
+                    })
 
         return edges
 
@@ -1168,8 +1263,17 @@ class PromotionEngine:
         rationale: str,
         confidence: float,
         source_paper_ids: list[str],
+        needs_review: bool = False,
+        driving_fields: list | None = None,
+        pre_filter_signal: str = "",
+        justification: str = "",
     ) -> None:
-        """Create a single row in the Edges DB."""
+        """Create a single row in the Edges DB.
+
+        New fields (needs_review, driving_fields, pre_filter_signal,
+        justification) are written when the DB schema includes them; they are
+        silently ignored otherwise — existing deployments are unaffected.
+        """
         edge_title = f"{relation_type}: {to_sb_id[:8]}"
 
         edge_props: dict[str, Any] = {
@@ -1184,14 +1288,36 @@ class PromotionEngine:
             "AI Confidence": {"number": confidence},
         }
 
-        if rationale:
+        if rationale or justification:
             edge_props["Rationale"] = {
                 "rich_text": [
-                    {"type": "text", "text": {"content": rationale[:2000]}}
+                    {"type": "text", "text": {"content": (rationale or justification)[:2000]}}
                 ]
             }
         if source_paper_ids:
             edge_props["Source Papers"] = self.notion.relation_prop(source_paper_ids)
+
+        # ── New schema fields (Part 3) ─────────────────────────────────────────
+        # These are written only if the value is meaningful so existing Edges DB
+        # rows that predate this schema change are not polluted with empty values.
+        edge_props["needs_review"] = self.notion.checkbox_prop(needs_review)
+
+        if driving_fields:
+            edge_props["driving_fields"] = {
+                "rich_text": [
+                    {"type": "text", "text": {
+                        "content": ", ".join(driving_fields)[:2000]
+                    }}
+                ]
+            }
+        if pre_filter_signal:
+            edge_props["pre_filter_signal"] = self.notion.select_prop(pre_filter_signal)
+        if justification and justification != rationale:
+            edge_props["justification"] = {
+                "rich_text": [
+                    {"type": "text", "text": {"content": justification[:2000]}}
+                ]
+            }
 
         self.notion.create_page(
             parent={"database_id": self.edges_db},
