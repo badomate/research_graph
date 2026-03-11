@@ -183,6 +183,7 @@ class PromotionEngine:
         driving_fields: list | None = None,
         pre_filter_signal: str = "",
         justification: str = "",
+        falsifiability: str = "",
     ) -> None:
         if not self.deferred_edges_db:
             logger.warning(
@@ -602,11 +603,15 @@ class PromotionEngine:
 
     def _promote_concept_edges(self, item: dict, from_sb_id: str) -> int:
         """
-        Create Edges DB rows for all edge suggestions on a KI item.
+        Create Edges DB rows for all auto-channel edge suggestions on a KI item.
 
         Both source (from_sb_id, already resolved) and targets are SB page
         IDs resolved via _sb_title_cache.  Targets not present in the cache
         (i.e. concepts that were never promoted) are skipped with a log entry.
+
+        Only channel='auto' edges are written to the Edges DB.  channel='suggest'
+        edges appear in the KI page body for human review and are never
+        auto-created.
 
         Returns the number of edges successfully created.
         """
@@ -617,15 +622,26 @@ class PromotionEngine:
 
         edges_created = 0
         for edge_entry in edges:
-            rel_type        = edge_entry["relation_type"]
-            target_title    = edge_entry["target_title"]
-            rationale       = edge_entry["rationale"]
-            confidence      = edge_entry["confidence"]
-            needs_review    = edge_entry.get("needs_review", False)
-            driving_fields  = edge_entry.get("driving_fields", [])
+            # Skip suggest-channel edges — they are never auto-created.
+            if edge_entry.get("channel", "auto") == "suggest":
+                logger.debug(
+                    "PromotionEngine [pass 2]: skipping suggest-channel edge "
+                    "'%s' → '%s' on KI page %s.",
+                    edge_entry.get("relation_type"), edge_entry.get("target_title"),
+                    ki_page_id,
+                )
+                continue
+
+            rel_type          = edge_entry["relation_type"]
+            target_title      = edge_entry["target_title"]
+            rationale         = edge_entry["rationale"]
+            confidence        = edge_entry["confidence"]
+            needs_review      = edge_entry.get("needs_review", False)
+            driving_fields    = edge_entry.get("driving_fields", [])
             pre_filter_signal = edge_entry.get("pre_filter_signal", "")
-            justification   = edge_entry.get("justification", rationale)
-            target_page_id  = edge_entry.get("target_notion_page_id", "")
+            justification     = edge_entry.get("justification", rationale)
+            target_page_id    = edge_entry.get("target_notion_page_id", "")
+            falsifiability    = edge_entry.get("falsifiability", "")
 
             # Resolve target SB page ID.
             # 1. If we have a direct target_notion_page_id, check if it maps to
@@ -651,6 +667,7 @@ class PromotionEngine:
                     driving_fields=driving_fields,
                     pre_filter_signal=pre_filter_signal,
                     justification=justification,
+                    falsifiability=falsifiability,
                 )
                 continue
             try:
@@ -665,6 +682,7 @@ class PromotionEngine:
                     driving_fields=driving_fields,
                     pre_filter_signal=pre_filter_signal,
                     justification=justification,
+                    falsifiability=falsifiability,
                 )
                 edges_created += 1
             except Exception:
@@ -744,6 +762,8 @@ class PromotionEngine:
                     "driving_fields":     entry.get("driving_fields", []),
                     "pre_filter_signal":  entry.get("pre_filter_signal", ""),
                     "target_notion_page_id": entry.get("target_notion_page_id", ""),
+                    "channel":            entry.get("channel", "auto"),
+                    "falsifiability":     entry.get("falsifiability", ""),
                 })
             return edges
 
@@ -1267,12 +1287,16 @@ class PromotionEngine:
         driving_fields: list | None = None,
         pre_filter_signal: str = "",
         justification: str = "",
+        falsifiability: str = "",
+        channel: str = "auto",
+        temperature_stable: bool = False,
     ) -> None:
         """Create a single row in the Edges DB.
 
         New fields (needs_review, driving_fields, pre_filter_signal,
-        justification) are written when the DB schema includes them; they are
-        silently ignored otherwise — existing deployments are unaffected.
+        justification, falsifiability, channel, temperature_stable) are written
+        when the DB schema includes them; they are silently ignored otherwise —
+        existing deployments are unaffected.
         """
         edge_title = f"{relation_type}: {to_sb_id[:8]}"
 
@@ -1297,10 +1321,10 @@ class PromotionEngine:
         if source_paper_ids:
             edge_props["Source Papers"] = self.notion.relation_prop(source_paper_ids)
 
-        # ── New schema fields (Part 3) ─────────────────────────────────────────
-        # These are written only if the value is meaningful so existing Edges DB
-        # rows that predate this schema change are not polluted with empty values.
+        # ── New schema fields (dual-channel system) ────────────────────────────
         edge_props["needs_review"] = self.notion.checkbox_prop(needs_review)
+        edge_props["channel"] = self.notion.select_prop(channel)
+        edge_props["temperature_stable"] = self.notion.checkbox_prop(temperature_stable)
 
         if driving_fields:
             edge_props["driving_fields"] = {
@@ -1310,14 +1334,20 @@ class PromotionEngine:
                     }}
                 ]
             }
-        if pre_filter_signal:
-            edge_props["pre_filter_signal"] = self.notion.select_prop(pre_filter_signal)
-        if justification and justification != rationale:
+        if falsifiability:
+            edge_props["falsifiability"] = {
+                "rich_text": [
+                    {"type": "text", "text": {"content": falsifiability[:2000]}}
+                ]
+            }
+        if justification:
             edge_props["justification"] = {
                 "rich_text": [
                     {"type": "text", "text": {"content": justification[:2000]}}
                 ]
             }
+        if pre_filter_signal:
+            edge_props["pre_filter_signal"] = self.notion.select_prop(pre_filter_signal)
 
         self.notion.create_page(
             parent={"database_id": self.edges_db},

@@ -81,6 +81,7 @@ from webdav3.client import Client as WebDAVClient
 
 from .extraction_schema import (
     EDGE_CAPS,
+    EDGE_CONFIRMATION_SYSTEM_PROMPT,
     EXTRACTION_VERSION,
     LATEX_FORMATTING_RULES,
     REEXTRACT_SYSTEM_PROMPT,
@@ -172,6 +173,11 @@ TOKEN_THRESHOLD_WARN  = 60_000   # above this: log warning, still chunk
 # -- Two-pass extraction feature flag (Layer 3) --------------------------------
 ENABLE_TWO_PASS_EXTRACTION: bool = os.environ.get(
     "ENABLE_TWO_PASS_EXTRACTION", "false"
+).lower() in ("1", "true", "yes")
+
+# -- Two-temperature validation feature flag (dual-channel edge system) --------
+ENABLE_TWO_TEMPERATURE_VALIDATION: bool = os.environ.get(
+    "ENABLE_TWO_TEMPERATURE_VALIDATION", "false"
 ).lower() in ("1", "true", "yes")
 
 # Minimum token count to consider two-pass (all three criteria must be met).
@@ -490,6 +496,81 @@ def _assign_review_flag(proposal: EdgeProposal, score: CandidateScore) -> EdgePr
         proposal.needs_review = True
 
     return proposal
+
+
+def _relation_type_valid(p: EdgeProposal) -> bool:
+    """
+    Enforce the relation type constraint table from the dual-channel prompt.
+
+    Returns True if the relation type is valid for the source/target type pair,
+    or if type info is unavailable (cannot validate).
+    """
+    constraints: dict[tuple[str, str], set[str]] = {
+        ("Theorem",    "Theorem"):    {"depends_on", "generalizes", "special_case_of"},
+        ("Theorem",    "Definition"): {"depends_on"},
+        ("Theorem",    "Lemma"):      {"depends_on"},
+        ("Definition", "Definition"): {"generalizes", "special_case_of"},
+        ("Definition", "Theorem"):    set(),  # never in auto
+        ("Lemma",      "Theorem"):    {"enables"},
+        ("Algorithm",  "Theorem"):    {"depends_on"},
+        ("Assumption", "Theorem"):    {"enables"},
+    }
+    if p.source_type is None or p.target_type is None:
+        return True  # cannot validate without type info — allow
+    key = (p.source_type, p.target_type)
+    allowed = constraints.get(
+        key,
+        {"depends_on", "enables", "generalizes", "special_case_of", "related"},
+    )
+    return p.relation_type in allowed
+
+
+def route_edge_proposals(
+    proposals: list,  # list[EdgeProposal]
+    scores: dict,     # dict[str, CandidateScore]
+) -> tuple:          # tuple[list[EdgeProposal], list[EdgeProposal]]
+    """
+    Apply hard validation on top of GPT's channel assignment.
+
+    GPT can be demoted from auto → suggest but never promoted.
+
+    Returns (auto_edges, suggest_edges).
+    Count caps enforced: ≤ 3 auto, ≤ 4 suggest per source concept.
+    """
+    auto_edges: list = []
+    suggest_edges: list = []
+
+    for p in proposals:
+        if p.channel == "auto":
+            valid = (
+                p.confidence >= 0.75
+                and any(
+                    f in p.driving_fields
+                    for f in ["named_tools", "assumptions", "conclusion"]
+                )
+                and len(p.falsifiability.split()) >= 8
+                and _relation_type_valid(p)
+            )
+            if not valid:
+                # Demote to suggest rather than drop entirely.
+                p.channel = "suggest"
+                p.needs_review = True
+                p.demoted_from_auto = True
+                suggest_edges.append(p)
+            else:
+                p.needs_review = False
+                auto_edges.append(p)
+        else:  # suggest
+            if p.confidence >= 0.50:
+                p.needs_review = True
+                suggest_edges.append(p)
+            # else: drop — below suggest floor
+
+    # Enforce count caps after routing.
+    auto_edges = sorted(auto_edges, key=lambda x: x.confidence, reverse=True)[:3]
+    suggest_edges = sorted(suggest_edges, key=lambda x: x.confidence, reverse=True)[:4]
+
+    return auto_edges, suggest_edges
 
 # -- Stage 3 linking system prompt ---------------------------------------------
 LINKING_SYSTEM_PROMPT_V1 = """\
@@ -2499,37 +2580,46 @@ class IngestionEngine:
         """
         Write CrossPaperLinkResult to the KI page:
 
-        1. Serialise proposals (confidence >= EDGE_REVIEW_FLAG_CONFIDENCE) as
-           JSON in the 'Edge Suggestions' property for PromotionEngine.
-        2. Append the 3-tier '## Proposed Cross-Paper Edges' section to the
-           page body.
+        1. Serialise only channel='auto' proposals as JSON in the 'Edge
+           Suggestions' property for PromotionEngine (these are auto-created).
+        2. Append the three-section '## Proposed Cross-Paper Edges' section to
+           the page body (auto, suggest, demoted).
         """
         all_proposals = link_result.proposals
-        low_conf = link_result.low_confidence_suggestions
 
-        if not all_proposals and not low_conf:
+        if not all_proposals:
             logger.debug(
                 "KI page %s: no cross-paper edges produced -- remaining 'unlinked'.",
                 ki_page_id,
             )
             return
 
-        # -- Write Edge Suggestions property (for PromotionEngine) ------------
-        payload = {
-            "proposals": [p.model_dump() for p in all_proposals],
-        }
-        edge_json = json.dumps(payload, ensure_ascii=False)
-        # Truncate if necessary (Notion 2000-char limit per rich_text segment).
-        if len(edge_json) > NOTION_BLOCK_MAX_CHARS:
-            while all_proposals and len(
-                json.dumps({"proposals": [p.model_dump() for p in all_proposals]},
-                           ensure_ascii=False)
-            ) > NOTION_BLOCK_MAX_CHARS:
-                all_proposals.pop()
-            edge_json = json.dumps(
-                {"proposals": [p.model_dump() for p in all_proposals]},
-                ensure_ascii=False,
-            )
+        # Separate by channel for Edges DB writing vs KI rendering.
+        auto_proposals = [p for p in all_proposals if p.channel == "auto"]
+        suggest_proposals = [p for p in all_proposals if p.channel == "suggest"]
+
+        # -- Write Edge Suggestions property (PromotionEngine reads this) ------
+        # Only auto-channel edges are written here — suggest-channel edges are
+        # never auto-created.
+        if auto_proposals:
+            payload = {
+                "proposals": [p.model_dump() for p in auto_proposals],
+            }
+            edge_json = json.dumps(payload, ensure_ascii=False)
+            # Truncate if necessary (Notion 2000-char limit per rich_text segment).
+            if len(edge_json) > NOTION_BLOCK_MAX_CHARS:
+                trimmed = list(auto_proposals)
+                while trimmed and len(
+                    json.dumps({"proposals": [p.model_dump() for p in trimmed]},
+                               ensure_ascii=False)
+                ) > NOTION_BLOCK_MAX_CHARS:
+                    trimmed.pop()
+                edge_json = json.dumps(
+                    {"proposals": [p.model_dump() for p in trimmed]},
+                    ensure_ascii=False,
+                )
+        else:
+            edge_json = json.dumps({"proposals": []}, ensure_ascii=False)
 
         self.notion.update_page(
             page_id=ki_page_id,
@@ -2541,10 +2631,10 @@ class IngestionEngine:
             },
         )
 
-        # -- Append 3-tier edge section to page body --------------------------
+        # -- Append three-section edge rendering to page body -----------------
         edge_blocks = self._render_cross_paper_edges_blocks(
-            proposals=all_proposals,
-            low_confidence_suggestions=low_conf,
+            auto_proposals=auto_proposals,
+            suggest_proposals=suggest_proposals,
         )
         if edge_blocks:
             try:
@@ -2833,8 +2923,14 @@ class IngestionEngine:
         Call the LLM linking prompt and return edge proposals.
 
         When candidates include pre-filter metadata (Qdrant path), the new
-        enriched prompt (v2) is used and a CrossPaperLinkResult is returned.
-        Otherwise the legacy prompt is used and a ConceptLinkResult is returned.
+        dual-channel prompt (v3) is used and a CrossPaperLinkResult is returned.
+
+        TF-IDF path (vector index unavailable): skips the GPT call entirely and
+        writes all candidates as suggest-channel edges with confidence=0.0, as
+        per the dual-channel constraint.
+
+        Same-paper-only candidates (no cross-paper hydrated data on the Qdrant
+        path): uses the legacy v1 prompt.
 
         Returns an empty ConceptLinkResult on failure or when there are no
         candidates.
@@ -2844,6 +2940,28 @@ class IngestionEngine:
 
         # Check whether any cross-paper candidates have been hydrated.
         has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
+
+        # TF-IDF fallback: vector index unavailable → skip GPT, write suggest-only.
+        is_tfidf_path = not (self._vector_index and self._vector_index.available)
+        if is_tfidf_path and not has_cross_paper:
+            proposals = [
+                EdgeProposal(
+                    source_concept_title=concept.title,
+                    target_concept_title=c.get("title", "(unknown)"),
+                    target_notion_page_id=c.get("id", ""),
+                    relation_type="related",
+                    direction="A_to_B",
+                    channel="suggest",
+                    confidence=0.0,
+                    justification="TF-IDF fallback — no GPT confirmation",
+                    driving_fields=["keywords"],
+                    falsifiability="",
+                    needs_review=True,
+                )
+                for c in candidates
+                if c.get("id")
+            ]
+            return CrossPaperLinkResult(proposals=proposals)
 
         try:
             if has_cross_paper:
@@ -3005,227 +3123,172 @@ class IngestionEngine:
         return user_message
     
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=10, max=60))
-    def _call_claude_link_single_relation(
+    def _call_edge_confirmation_gpt(
         self,
         concept: MathObject,
         candidates: list[dict],
-        relation_type: str,
+        temperature: float = 0.0,
     ) -> CrossPaperLinkResult:
         """
-        Targeted call: ask Claude to find edges of ONE specific relation type only.
-        The focused scope prevents cross-type suppression and forces the model
-        to reason specifically about the relation's logical criterion.
+        Single GPT call for edge confirmation using the dual-channel prompt.
+
+        Accepts a ``temperature`` parameter for two-temperature validation.
+        Returns a CrossPaperLinkResult whose proposals list contains raw GPT
+        output — routing has NOT yet been applied.
         """
-        # Build same user message as _call_claude_link_v2 (factored out)
         user_message = self._build_link_v2_user_message(concept, candidates)
-
-        # Inject relation-specific instruction at the end
-        relation_criteria = {
-            "depends_on": (
-                "Focus ONLY on depends_on edges. "
-                "A depends_on edge exists if: C_A's assumptions, proof, or definition "
-                "explicitly requires an object, condition, or result provided by C_B. "
-                "Concretely: C_A's assumption field should reference what C_B concludes, "
-                "OR C_A's named_tools should include C_B's name."
-            ),
-            "enables": (
-                "Focus ONLY on enables edges. "
-                "A enables edge exists if: C_A's conclusion or output is used as an "
-                "assumption or input by C_B. "
-                "Concretely: C_B's assumption field should reference what C_A concludes."
-            ),
-            "special_case_of": (
-                "Focus ONLY on special_case_of edges. "
-                "C_A is a special case of C_B if: C_B's setting or assumption set "
-                "strictly contains C_A's (C_B is more general). "
-                "State which field shows the containment."
-            ),
-            "generalizes": (
-                "Focus ONLY on generalizes edges. "
-                "C_A generalizes C_B if: C_A's setting or assumption set strictly "
-                "contains C_B's (C_A is more general). "
-                "State which field shows the containment."
-            ),
-            "related": (
-                "Focus ONLY on related edges. "
-                "A related edge exists if: C_A and C_B share at least one concrete "
-                "structural element — same operator class, same PDE type, same "
-                "named tool, overlapping assumption sets, or same equilibrium notion. "
-                "Topic similarity alone is NOT sufficient."
-            ),
-        }
-
-        instruction = relation_criteria[relation_type]
-        focused_prompt = (
-            f"{LINKING_SYSTEM_PROMPT_V2}\n\n"
-            f"CURRENT TASK — {relation_type.upper()} EDGES ONLY\n"
-            f"{instruction}\n\n"
-            "If no candidates qualify, return {\"proposals\": []}. "
-            "Do not propose edges of other types in this call."
+        result: CrossPaperLinkResult = self.claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            system=EDGE_CONFIRMATION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+            response_model=CrossPaperLinkResult,
+            temperature=temperature,
         )
+        return result
 
-        try:
-            result: CrossPaperLinkResult = self.claude_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=2048,  # smaller budget per call is fine
-                system=focused_prompt,
-                messages=[{"role": "user", "content": user_message}],
-                response_model=CrossPaperLinkResult,
-            )
-            return result
-        except Exception:
-            logger.warning(
-                "_call_claude_link_single_relation: failed for '%s' / %s.",
-                concept.title, relation_type, exc_info=True,
-            )
-            return CrossPaperLinkResult()
-    def _audit_missing_edges(
+    def _validate_auto_edges_two_temperature(
         self,
         concept: MathObject,
         candidates: list[dict],
-        existing_proposals: list[EdgeProposal],
-    ) -> list[EdgeProposal]:
+        first_pass_auto: list,  # list[EdgeProposal]
+    ) -> list:                  # list[EdgeProposal]
         """
-        Ask Claude: given what was already proposed, what obvious edges are missing?
-        Cheap call — 512 tokens max. Returns additional proposals only.
+        Re-run edge confirmation at temperature=0.3 for auto-channel candidates
+        only.  Returns edges stable across both temperature passes.
+
+        Edges that disappear in the second pass are demoted to suggest.
+        Intra-paper edges (same_paper_ids) bypass this check.
         """
-        if not candidates:
+        if not first_pass_auto:
             return []
 
-        proposed_ids = {p.target_notion_page_id for p in existing_proposals}
-        proposed_summary = "\n".join(
-            f"- {p.relation_type} → {p.target_concept_title} ({p.confidence:.0%})"
-            for p in existing_proposals
-        ) or "(none)"
+        # Only pass the specific candidates that produced auto edges.
+        target_ids = {p.target_notion_page_id for p in first_pass_auto}
+        filtered_candidates = [
+            c for c in candidates
+            if (c.get("id") in target_ids)
+            or (
+                c.get("_concept_data") is not None
+                and c["_concept_data"].notion_page_id in target_ids
+            )
+        ]
+        if not filtered_candidates:
+            return first_pass_auto  # nothing to validate against
 
-        # Only audit candidates not already linked.
-        unlinked = [c for c in candidates
-                    if c.get("id") not in proposed_ids
-                    and c.get("_concept_data") is not None]
-        if not unlinked:
-            return []
+        try:
+            second_pass_result = self._call_edge_confirmation_gpt(
+                concept, filtered_candidates, temperature=0.3
+            )
+        except Exception:
+            logger.warning(
+                "_validate_auto_edges_two_temperature: second-pass call failed "
+                "for '%s' — keeping first-pass auto edges.",
+                concept.title,
+                exc_info=True,
+            )
+            return first_pass_auto
 
-        unlinked_titles = "\n".join(
-            f"- [{c['_concept_data'].notion_page_id}] {c['_concept_data'].title}"
-            for c in unlinked[:10]
+        second_pass_auto, _ = route_edge_proposals(
+            second_pass_result.proposals, scores={}
         )
 
-        audit_prompt = f"""\
-    You previously proposed these edges for concept '{concept.title}':
-    {proposed_summary}
+        second_pass_index = {
+            (p.target_notion_page_id, p.relation_type, p.direction): p
+            for p in second_pass_auto
+        }
 
-    The following candidates were NOT linked. For each, state briefly whether 
-    a relationship clearly exists and was missed, or was correctly excluded:
-    {unlinked_titles}
+        stable: list = []
+        for p in first_pass_auto:
+            key = (p.target_notion_page_id, p.relation_type, p.direction)
+            if key in second_pass_index:
+                stable.append(p)
+            else:
+                # Demote to suggest — unstable across temperatures.
+                p.channel = "suggest"
+                p.needs_review = True
+                p.demoted_from_auto = True
 
-    If a clearly missed edge exists, return it as an EdgeProposal in 'proposals'.
-    If all exclusions were correct, return {{"proposals": []}}.
-    Only propose edges with confidence >= 0.70 and specific field-level evidence.
-    """
-        try:
-            result: CrossPaperLinkResult = self.claude_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=512,
-                system=LINKING_SYSTEM_PROMPT_V2,
-                messages=[{"role": "user", "content": audit_prompt}],
-                response_model=CrossPaperLinkResult,
-            )
-            return result.proposals
-        except Exception:
-            return []
-        
+        return stable
+
     def _call_claude_link_v2(
         self, concept: MathObject, candidates: list[dict]
     ) -> CrossPaperLinkResult:
-        all_proposals: list[EdgeProposal] = []
-        all_low_conf: list[EdgeProposal] = []
-        seen_edges: set[tuple[str, str]] = set()
+        """
+        Single call to the dual-channel edge confirmation prompt (v3).
 
-        # Build relation → subset mapping upfront
-        relation_subsets: dict[str, list[dict]] = {}
-        for relation_type in ("depends_on", "enables", "special_case_of",
-                            "generalizes", "related"):
-            hint_key = _RELATION_CANDIDATE_MAP[relation_type]
-            subset = [
-                c for c in candidates
-                if hint_key in c.get("edge_type_hint", "related")
-            ] or candidates
-            if subset:
-                relation_subsets[relation_type] = subset
+        Populates source_type / target_type from concept data, applies routing
+        (route_edge_proposals), and optionally runs two-temperature validation
+        for auto-channel edges (gated behind ENABLE_TWO_TEMPERATURE_VALIDATION).
+        """
+        # Single GPT call at temperature=0.
+        try:
+            raw_result = self._call_edge_confirmation_gpt(concept, candidates, temperature=0)
+        except Exception:
+            logger.warning(
+                "_call_claude_link_v2: GPT call failed for '%s'.", concept.title,
+                exc_info=True,
+            )
+            return CrossPaperLinkResult()
 
-        # Parallel execution — collapses latency to ~slowest single call
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {
-                pool.submit(
-                    self._call_claude_link_single_relation,
-                    concept, subset, rel_type
-                ): rel_type
-                for rel_type, subset in relation_subsets.items()
-            }
-            for future in concurrent.futures.as_completed(futures):
-                rel_type = futures[future]
-                try:
-                    result = future.result()
-                except Exception:
-                    logger.warning(
-                        "_call_claude_link_v2: sub-call failed for '%s' / %s — skipping.",
-                        concept.title, rel_type,
-                    )
-                    continue
-
-                for p in result.proposals:
-                    key = (p.target_notion_page_id, p.relation_type)
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        all_proposals.append(p)
-
-                for p in result.low_confidence_suggestions:
-                    key = (p.target_notion_page_id, p.relation_type)
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        all_low_conf.append(p)
-
-        # Audit pass — catches structurally obvious missed edges
-        audit_additions = self._audit_missing_edges(concept, candidates, all_proposals)
-        for p in audit_additions:
-            key = (p.target_notion_page_id, p.relation_type)
-            if key not in seen_edges:
-                seen_edges.add(key)
-                all_proposals.append(p)
-
-        # Apply review flag routing to all collected proposals
+        # Build lookup: notion_page_id → (ConceptData, CandidateScore).
         scores_by_id: dict[str, CandidateScore] = {
             cand.get("id", ""): cand["_score_obj"]
             for cand in candidates
             if cand.get("_score_obj") is not None
         }
-        final_proposals: list[EdgeProposal] = []
-        final_low_conf: list[EdgeProposal] = []
+        concept_data_by_id: dict[str, "ConceptData"] = {
+            cand["_concept_data"].notion_page_id: cand["_concept_data"]
+            for cand in candidates
+            if cand.get("_concept_data") is not None
+        }
 
-        for proposal in all_proposals:
-            score_obj = scores_by_id.get(proposal.target_notion_page_id)
-            if score_obj is None:
-                score_obj = CandidateScore(
-                    candidate_id=proposal.target_notion_page_id,
-                    qdrant_similarity=0.0,
-                    named_tool_match=False,
-                    assumption_conclusion_overlap=0.0,
-                    setting_containment=None,
-                    keyword_jaccard=0.0,
-                    composite_score=0.0,
-                    should_drop=False,
-                )
-            proposal.pre_filter_signal = _dominant_signal(score_obj)
+        # Populate pipeline-set fields for each raw proposal.
+        for p in raw_result.proposals:
+            p.source_type = concept.type
+            cd = concept_data_by_id.get(p.target_notion_page_id)
+            if cd:
+                p.target_type = cd.concept_type
+            score_obj = scores_by_id.get(p.target_notion_page_id)
+            if score_obj:
+                p.pre_filter_signal = _dominant_signal(score_obj)
 
-            if proposal.confidence < EDGE_REVIEW_FLAG_CONFIDENCE:
-                final_low_conf.append(proposal)
-            else:
-                _assign_review_flag(proposal, score_obj)
-                final_proposals.append(proposal)
+        # Apply routing: enforce structural checks and count caps.
+        auto_edges, suggest_edges = route_edge_proposals(
+            raw_result.proposals, scores_by_id
+        )
 
+        # Optional: two-temperature validation for auto-channel edges.
+        if ENABLE_TWO_TEMPERATURE_VALIDATION and auto_edges:
+            # Intra-paper edges bypass two-temperature check.
+            same_paper_ids = {
+                c.get("id", "") for c in candidates
+                if c.get("_concept_data") is None
+            }
+            intra_auto = [p for p in auto_edges
+                          if p.target_notion_page_id in same_paper_ids]
+            cross_auto = [p for p in auto_edges
+                          if p.target_notion_page_id not in same_paper_ids]
+
+            stable_cross = self._validate_auto_edges_two_temperature(
+                concept, candidates, cross_auto
+            )
+            # Demoted edges are now in suggest_edges after mutation above.
+            demoted_from_temp = [
+                p for p in cross_auto
+                if p.demoted_from_auto and p not in stable_cross
+            ]
+            suggest_edges = sorted(
+                suggest_edges + demoted_from_temp,
+                key=lambda x: x.confidence,
+                reverse=True,
+            )[:4]
+            auto_edges = intra_auto + stable_cross
+
+        all_proposals = auto_edges + suggest_edges
         return CrossPaperLinkResult(
-            proposals=final_proposals,
-            low_confidence_suggestions=final_low_conf + all_low_conf,
+            proposals=all_proposals,
+            low_confidence_suggestions=[],
         )
     # -- Re-extraction flow (REQ-5) --------------------------------------------
 
@@ -3464,40 +3527,37 @@ class IngestionEngine:
         """Build a Notion divider block."""
         return {"object": "block", "type": "divider", "divider": {}}
 
-    # -- Cross-paper edge rendering (Part 3) -----------------------------------
+    # -- Cross-paper edge rendering (Part 5) -----------------------------------
     #
-    # Human review workflow for flagged edges:
+    # Human review workflow for the three-section layout:
     #
-    #   ✅ Auto-Created (needs_review=False):
-    #      The edge already exists in Edges DB.  No action required.
-    #      The callout is informational — it shows WHY the edge was created.
+    #   ✅ Auto-Created Edges (channel=auto, needs_review=False):
+    #      Written to Edges DB automatically. No action required.
+    #      Green callout shows WHY the edge was created.
     #
-    #   ⚠️  Flagged — Requires Your Decision (needs_review=True):
-    #      The edge EXISTS in Edges DB but is flagged for human confirmation.
-    #      - Accept: open the edge page in Edges DB, uncheck 'needs_review'.
-    #      - Reject: delete the edge page from Edges DB.
-    #      The checkbox in Notion is a VISUAL PROMPT only — checking it does
-    #      NOT automatically update the Edges DB.
+    #   💡 Suggested Connections (channel=suggest, demoted_from_auto=False):
+    #      NOT written to Edges DB. Yellow to-do checkbox for human decision.
+    #      To accept: create edge manually in Edges DB and uncheck needs_review.
     #
-    #   💡 Low-Confidence Suggestions (confidence < EDGE_REVIEW_FLAG_CONFIDENCE):
-    #      These edges were NOT written to Edges DB.  They are similarity hints
-    #      only.  If you want to create one, do so manually in the Edges DB.
+    #   ⬇️  Demoted Edges (channel=suggest, demoted_from_auto=True):
+    #      GPT originally proposed as auto but pipeline validation failed.
+    #      Same treatment as suggest — NOT auto-created.
 
     def _render_cross_paper_edges_blocks(
         self,
-        proposals: list[EdgeProposal],
-        low_confidence_suggestions: list[EdgeProposal],
+        auto_proposals: list[EdgeProposal],
+        suggest_proposals: list[EdgeProposal],
     ) -> list[dict]:
         """
         Build Notion block children for the '## Proposed Cross-Paper Edges'
         section appended to every KI page that has cross-paper edge proposals.
 
         Three subsections:
-          1. Auto-Created Edges (needs_review=False)  — green callout blocks
-          2. Flagged Edges (needs_review=True)         — to-do blocks
-          3. Low-Confidence Suggestions               — bulleted list (gray)
+          1. Auto-Created Edges (channel=auto)           — green callout blocks
+          2. Suggested Connections — Your Decision       — yellow to-do blocks
+          3. Demoted Edges (originally auto, failed checks) — yellow to-do + ⬇️
         """
-        if not proposals and not low_confidence_suggestions:
+        if not auto_proposals and not suggest_proposals:
             return []
 
         blocks: list[dict] = [
@@ -3505,17 +3565,16 @@ class IngestionEngine:
             self._heading_block("Proposed Cross-Paper Edges"),
         ]
 
-        # ── Sub-section 1: Auto-Created ────────────────────────────────────────
-        auto_created = [p for p in proposals if not p.needs_review]
-        if auto_created:
+        # ── Section 1: Auto-Created Edges ──────────────────────────────────────
+        if auto_proposals:
             blocks.append(self._heading_block("Auto-Created Edges"))
-            for p in auto_created:
+            for p in auto_proposals:
                 text = (
-                    f"✅ {p.relation_type} → {p.target_concept_title}\n"
-                    f"   Confidence: {p.confidence:.0%}\n"
-                    f"   Why: {p.justification}\n"
+                    f"✅ {p.relation_type} → {p.target_concept_title}"
+                    f"   (confidence: {p.confidence:.0%})\n"
+                    f"   Because: {p.justification}\n"
                     f"   Fields: {', '.join(p.driving_fields)}\n"
-                    f"   Signal: {p.pre_filter_signal or 'none'}"
+                    f"   Would be wrong if: {p.falsifiability or '(not specified)'}"
                 )
                 blocks.append({
                     "object": "block",
@@ -3529,44 +3588,51 @@ class IngestionEngine:
                     },
                 })
 
-        # ── Sub-section 2: Flagged — Requires Decision ─────────────────────────
-        flagged = [p for p in proposals if p.needs_review]
-        if flagged:
-            blocks.append(self._heading_block("Flagged Edges — Requires Your Decision"))
-            for p in flagged:
+        # ── Section 2: Suggested Connections (not demoted) ────────────────────
+        pure_suggest = [p for p in suggest_proposals if not p.demoted_from_auto]
+        if pure_suggest:
+            blocks.append(self._heading_block("Suggested Connections — Your Decision"))
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {
+                            "content": (
+                                "These were not auto-created. To accept: create the "
+                                "edge in the Edges DB manually and uncheck needs_review. "
+                                "To reject: leave unchecked."
+                            )
+                        },
+                        "annotations": {"italic": True, "color": "gray"},
+                    }],
+                },
+            })
+            for p in pure_suggest:
                 text = (
-                    f"⚠️ {p.relation_type} → {p.target_concept_title}  "
-                    f"Confidence: {p.confidence:.0%}\n"
-                    f"   Why: {p.justification}\n"
-                    f"   Fields: {', '.join(p.driving_fields)}\n"
-                    f"   Signal: {p.pre_filter_signal or 'none'}\n"
-                    f"   → Accept: open edge in Edges DB, uncheck needs_review. "
-                    f"Reject: delete edge from Edges DB."
+                    f"💡 {p.relation_type} → {p.target_concept_title}"
+                    f"   (confidence: {p.confidence:.0%})  [NOT auto-created]\n"
+                    f"   Why GPT thinks this is interesting: {p.justification}\n"
+                    f"   Would be wrong if: {p.falsifiability or '(not specified)'}\n"
+                    f"   → [ ] Accept (create edge manually)   [ ] Reject"
                 )
                 blocks.append(self._todo_block(text))
 
-        # ── Sub-section 3: Low-Confidence Suggestions ─────────────────────────
-        if low_confidence_suggestions:
-            blocks.append(self._heading_block("Low-Confidence Suggestions"))
-            for p in low_confidence_suggestions:
+        # ── Section 3: Demoted Edges ──────────────────────────────────────────
+        demoted = [p for p in suggest_proposals if p.demoted_from_auto]
+        if demoted:
+            blocks.append(self._heading_block("Demoted Edges"))
+            for p in demoted:
                 text = (
-                    f"💡 {p.relation_type} → {p.target_concept_title}  "
-                    f"Confidence: {p.confidence:.0%}  [NOT auto-created — similarity hint only]\n"
-                    f"   Why: {p.justification}"
+                    f"⬇️ {p.relation_type} → {p.target_concept_title}"
+                    f"  [demoted from auto — unstable or failed validation]\n"
+                    f"   (confidence: {p.confidence:.0%})  [NOT auto-created]\n"
+                    f"   Why GPT thinks this is interesting: {p.justification}\n"
+                    f"   Would be wrong if: {p.falsifiability or '(not specified)'}\n"
+                    f"   → [ ] Accept (create edge manually)   [ ] Reject"
                 )
-                blocks.append({
-                    "object": "block",
-                    "type": "bulleted_list_item",
-                    "bulleted_list_item": {
-                        "rich_text": [
-                            {
-                                "type": "text",
-                                "text": {"content": text[:2000]},
-                                "annotations": {"color": "gray"},
-                            }
-                        ]
-                    },
-                })
+                blocks.append(self._todo_block(text))
 
         return blocks
 
