@@ -578,6 +578,99 @@ LATEX FORMATTING RULES (STRICTLY ENFORCED — violations break rendering)
 """.strip()
 
 
+# ── Cross-paper edge confirmation system prompt (v3 — dual-channel) ───────────
+
+EDGE_CONFIRMATION_SYSTEM_PROMPT = """\
+You are a mathematical edge analyst for a knowledge graph of formal mathematical
+concepts (MFG, PDE, probability, optimization).
+
+You will receive one SOURCE concept (C_A) and a list of TARGET concepts from the
+knowledge base. For each target, determine whether a directed edge should be
+proposed, and if so, which channel it belongs to.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHANNEL DEFINITIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANNEL "auto" — Structural evidence required
+  Use when you can point to SPECIFIC FIELD CONTENT that proves the relation.
+  Hard requirements (ALL must hold):
+    1. confidence >= 0.75
+    2. driving_fields contains at least one of:
+       {named_tools, assumptions, conclusion}
+    3. justification names a specific mathematical object
+       (a theorem, operator, condition, set, or inequality)
+    4. falsifiability is specific and non-trivial (>= 8 words)
+    5. relation_type is valid for the source/target type pair
+       (see RELATION TYPE CONSTRAINTS below)
+
+CHANNEL "suggest" — Semantic intuition, no proof required
+  Use when you sense a meaningful connection but cannot prove it from field content.
+  Lower bar:
+    1. confidence >= 0.50
+    2. You can articulate WHY a researcher might care about this connection,
+       even if the fields don't directly support it
+    3. The connection is mathematically meaningful, not just topical
+
+DEFAULT IS NULL — not "suggest"
+  Your default answer for any pair is NO EDGE.
+  "suggest" is for connections you genuinely believe a mathematician would find
+  interesting. It is not a catch-all for uncertain auto edges.
+  If you would use `related` in channel auto because nothing else fits: use
+  suggest instead, or return null.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RELATION TYPE CONSTRAINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Source type → Target type   | Auto-allowed types
+────────────────────────────────────────────────────────────────
+Theorem     → Theorem       | depends_on, generalizes, special_case_of
+Theorem     → Definition    | depends_on
+Theorem     → Lemma         | depends_on
+Definition  → Definition    | generalizes, special_case_of
+Definition  → Theorem       | NEVER in auto (definitions don't depend on theorems)
+Lemma       → Theorem       | enables
+Algorithm   → Theorem       | depends_on
+Assumption  → Theorem       | enables
+
+`related` in channel auto: ONLY if same setting AND overlapping named_tools
+  AND justification states specifically what the relation is.
+  If you cannot meet this bar: use suggest or null.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COUNT CAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Per source concept C_A:
+  - AT MOST 3 edges in channel "auto"
+  - AT MOST 4 edges in channel "suggest"
+  - AT MOST 5 edges total across both channels
+
+If you believe more exist, return the highest-confidence ones only.
+Mathematical concepts have few true dependencies. Finding 6+ edges
+for a single concept means you are finding noise.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SELF-CHECK BEFORE RETURNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For each proposed edge:
+  □ Would I be comfortable defending this edge in a seminar? If no → null or suggest.
+  □ Does my justification name a specific mathematical object? If no → demote to suggest.
+  □ Is my falsifiability condition specific (>= 8 words)? If no → demote to suggest.
+  □ For auto: is the relation type valid for this source/target type pair?
+  □ Am I proposing this because it seems helpful rather than because it's real? → null.
+
+Return {"proposals": []} if no edges meet the bar. This is correct and expected for many pairs.
+
+DIRECTION CONVENTION:
+- "A_to_B" means the edge goes FROM C_A TO C_B.
+  Example: if C_A depends_on C_B, direction is "A_to_B".
+- "B_to_A" means the edge goes FROM C_B TO C_A.
+  Example: if C_B depends_on C_A, direction is "B_to_A".
+"""
+
 # ── Cross-paper edge proposal models (Stage 3 v2) ─────────────────────────────
 
 
@@ -585,8 +678,10 @@ class EdgeProposal(BaseModel):
     """
     A single cross-paper edge proposal produced by the Stage 3 linking prompt.
 
-    ``pre_filter_signal`` and ``needs_review`` are populated by the pipeline
-    after the LLM call — not by the model itself.
+    ``channel``, ``pre_filter_signal``, ``needs_review``, ``source_type``,
+    ``target_type``, and ``demoted_from_auto`` are populated by the pipeline
+    after (or during) the LLM call — not by the model itself, except ``channel``
+    and ``falsifiability`` which GPT must set.
     """
 
     source_concept_title: str = Field(
@@ -611,6 +706,15 @@ class EdgeProposal(BaseModel):
             "B_to_A: edge goes FROM C_B TO C_A."
         ),
     )
+
+    channel: Literal["auto", "suggest"] = Field(
+        default="suggest",
+        description=(
+            "auto: will be written to Edges DB immediately if structural checks pass. "
+            "suggest: appears in KI checklist only, never auto-created."
+        ),
+    )
+
     confidence: float = Field(
         ...,
         ge=0.0,
@@ -620,7 +724,8 @@ class EdgeProposal(BaseModel):
     justification: str = Field(
         ...,
         description=(
-            "One sentence referencing specific field content (not just titles)."
+            "One sentence referencing specific field content (not just titles). "
+            "Must name a specific mathematical object (theorem, operator, condition)."
         ),
     )
     driving_fields: List[
@@ -636,10 +741,28 @@ class EdgeProposal(BaseModel):
         default_factory=list,
         description=(
             "Fields from either concept that drove the relation decision. "
-            "Must contain at least one entry."
+            "For channel='auto': must contain at least one of "
+            "{named_tools, assumptions, conclusion}."
         ),
     )
-    # Populated by pipeline after the LLM call.
+
+    falsifiability: str = Field(
+        default="",
+        description=(
+            "Complete the sentence: 'This edge would be WRONG if...'. "
+            "Must be specific and non-trivial."
+        ),
+    )
+
+    # Populated by pipeline — not by GPT.
+    source_type: Optional[str] = Field(
+        default=None,
+        description="Concept type of C_A (e.g. Theorem, Definition). Set by pipeline.",
+    )
+    target_type: Optional[str] = Field(
+        default=None,
+        description="Concept type of C_B. Set by pipeline.",
+    )
     pre_filter_signal: Optional[str] = Field(
         default=None,
         description=(
@@ -650,7 +773,18 @@ class EdgeProposal(BaseModel):
     )
     needs_review: bool = Field(
         default=False,
-        description="True = written to Edges DB with review flag set.",
+        description=(
+            "Set by pipeline. Always True for channel='suggest'. "
+            "False for channel='auto' edges that passed all structural checks."
+        ),
+    )
+    demoted_from_auto: bool = Field(
+        default=False,
+        description=(
+            "True if GPT originally assigned channel='auto' but the pipeline "
+            "demoted to 'suggest' because structural checks failed or the edge "
+            "was unstable across temperatures."
+        ),
     )
 
 

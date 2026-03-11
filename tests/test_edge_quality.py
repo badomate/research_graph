@@ -73,6 +73,8 @@ from orchestrator.modules.ingestion import (
     _normalize_for_fuzzy,
     _tokenize_for_overlap,
     score_candidate_pair,
+    route_edge_proposals,
+    _relation_type_valid,
     EDGE_AUTO_CREATE_CONFIDENCE,
     EDGE_REVIEW_FLAG_CONFIDENCE,
 )
@@ -574,6 +576,282 @@ class TestHydrateCandidates(unittest.TestCase):
         self.assertEqual(set(result.keys()), {"p1", "p2"})
         self.assertEqual(result["p1"].title, "Concept One")
         self.assertEqual(result["p2"].title, "Concept Two")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: EdgeProposal new dual-channel fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEdgeProposalDualChannel(unittest.TestCase):
+
+    def test_channel_defaults_to_suggest(self):
+        """EdgeProposal.channel defaults to 'suggest' when not provided."""
+        p = _make_proposal(confidence=0.80)
+        self.assertEqual(p.channel, "suggest")
+
+    def test_channel_auto_explicit(self):
+        """EdgeProposal accepts channel='auto' when provided."""
+        p = EdgeProposal(
+            source_concept_title="A",
+            target_concept_title="B",
+            target_notion_page_id="pid",
+            relation_type="depends_on",
+            direction="A_to_B",
+            channel="auto",
+            confidence=0.80,
+            justification="C_A uses the Banach fixed-point theorem proven in C_B",
+            driving_fields=["named_tools"],
+            falsifiability="This edge would be wrong if C_A does not mention contraction mappings",
+        )
+        self.assertEqual(p.channel, "auto")
+
+    def test_falsifiability_defaults_to_empty(self):
+        """EdgeProposal.falsifiability defaults to empty string."""
+        p = _make_proposal(confidence=0.80)
+        self.assertEqual(p.falsifiability, "")
+
+    def test_source_type_target_type_default_none(self):
+        """source_type and target_type default to None."""
+        p = _make_proposal(confidence=0.80)
+        self.assertIsNone(p.source_type)
+        self.assertIsNone(p.target_type)
+
+    def test_demoted_from_auto_default_false(self):
+        """demoted_from_auto defaults to False."""
+        p = _make_proposal(confidence=0.80)
+        self.assertFalse(p.demoted_from_auto)
+
+    def test_invalid_channel_rejected(self):
+        """An invalid channel value causes a ValidationError."""
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            EdgeProposal(
+                source_concept_title="A",
+                target_concept_title="B",
+                target_notion_page_id="pid",
+                relation_type="depends_on",
+                direction="A_to_B",
+                channel="bad_channel",  # invalid
+                confidence=0.80,
+                justification="test",
+                driving_fields=["named_tools"],
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: _relation_type_valid
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_typed_proposal(
+    relation_type: str,
+    source_type: str,
+    target_type: str,
+    channel: str = "auto",
+) -> EdgeProposal:
+    return EdgeProposal(
+        source_concept_title="A",
+        target_concept_title="B",
+        target_notion_page_id="pid",
+        relation_type=relation_type,
+        direction="A_to_B",
+        channel=channel,
+        confidence=0.80,
+        justification="test justification referencing the Gronwall lemma",
+        driving_fields=["assumptions"],
+        falsifiability="This edge would be wrong if no boundedness condition exists",
+        source_type=source_type,
+        target_type=target_type,
+    )
+
+
+class TestRelationTypeValid(unittest.TestCase):
+
+    def test_theorem_to_theorem_depends_on_allowed(self):
+        p = _make_typed_proposal("depends_on", "Theorem", "Theorem")
+        self.assertTrue(_relation_type_valid(p))
+
+    def test_theorem_to_theorem_generalizes_allowed(self):
+        p = _make_typed_proposal("generalizes", "Theorem", "Theorem")
+        self.assertTrue(_relation_type_valid(p))
+
+    def test_theorem_to_theorem_related_not_in_strict_list(self):
+        p = _make_typed_proposal("related", "Theorem", "Theorem")
+        # "related" is not in the Theorem→Theorem allowed set.
+        self.assertFalse(_relation_type_valid(p))
+
+    def test_definition_to_theorem_never_allowed(self):
+        p = _make_typed_proposal("depends_on", "Definition", "Theorem")
+        self.assertFalse(_relation_type_valid(p))
+
+    def test_lemma_to_theorem_enables_allowed(self):
+        p = _make_typed_proposal("enables", "Lemma", "Theorem")
+        self.assertTrue(_relation_type_valid(p))
+
+    def test_lemma_to_theorem_depends_on_not_allowed(self):
+        p = _make_typed_proposal("depends_on", "Lemma", "Theorem")
+        self.assertFalse(_relation_type_valid(p))
+
+    def test_unknown_type_pair_allows_all(self):
+        """Pairs not in the constraint table allow all relation types."""
+        p = _make_typed_proposal("related", "ProofTechnique", "Algorithm")
+        self.assertTrue(_relation_type_valid(p))
+
+    def test_missing_source_type_allows(self):
+        """If source_type is None, validation is skipped (return True)."""
+        p = _make_typed_proposal("depends_on", "Theorem", "Theorem")
+        p.source_type = None
+        self.assertTrue(_relation_type_valid(p))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: route_edge_proposals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_auto_proposal(
+    target_id: str = "pid",
+    confidence: float = 0.80,
+    driving_fields: list | None = None,
+    falsifiability: str = "This edge would be wrong if the assumptions do not overlap",
+    relation_type: str = "depends_on",
+    source_type: str = "Theorem",
+    target_type: str = "Theorem",
+) -> EdgeProposal:
+    return EdgeProposal(
+        source_concept_title="A",
+        target_concept_title="B",
+        target_notion_page_id=target_id,
+        relation_type=relation_type,
+        direction="A_to_B",
+        channel="auto",
+        confidence=confidence,
+        justification="C_A's assumptions field contains the Lipschitz condition proven in C_B",
+        driving_fields=driving_fields if driving_fields is not None else ["assumptions"],
+        falsifiability=falsifiability,
+        source_type=source_type,
+        target_type=target_type,
+    )
+
+
+class TestRouteEdgeProposals(unittest.TestCase):
+
+    def test_valid_auto_proposal_stays_auto(self):
+        """A valid auto proposal remains in auto_edges."""
+        p = _make_auto_proposal(confidence=0.80)
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertIn(p, auto)
+        self.assertEqual(len(suggest), 0)
+        self.assertFalse(p.needs_review)
+
+    def test_low_confidence_auto_demoted_to_suggest(self):
+        """An auto proposal with confidence < 0.75 is demoted to suggest."""
+        p = _make_auto_proposal(confidence=0.70)
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertIn(p, suggest)
+        self.assertEqual(p.channel, "suggest")
+        self.assertTrue(p.demoted_from_auto)
+        self.assertTrue(p.needs_review)
+
+    def test_auto_without_structural_field_demoted(self):
+        """Auto proposal with only keywords/setting in driving_fields is demoted."""
+        p = _make_auto_proposal(driving_fields=["keywords", "setting"])
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertIn(p, suggest)
+        self.assertTrue(p.demoted_from_auto)
+
+    def test_auto_with_trivial_falsifiability_demoted(self):
+        """Auto proposal with < 8-word falsifiability is demoted."""
+        p = _make_auto_proposal(falsifiability="too short")
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertTrue(p.demoted_from_auto)
+
+    def test_invalid_relation_type_for_type_pair_demoted(self):
+        """Auto proposal with invalid relation type for type pair is demoted."""
+        p = _make_auto_proposal(
+            relation_type="depends_on",
+            source_type="Definition",
+            target_type="Theorem",  # Definition→Theorem never allowed
+        )
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertTrue(p.demoted_from_auto)
+
+    def test_suggest_proposal_with_sufficient_confidence_kept(self):
+        """A suggest proposal with confidence >= 0.50 appears in suggest_edges."""
+        p = EdgeProposal(
+            source_concept_title="A",
+            target_concept_title="B",
+            target_notion_page_id="pid",
+            relation_type="related",
+            direction="A_to_B",
+            channel="suggest",
+            confidence=0.60,
+            justification="Both concepts involve Lipschitz conditions",
+            driving_fields=["keywords"],
+            falsifiability="",
+        )
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertIn(p, suggest)
+        self.assertTrue(p.needs_review)
+
+    def test_suggest_proposal_below_floor_dropped(self):
+        """A suggest proposal with confidence < 0.50 is dropped entirely."""
+        p = EdgeProposal(
+            source_concept_title="A",
+            target_concept_title="B",
+            target_notion_page_id="pid",
+            relation_type="related",
+            direction="A_to_B",
+            channel="suggest",
+            confidence=0.40,
+            justification="test",
+            driving_fields=["keywords"],
+            falsifiability="",
+        )
+        auto, suggest = route_edge_proposals([p], scores={})
+        self.assertEqual(len(auto), 0)
+        self.assertEqual(len(suggest), 0)
+
+    def test_count_cap_auto_max_3(self):
+        """At most 3 auto edges are returned, sorted by descending confidence."""
+        proposals = [
+            _make_auto_proposal(target_id=f"pid{i}", confidence=0.75 + i * 0.01)
+            for i in range(5)
+        ]
+        auto, suggest = route_edge_proposals(proposals, scores={})
+        self.assertLessEqual(len(auto), 3)
+        # Should keep highest confidence
+        confidences = [p.confidence for p in auto]
+        self.assertEqual(confidences, sorted(confidences, reverse=True))
+
+    def test_count_cap_suggest_max_4(self):
+        """At most 4 suggest edges are returned."""
+        proposals = [
+            EdgeProposal(
+                source_concept_title="A",
+                target_concept_title=f"B{i}",
+                target_notion_page_id=f"pid{i}",
+                relation_type="related",
+                direction="A_to_B",
+                channel="suggest",
+                confidence=0.50 + i * 0.01,
+                justification="test",
+                driving_fields=["keywords"],
+                falsifiability="",
+            )
+            for i in range(6)
+        ]
+        auto, suggest = route_edge_proposals(proposals, scores={})
+        self.assertLessEqual(len(suggest), 4)
+
+    def test_empty_proposals_returns_empty_lists(self):
+        """Empty input produces empty output."""
+        auto, suggest = route_edge_proposals([], scores={})
+        self.assertEqual(auto, [])
+        self.assertEqual(suggest, [])
 
 
 if __name__ == "__main__":
