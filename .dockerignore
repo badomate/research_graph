@@ -1,0 +1,5 @@
+.git
+.env
+**/.pytest_cache
+**/__pycache__
+graph_output

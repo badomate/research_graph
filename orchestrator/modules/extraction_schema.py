@@ -20,7 +20,6 @@ Changelog:
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -45,25 +44,18 @@ ALLOWED_EDGE_TYPES: frozenset[str] = frozenset(
     {"depends_on", "enables", "generalizes", "special_case_of", "related"}
 )
 
-# ── Edge caps per concept ──────────────────────────────────────────────────────
-EDGE_CAPS: dict[str, int] = {
+# ── Edge caps per concept (private — used only by model validators) ────────────
+# The runtime-configurable version lives in Config.edge_caps.
+_EDGE_CAPS: dict[str, int] = {
     "depends_on": 3,
     "enables": 3,
     "generalizes": 2,
     "special_case_of": 2,
     "related": 5,
 }
-# Bump this whenever the extraction schema or system prompt changes.
-# Can be overridden via the EXTRACTION_VERSION environment variable.
-# Changelog:
-#   v1 — original schema: type, name, content, assumptions, suggested_hub
-#   v2 — hardened schema: type, title, statement_latex, assumptions, variables,
-#         conclusion, source_pages, source_quotes, confidence; hub_suggestions
-#         stored as text only; verification_status added to Knowledge Inbox.
-#   v3 — extended schema: suggested_hub (proper field), interpretation, proof_idea,
-#         source_anchors, named_tools, setting, result_category,
-#         canonical_keywords, prereq_keywords, downstream_keywords, aliases.
-EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
+
+# Back-compat alias so existing imports still work during migration.
+EDGE_CAPS = _EDGE_CAPS
 
 
 # ── Completeness gate ──────────────────────────────────────────────────────────
@@ -484,11 +476,11 @@ class ConceptLinkResult(BaseModel):
     @model_validator(mode="after")
     def enforce_caps(self) -> "ConceptLinkResult":
         """Silently trim any edge list that exceeds its cap."""
-        self.depends_on = self.depends_on[: EDGE_CAPS["depends_on"]]
-        self.enables = self.enables[: EDGE_CAPS["enables"]]
-        self.generalizes = self.generalizes[: EDGE_CAPS["generalizes"]]
-        self.special_case_of = self.special_case_of[: EDGE_CAPS["special_case_of"]]
-        self.related = self.related[: EDGE_CAPS["related"]]
+        self.depends_on = self.depends_on[: _EDGE_CAPS["depends_on"]]
+        self.enables = self.enables[: _EDGE_CAPS["enables"]]
+        self.generalizes = self.generalizes[: _EDGE_CAPS["generalizes"]]
+        self.special_case_of = self.special_case_of[: _EDGE_CAPS["special_case_of"]]
+        self.related = self.related[: _EDGE_CAPS["related"]]
         return self
 
 
@@ -517,7 +509,7 @@ def validate_link_result(raw: dict) -> tuple["ConceptLinkResult", list[str]]:
 
         # Best-effort: parse each edge list individually.
         partial: dict = {}
-        for edge_type in EDGE_CAPS:
+        for edge_type in _EDGE_CAPS:
             valid_edges: list[LinkEdge] = []
             for e in raw.get(edge_type, []):
                 try:
@@ -528,148 +520,6 @@ def validate_link_result(raw: dict) -> tuple["ConceptLinkResult", list[str]]:
 
         return ConceptLinkResult(**partial), errors
 
-
-# ── LaTeX formatting rules (injected into extraction prompts) ──────────────────
-
-LATEX_FORMATTING_RULES = """
-LATEX FORMATTING RULES (STRICTLY ENFORCED — violations break rendering)
-════════════════════════════════════════════════════════════════════════
-
-1. DELIMITERS — every LaTeX expression must be wrapped. No exceptions.
-   - Inline math:  $...$       for symbols, variables, short expressions
-   - Display math: \\[...\\]   for full statements, multi-line equations
-   - NEVER use $$...$$ — use \\[...\\] for display math
-   - NEVER write bare LaTeX outside a delimiter:
-       WRONG:  \\partial_\\alpha f(\\alpha^*)=0
-       CORRECT: $\\partial_\\alpha f(\\alpha^*) = 0$
-
-2. ENVIRONMENTS — must always be nested inside \\[...\\]
-   - CORRECT:  \\[\\begin{aligned} f(x) &= 0 \\\\\\\\ g(x) &= 1 \\end{aligned}\\]
-   - WRONG:    \\begin{aligned} f(x) &= 0 \\\\\\\\ g(x) &= 1 \\end{aligned}
-   - Use \\\\\\\\ for line breaks — NEVER literal newlines between \\[ and \\]
-   - NEVER use \\begin{equation} — use \\[...\\] directly
-
-3. \\text{} — only valid INSIDE a math environment
-   - WRONG:  \\text{If condition holds} \\alpha \\in (0,1)
-   - CORRECT: "If condition holds, $\\alpha \\in (0,1)$"
-
-4. FORBIDDEN IN ALL FIELDS
-   - \\tag{N}, \\label{...}, \\ref{...}, \\nonumber
-   - \\begin{equation} / \\end{equation}
-
-5. CANONICAL NOTATION
-   - Fractions:     \\frac{a}{b}           NEVER a/b in display math
-   - Norms:         \\|x\\|                NEVER ||x||
-   - Inner product: \\langle x,y \\rangle  NEVER <x,y>
-   - Sets:          \\mathbb{R}, \\mathbb{E}, \\mathbb{P}
-
-6. FIELD-SPECIFIC RULES
-   statement_latex:
-     ONE \\[...\\] block only. Multiple equations → \\begin{aligned}.
-     Must be self-contained and KaTeX-parseable.
-   assumptions:
-     Plain English + inline $...$ only. NO display math.
-   variables:
-     Format: $<symbol>$ (<description>), one per line.
-   conclusion, interpretation:
-     Plain English. Inline $...$ only if unavoidable.
-   proof_idea:
-     Inline $...$ freely. No display math blocks.
-""".strip()
-
-
-# ── Cross-paper edge confirmation system prompt (v3 — dual-channel) ───────────
-
-EDGE_CONFIRMATION_SYSTEM_PROMPT = """\
-You are a mathematical edge analyst for a knowledge graph of formal mathematical
-concepts (MFG, PDE, probability, optimization).
-
-You will receive one SOURCE concept (C_A) and a list of TARGET concepts from the
-knowledge base. For each target, determine whether a directed edge should be
-proposed, and if so, which channel it belongs to.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANNEL DEFINITIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-CHANNEL "auto" — Structural evidence required
-  Use when you can point to SPECIFIC FIELD CONTENT that proves the relation.
-  Hard requirements (ALL must hold):
-    1. confidence >= 0.75
-    2. driving_fields contains at least one of:
-       {named_tools, assumptions, conclusion}
-    3. justification names a specific mathematical object
-       (a theorem, operator, condition, set, or inequality)
-    4. falsifiability is specific and non-trivial (>= 8 words)
-    5. relation_type is valid for the source/target type pair
-       (see RELATION TYPE CONSTRAINTS below)
-
-CHANNEL "suggest" — Semantic intuition, no proof required
-  Use when you sense a meaningful connection but cannot prove it from field content.
-  Lower bar:
-    1. confidence >= 0.50
-    2. You can articulate WHY a researcher might care about this connection,
-       even if the fields don't directly support it
-    3. The connection is mathematically meaningful, not just topical
-
-DEFAULT IS NULL — not "suggest"
-  Your default answer for any pair is NO EDGE.
-  "suggest" is for connections you genuinely believe a mathematician would find
-  interesting. It is not a catch-all for uncertain auto edges.
-  If you would use `related` in channel auto because nothing else fits: use
-  suggest instead, or return null.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RELATION TYPE CONSTRAINTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Source type → Target type   | Auto-allowed types
-────────────────────────────────────────────────────────────────
-Theorem     → Theorem       | depends_on, generalizes, special_case_of
-Theorem     → Definition    | depends_on
-Theorem     → Lemma         | depends_on
-Definition  → Definition    | generalizes, special_case_of
-Definition  → Theorem       | NEVER in auto (definitions don't depend on theorems)
-Lemma       → Theorem       | enables
-Algorithm   → Theorem       | depends_on
-Assumption  → Theorem       | enables
-
-`related` in channel auto: ONLY if same setting AND overlapping named_tools
-  AND justification states specifically what the relation is.
-  If you cannot meet this bar: use suggest or null.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUNT CAP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Per source concept C_A:
-  - AT MOST 3 edges in channel "auto"
-  - AT MOST 4 edges in channel "suggest"
-  - AT MOST 5 edges total across both channels
-
-If you believe more exist, return the highest-confidence ones only.
-Mathematical concepts have few true dependencies. Finding 6+ edges
-for a single concept means you are finding noise.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SELF-CHECK BEFORE RETURNING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-For each proposed edge:
-  □ Would I be comfortable defending this edge in a seminar? If no → null or suggest.
-  □ Does my justification name a specific mathematical object? If no → demote to suggest.
-  □ Is my falsifiability condition specific (>= 8 words)? If no → demote to suggest.
-  □ For auto: is the relation type valid for this source/target type pair?
-  □ Am I proposing this because it seems helpful rather than because it's real? → null.
-
-Return {"proposals": []} if no edges meet the bar. This is correct and expected for many pairs.
-
-DIRECTION CONVENTION:
-- "A_to_B" means the edge goes FROM C_A TO C_B.
-  Example: if C_A depends_on C_B, direction is "A_to_B".
-- "B_to_A" means the edge goes FROM C_B TO C_A.
-  Example: if C_B depends_on C_A, direction is "B_to_A".
-"""
 
 # ── Cross-paper edge proposal models (Stage 3 v2) ─────────────────────────────
 
@@ -799,38 +649,6 @@ class CrossPaperLinkResult(BaseModel):
 
     proposals: List[EdgeProposal] = Field(default_factory=list)
     low_confidence_suggestions: List[EdgeProposal] = Field(default_factory=list)
-
-
-# ── Re-extraction system prompt ────────────────────────────────────────────────
-
-REEXTRACT_SYSTEM_PROMPT = """
-You are a mathematical knowledge extraction engine performing a TARGETED
-second-pass extraction.
-
-A human reviewer has already reviewed the initial extraction of this paper
-and identified the following MISSING concepts:
-
-<missing_concepts>
-{hints}
-</missing_concepts>
-
-The following concepts have ALREADY been extracted — do NOT re-extract them:
-
-<already_extracted>
-{existing_titles}
-</already_extracted>
-
-Your task:
-- Extract ONLY the missing concepts described in <missing_concepts>
-- Each missing concept hint may correspond to 1-3 MathObject entries
-- Do NOT extract anything not mentioned in <missing_concepts>
-- Apply the same MathObject schema and LaTeX formatting rules as the
-  primary extraction
-- If a hint is ambiguous, extract the most mathematically precise
-  interpretation
-
-{latex_formatting_rules}
-""".strip()
 
 
 # ── Two-pass skeleton models (Layer 3) ────────────────────────────────────────

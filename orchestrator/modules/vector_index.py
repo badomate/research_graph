@@ -52,10 +52,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+if TYPE_CHECKING:
+    from modules.config import Config
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -246,25 +249,42 @@ class VectorIndexEngine:
         "concept_conclusions",
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, config: "Config | None" = None) -> None:
         self._available: bool = False
-        self._vector_dim: int = _EMBEDDING_DIM
-        self._backend: str = _EMBEDDING_BACKEND
+        self._config = config
+        self._vector_dim: int = (
+            config.vector_embedding_dim if config is not None else _EMBEDDING_DIM
+        )
+        self._backend: str = (
+            config.vector_embedding_backend if config is not None else _EMBEDDING_BACKEND
+        )
+        self._embedding_model: str = (
+            config.vector_embedding_model if config is not None else _EMBEDDING_MODEL
+        )
         self._openai_client: Any = None
         self._local_model: Any = None
         # Notion client (lazily initialised on first rebuild() call).
         self._notion: Any = None
-        self._sb_db: str = os.environ.get("NOTION_SECOND_BRAIN_DB_ID", "")
-        self._ki_db: str = os.environ.get("NOTION_KNOWLEDGE_INBOX_DB_ID", "")
+        self._sb_db: str = (
+            config.notion_second_brain_db_id
+            if config is not None
+            else os.environ.get("NOTION_SECOND_BRAIN_DB_ID", "")
+        )
+        self._ki_db: str = (
+            config.notion_knowledge_inbox_db_id
+            if config is not None
+            else os.environ.get("NOTION_KNOWLEDGE_INBOX_DB_ID", "")
+        )
+        _qdrant_url = config.qdrant_url if config is not None else _QDRANT_URL
 
         # ── Connect to Qdrant ─────────────────────────────────────────────────
         try:
             from qdrant_client import QdrantClient
 
-            self._client = QdrantClient(url=_QDRANT_URL, timeout=10)
+            self._client = QdrantClient(url=_qdrant_url, timeout=10)
             # Connectivity smoke-test.
             self._client.get_collections()
-            logger.info("VectorIndexEngine: connected to Qdrant at %s.", _QDRANT_URL)
+            logger.info("VectorIndexEngine: connected to Qdrant at %s.", _qdrant_url)
         except Exception as exc:
             logger.warning(
                 "VectorIndexEngine: Qdrant unavailable (%s). "
@@ -308,7 +328,11 @@ class VectorIndexEngine:
     # ── Backend initialisation ────────────────────────────────────────────────
 
     def _init_openai_client(self) -> None:
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = (
+            self._config.openai_api_key
+            if self._config is not None
+            else os.environ.get("OPENAI_API_KEY")
+        )
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not set — cannot use OpenAI embeddings.")
         import openai
@@ -325,7 +349,7 @@ class VectorIndexEngine:
                 "Install with: pip install sentence-transformers>=2.7.0"
             ) from exc
 
-        model_name = _EMBEDDING_MODEL if _EMBEDDING_MODEL else "sentence-transformers/allenai-specter"
+        model_name = self._embedding_model or "sentence-transformers/allenai-specter"
         logger.info("VectorIndexEngine: loading local model '%s' ...", model_name)
         self._local_model = SentenceTransformer(model_name)
         logger.info("VectorIndexEngine: local model loaded.")

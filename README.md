@@ -287,6 +287,16 @@ persistent `qdrant_storage` Docker volume.
 The `marker-local` profiles download model weights on first run (~2–4 GB).
 These are cached in the `marker_models` Docker volume and survive rebuilds.
 
+### Tests
+
+The unit test image installs only the lightweight test dependencies and stubs
+external services such as Notion, Koofr, Marker, and the LLM clients:
+
+```bash
+docker build -f orchestrator/Dockerfile.test -t paper-pipeline-tests .
+docker run --rm paper-pipeline-tests
+```
+
 ---
 
 ## Status Pipeline

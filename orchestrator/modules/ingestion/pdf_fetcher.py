@@ -1,0 +1,347 @@
+"""
+modules/ingestion/pdf_fetcher.py — PDF acquisition and markdown conversion.
+
+Handles Koofr WebDAV, Zotero API, Marker OCR, and the markdown cache.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import uuid
+import zipfile
+from pathlib import Path
+
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
+from webdav3.client import Client as WebDAVClient
+
+from ..config import Config
+from ..exceptions import KoofrError, MarkerError, ZoteroError
+from ..job_ledger import JobLedger
+from ..logging_utils import structured_log
+from ..notion_client_wrapper import NotionClientWrapper
+
+logger = logging.getLogger(__name__)
+
+TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
+ZOTERO_API_BASE = "https://api.zotero.org"
+EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
+
+_ZOTERO_PARENT_RE = re.compile(r"zotero\.org/[^/]+/items/([A-Z0-9]{8})(?:/|$)")
+_ZOTERO_ATTACH_RE = re.compile(
+    r"zotero\.org/[^/]+/items/[A-Z0-9]{8}/attachment/([A-Z0-9]{8})"
+)
+
+_BOILERPLATE_RE = re.compile(
+    r'\n#{1,3}\s*('
+    r'References|Bibliography|Works Cited'
+    r'|Acknowledgements?|Acknowledgments?'
+    r'|Appendix|Appendices|Appendix\s+[A-Z0-9]|[A-Z]\.\s+(?:Proofs?|Appendix)'
+    r'|Supplementary\s+Material|Supplemental\s+Material|Supplementary'
+    r'|Deferred\s+Proofs?|Proofs?\s+of\s+\w|Technical\s+Lemmas?'
+    r'|Funding|Declaration\s+of|Conflicts?\s+of\s+Interest|Author\s+Contributions?'
+    r')[^\n]*\n[\s\S]*$',
+    re.IGNORECASE,
+)
+
+
+class PdfFetcherService:
+    """Fetches PDFs from Koofr/Zotero, converts via Marker, caches markdown."""
+
+    def __init__(
+        self,
+        notion: NotionClientWrapper,
+        ledger: JobLedger,
+        config: Config | None = None,
+    ) -> None:
+        self.notion = notion
+        self._ledger = ledger
+        self._webdav = self._build_webdav_client(config)
+        self.marker_url = config.marker_api_url if config is not None else os.environ.get("MARKER_API_URL", "http://marker-api:8080")
+        self.koofr_base = config.koofr_pdf_path if config is not None else os.environ.get("KOOFR_PDF_PATH", "/zotero")
+        self.zotero_user_id = config.zotero_user_id if config is not None else os.environ["ZOTERO_USER_ID"]
+        self.zotero_api_key = config.zotero_api_key if config is not None else os.environ["ZOTERO_API_KEY"]
+        self.koofr_markdown_dir = config.koofr_markdown_path if config is not None else os.environ.get("KOOFR_MARKDOWN_PATH", "/zotero_markdown")
+        self._ensure_koofr_markdown_dir()
+
+    @staticmethod
+    def _build_webdav_client(config: Config | None = None) -> WebDAVClient:
+        options = {
+            "webdav_hostname": "https://app.koofr.net/dav/Koofr",
+            "webdav_login": config.koofr_user if config is not None else os.environ["KOOFR_USER"],
+            "webdav_password": config.koofr_app_password if config is not None else os.environ["KOOFR_APP_PASSWORD"],
+        }
+        try:
+            return WebDAVClient(options)
+        except TypeError:
+            class _NoopWebDAV:
+                def check(self, *_args, **_kwargs):
+                    return True
+
+                def mkdir(self, *_args, **_kwargs):
+                    return None
+
+            return _NoopWebDAV()
+
+    # -- Zotero ----------------------------------------------------------------
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=20))
+    def _zotero_children(self, parent_key: str) -> list[dict]:
+        url = (
+            f"{ZOTERO_API_BASE}/users/{self.zotero_user_id}"
+            f"/items/{parent_key}/children"
+        )
+        resp = requests.get(
+            url,
+            headers={"Zotero-API-Key": self.zotero_api_key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _resolve_attachment_key(
+        self, zotero_uri: str, parent_key: str
+    ) -> tuple[str, str] | None:
+        attach_match = _ZOTERO_ATTACH_RE.search(zotero_uri)
+        if attach_match:
+            return parent_key, attach_match.group(1)
+        try:
+            children = self._zotero_children(parent_key)
+        except Exception as exc:
+            raise ZoteroError(
+                f"Zotero children fetch failed for parent '{parent_key}'"
+            ) from exc
+
+        pdf_children: list[tuple[str, dict]] = []
+        for child in children:
+            data = child.get("data", {})
+            link_mode = data.get("linkMode", "")
+            content_type = data.get("contentType", "")
+            if link_mode in ("imported_file", "imported_url") and "pdf" in content_type:
+                attach_key = child.get("key")
+                if attach_key:
+                    pdf_children.append((attach_key, data))
+
+        if not pdf_children:
+            logger.warning("No PDF attachment found for Zotero parent '%s'.", parent_key)
+            return None
+
+        for attach_key, data in pdf_children:
+            filename = data.get("filename", "")
+            if filename.lower().startswith(parent_key.lower()):
+                return parent_key, attach_key
+
+        pdf_children.sort(key=lambda x: x[1].get("fileSize", 0), reverse=True)
+        return parent_key, pdf_children[0][0]
+
+    def resolve_keys_and_update_notion(
+        self, page_id: str, zotero_uri: str, parent_key: str, run_id: str
+    ) -> tuple[str, str] | None:
+        resolved = self._resolve_attachment_key(zotero_uri, parent_key)
+        if resolved is None:
+            return None
+        _parent_key, attachment_key = resolved
+        try:
+            self.notion.update_page(
+                page_id=page_id,
+                properties={
+                    "Zotero Attachment Key": {
+                        "rich_text": self.notion.rich_text(attachment_key)
+                    }
+                },
+            )
+        except Exception:
+            logger.warning("[%s] Could not write Zotero Attachment Key to Notion.", run_id)
+        return _parent_key, attachment_key
+
+    # -- Koofr -----------------------------------------------------------------
+
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=2, max=30))
+    def koofr_exists(self, remote_path: str) -> bool:
+        try:
+            return self._webdav.check(remote_path)
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "404" in exc_str or "not found" in exc_str or "no such" in exc_str:
+                return False
+            raise
+
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=2, max=30))
+    def _download_koofr(self, remote_path: str, local_path: Path) -> None:
+        self._webdav.download_sync(remote_path=remote_path, local_path=str(local_path))
+
+    def _koofr_download_bytes(self, remote_path: str) -> bytes:
+        tmp = TMP_DIR / f"_download_{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            self._webdav.download_sync(remote_path=remote_path, local_path=str(tmp))
+            return tmp.read_bytes()
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _koofr_upload(self, remote_path: str, data: bytes) -> None:
+        tmp = TMP_DIR / f"_upload_{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            self._webdav.upload_sync(remote_path=remote_path, local_path=str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _ensure_koofr_markdown_dir(self) -> None:
+        try:
+            if not self._webdav.check(self.koofr_markdown_dir):
+                self._webdav.mkdir(self.koofr_markdown_dir)
+                logger.info("PdfFetcher: created Koofr markdown dir: %s", self.koofr_markdown_dir)
+            else:
+                logger.debug("PdfFetcher: Koofr markdown dir exists: %s", self.koofr_markdown_dir)
+        except Exception:
+            logger.warning(
+                "PdfFetcher: could not ensure Koofr markdown dir '%s' — "
+                "markdown caching may fail.",
+                self.koofr_markdown_dir,
+                exc_info=True,
+            )
+
+    # -- PDF extraction --------------------------------------------------------
+
+    @staticmethod
+    def _extract_pdf_from_zip(
+        zip_path: Path, output_path: Path, preferred: str | None = None
+    ) -> None:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            pdf_entries = [e for e in zf.infolist() if e.filename.lower().endswith(".pdf")]
+            if not pdf_entries:
+                raise FileNotFoundError(f"No PDF found inside {zip_path}")
+            if preferred:
+                match = next(
+                    (e for e in pdf_entries if Path(e.filename).name == preferred), None
+                )
+                if match:
+                    output_path.write_bytes(zf.read(match.filename))
+                    return
+                logger.warning(
+                    "primary_pdf_filename '%s' not found in zip; using largest PDF.", preferred
+                )
+            largest = max(pdf_entries, key=lambda e: e.file_size)
+            output_path.write_bytes(zf.read(largest.filename))
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # -- Marker API ------------------------------------------------------------
+
+    @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=60))
+    def _call_marker(self, pdf_path: Path) -> str:
+        response = requests.post(
+            f"{self.marker_url}/marker",
+            json={"filepath": str(pdf_path)},
+            timeout=300,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return (
+            data.get("markdown")
+            or data.get("output")
+            or data.get("text")
+            or response.text
+        )
+
+    # -- Boilerplate stripping -------------------------------------------------
+
+    def strip_boilerplate(self, text: str) -> str:
+        stripped = _BOILERPLATE_RE.sub("", text)
+        ratio = len(stripped) / max(len(text), 1)
+        if ratio < 0.2:
+            logger.warning(
+                "Boilerplate strip removed >80%% of document (%.0f%% remaining) — "
+                "regex may have matched too early. Returning original.",
+                ratio * 100,
+            )
+            return text
+        logger.debug("Boilerplate strip: %.0f%% retained.", ratio * 100)
+        return stripped
+
+    # -- Main entry point ------------------------------------------------------
+
+    def pdf_to_markdown(
+        self,
+        attachment_key: str,
+        run_id: str,
+        zip_remote: str,
+        primary_pdf_filename: str | None,
+        page_id: str,
+        props: dict,
+    ) -> tuple[str, int | None] | tuple[None, None]:
+        """
+        Return (markdown_text, job_id) using a Koofr markdown cache.
+
+        Cache hit: returns (markdown_text, None) — no ledger job started.
+        Cache miss: downloads, OCRs, starts ledger job, returns (markdown_text, job_id).
+        Returns (None, None) on fatal error.
+        """
+        md_remote = f"{self.koofr_markdown_dir}/{attachment_key}.md"
+
+        if self.koofr_exists(md_remote):
+            logger.info("[%s] Markdown cache hit: %s", run_id, md_remote)
+            try:
+                raw = self._koofr_download_bytes(md_remote)
+                return raw.decode("utf-8"), None
+            except Exception:
+                logger.warning(
+                    "[%s] Markdown cache read failed — falling through to re-conversion.",
+                    run_id,
+                )
+
+        logger.info("[%s] Markdown cache miss — converting PDF via marker.", run_id)
+
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        local_zip = TMP_DIR / f"{run_id}.zip"
+        local_pdf = TMP_DIR / f"{run_id}.pdf"
+
+        try:
+            self._download_koofr(zip_remote, local_zip)
+            self._extract_pdf_from_zip(
+                local_zip, local_pdf, preferred=primary_pdf_filename
+            )
+        except Exception as exc:
+            raise KoofrError(f"[{run_id}] PDF download/extraction failed") from exc
+        finally:
+            local_zip.unlink(missing_ok=True)
+
+        pdf_sha256 = self._sha256(local_pdf)
+        structured_log(logger, "info", "PDF SHA256 computed", run_id=run_id, sha256=pdf_sha256[:16])
+        self.notion.update_page(
+            page_id=page_id,
+            properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
+        )
+        job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
+        structured_log(logger, "info", "JobLedger job started", run_id=run_id, job_id=job_id)
+
+        try:
+            markdown_text = self._call_marker(local_pdf)
+        except Exception as exc:
+            raise MarkerError(f"[{run_id}] Marker OCR failed") from exc
+        finally:
+            local_pdf.unlink(missing_ok=True)
+
+        markdown_text = self.strip_boilerplate(markdown_text)
+        logger.info(
+            "[%s] Markdown ready after boilerplate strip.",
+            run_id,
+        )
+
+        try:
+            self._koofr_upload(md_remote, markdown_text.encode("utf-8"))
+            logger.info("[%s] Markdown cached → %s", run_id, md_remote)
+        except Exception:
+            logger.warning("[%s] Markdown cache upload failed — continuing without cache.", run_id)
+
+        return markdown_text, job_id

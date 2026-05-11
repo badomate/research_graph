@@ -19,11 +19,15 @@ import os
 import time
 import urllib.parse
 import urllib.request
+from typing import TYPE_CHECKING
 from xml.etree import ElementTree
 
 import anthropic
 
 from .notion_client_wrapper import NotionClientWrapper
+
+if TYPE_CHECKING:
+    from modules.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +58,28 @@ class ArXivSniper:
     ARXIV_API_URL = "https://export.arxiv.org/api/query"
     ARXIV_DELAY_SECONDS = 3  # hard constraint per ArXiv ToS
 
-    def __init__(self) -> None:
-        self.notion = NotionClientWrapper()
-        self.claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self.paper_tracker_db = os.environ["NOTION_PAPER_TRACKER_DB_ID"]
-
-        raw_keywords = os.environ.get(
-            "ARXIV_KEYWORDS",
-            "Mean Field Games,Master Equation",
+    def __init__(self, config: "Config | None" = None) -> None:
+        self.notion = NotionClientWrapper(config=config)
+        api_key = (
+            config.anthropic_api_key if config is not None else os.environ["ANTHROPIC_API_KEY"]
+        )
+        self.claude = anthropic.Anthropic(api_key=api_key)
+        self.paper_tracker_db = (
+            config.notion_paper_tracker_db_id
+            if config is not None
+            else os.environ["NOTION_PAPER_TRACKER_DB_ID"]
+        )
+        raw_keywords = (
+            config.arxiv_keywords
+            if config is not None
+            else os.environ.get("ARXIV_KEYWORDS", "Mean Field Games,Master Equation")
         )
         self.keywords: list[str] = [k.strip() for k in raw_keywords.split(",") if k.strip()]
-        self.threshold: int = int(os.environ.get("ARXIV_RELEVANCE_THRESHOLD", "8"))
+        self.threshold: int = (
+            config.arxiv_relevance_threshold
+            if config is not None
+            else int(os.environ.get("ARXIV_RELEVANCE_THRESHOLD", "8"))
+        )
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

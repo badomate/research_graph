@@ -15,6 +15,7 @@ from pathlib import Path
 # ── Load .env before any module import ───────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
+from orchestrator.modules.config import get_config
 from orchestrator.modules.vector_index import VectorIndexEngine
 # ── Make `orchestrator/` importable ──────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent / "orchestrator"))
@@ -27,6 +28,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-index = VectorIndexEngine()
+config = get_config()
+index = VectorIndexEngine(config) if config.vector_index_enabled else None
 # ── Run (no Qdrant — pass None for vector_index) ──────────────────────────────
-PromotionEngine(vector_index=index).run()
+PromotionEngine(vector_index=index, config=config).run()

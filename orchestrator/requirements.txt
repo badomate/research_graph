@@ -8,11 +8,11 @@ notion-client==2.2.1
 # Kept for embeddings only (vector_index.py). Generation calls migrated to Claude.
 # 1.52.0+ is required — earlier versions pass `proxies` to httpx which was
 # removed in httpx 0.28.0, causing a TypeError on client instantiation.
-openai
+openai>=1.52.0,<2
 
 # ── Anthropic (Claude) ────────────────────────────────────────────────────────
-anthropic>=0.40.0
-instructor[anthropic]>=1.3.0
+anthropic==0.40.0
+instructor[anthropic]==1.7.2
 
 # ── WebDAV (Koofr) ───────────────────────────────────────────────────────────
 webdavclient3==3.14.6
@@ -32,24 +32,26 @@ pyvis==0.3.2
 python-dotenv==1.0.1
 tenacity==8.3.0
 
-# ── Data validation ───────────────────────────────────────────────────────────
-pydantic>=2.0,<3
+# ── Data validation / configuration ───────────────────────────────────────────
+pydantic>=2.9,<3
+pydantic-settings>=2.6,<3
 
 # ── YAML parsing (tag registry) ───────────────────────────────────────────────
 pyyaml>=6.0
 
+# ── Templating ───────────────────────────────────────────────────────────────
+jinja2>=3.1,<4
+
 # ── Vector index (Module 7) ───────────────────────────────────────────────────
 # Qdrant client — synchronous API used throughout VectorIndexEngine.
-qdrant-client>=1.9.0
-# sentence-transformers is OPTIONAL: only required when
+qdrant-client==1.12.0
+# sentence-transformers/peft are OPTIONAL: only required when
 # VECTOR_EMBEDDING_BACKEND=local (SPECTER2 / other HuggingFace models).
-# Uncomment the line below to enable local embedding:
-sentence-transformers>=2.7.0
-
-peft
+# Install them in a derived image or local venv for local embedding:
+#   pip install "sentence-transformers>=2.7" peft
 
 # ── Fuzzy string matching (Module 7 pre-filters) ─────────────────────────────
 # Used for named-tool match and setting-containment signals in cross-paper
 # edge quality scoring.  Drop-in replacement for fuzzywuzzy with no
 # Levenshtein C-extension dependency and significantly better performance.
-rapidfuzz>=3.0.0
+rapidfuzz

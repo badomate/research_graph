@@ -15,7 +15,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from notion_client import Client
 from notion_client.errors import APIResponseError
@@ -25,6 +25,9 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+if TYPE_CHECKING:
+    from modules.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +82,8 @@ class NotionClientWrapper:
       2. Exponential back-off retry on 429 / 5xx.
     """
 
-    def __init__(self) -> None:
-        token = os.environ["NOTION_TOKEN"]
+    def __init__(self, config: "Config | None" = None) -> None:
+        token = config.notion_token if config is not None else os.environ["NOTION_TOKEN"]
         self._client = Client(auth=token)
 
     # ── Internal call helper ──────────────────────────────────────────────
@@ -121,9 +124,6 @@ class NotionClientWrapper:
         return self._call(self._client.pages.retrieve, page_id=page_id)
 
     def create_page(self, parent: dict, properties: dict, **kwargs: Any) -> dict:
-        logger.info("CREATE_PAGE payload properties keys: %s", list(properties.keys()))
-        logger.info("CREATE_PAGE full properties: %s", properties)
-    
         return self._call(
             self._client.pages.create,
             parent=parent,

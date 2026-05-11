@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+COPY orchestrator/requirements-test.txt /tmp/requirements-test.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-test.txt
+
+COPY . /workspace
+
+ENV PYTHONPATH=/workspace/orchestrator:/workspace
+
+CMD ["pytest", "orchestrator/tests", "tests", "-q"]
