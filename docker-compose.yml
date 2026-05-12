@@ -12,14 +12,14 @@ version: "3.9"
 #
 # Profiles
 # --------
-#   (default / no profile)   marker-api is active  — uses Datalab cloud API
+#   marker-api               marker-api is active  — uses Datalab cloud API
 #   marker-local-cpu         marker-local is active — CPU inference
 #   marker-local-gpu         marker-local is active — GPU inference (needs NVIDIA runtime)
 #
 # Usage
 # -----
-#   Cloud API (default):
-#     docker compose up
+#   Cloud API:
+#     docker compose --profile marker-api up
 #
 #   Local CPU:
 #     docker compose --profile marker-local-cpu up
@@ -49,6 +49,19 @@ services:
       # Switches between cloud proxy and local runner.
       # Override in .env: MARKER_API_URL=http://marker-local:8080
       MARKER_API_URL: "${MARKER_API_URL:-http://marker-api:8080}"
+      QDRANT_URL: "http://qdrant:6333"
+    depends_on:
+      marker-api:
+        condition: service_healthy
+        required: false
+      marker-local-cpu:
+        condition: service_healthy
+        required: false
+      marker-local-gpu:
+        condition: service_healthy
+        required: false
+      qdrant:
+        condition: service_started
     volumes:
       - tmp_storage:/tmp/pipeline
       - graph_static:/app/static
@@ -83,7 +96,10 @@ services:
       retries: 3
       start_period: 15s
     networks:
-      - pipeline_net
+      pipeline_net:
+        aliases:
+          - marker-api
+          - marker-local
 
   # ── 3. Marker local — CPU ─────────────────────────────────────────────────
   marker-local-cpu:
@@ -113,7 +129,10 @@ services:
       retries: 5
       start_period: 60s
     networks:
-      - pipeline_net
+      pipeline_net:
+        aliases:
+          - marker-api
+          - marker-local
 
   # ── 4. Marker local — GPU ─────────────────────────────────────────────────
   marker-local-gpu:
@@ -150,7 +169,10 @@ services:
       retries: 5
       start_period: 60s
     networks:
-      - pipeline_net
+      pipeline_net:
+        aliases:
+          - marker-api
+          - marker-local
 
   # ── 5. Dependency graph server ────────────────────────────────────────────
   graph-server:

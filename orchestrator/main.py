@@ -6,7 +6,6 @@ import logging
 import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
@@ -36,14 +35,35 @@ def _load_config() -> Config:
         sys.exit(1)
 
 
-def run_arxiv_sniper(config: Config) -> None:
-    from modules.arxiv_sniper import ArXivSniper
-
-    ArXivSniper(config).run()
-
-
 def run_dependency_grapher() -> None:
     DependencyGrapher().run()
+
+
+def _run_startup_once(config: Config, vector_index: VectorIndexEngine | None) -> None:
+    """Run the core jobs once before the scheduler starts ticking."""
+    startup_jobs = [
+        (
+            "Core Ingestion Engine",
+            lambda: IngestionEngine(vector_index=vector_index, config=config).run(),
+        ),
+        (
+            "Promotion Engine",
+            lambda: PromotionEngine(vector_index=vector_index, config=config).run(),
+        ),
+        ("Dependency Grapher", run_dependency_grapher),
+    ]
+    logger.info("Startup pass: running %d job(s) once now.", len(startup_jobs))
+    for name, fn in startup_jobs:
+        try:
+            logger.info("Startup pass: running %s ...", name)
+            fn()
+            logger.info("Startup pass: %s complete.", name)
+        except Exception as exc:
+            logger.exception(
+                "Startup pass: %s failed; scheduler will continue. error_type=%s",
+                name,
+                type(exc).__name__,
+            )
 
 
 def main() -> None:
@@ -59,15 +79,6 @@ def main() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
-    )
-    scheduler.add_job(
-        lambda: run_arxiv_sniper(config),
-        trigger=CronTrigger(hour=6, minute=0, timezone="UTC"),
-        id="arxiv_sniper",
-        name="ArXiv Sniper",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=600,
     )
     scheduler.add_job(
         run_dependency_grapher,
@@ -93,6 +104,7 @@ def main() -> None:
         logger.info("  - [%s] %s", job.id, job.name)
 
     try:
+        _run_startup_once(config, vector_index)
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Orchestrator shutting down.")
