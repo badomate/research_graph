@@ -6,9 +6,11 @@ Tracks every ingestion job so that:
   - Partial failures can be resumed from the last successful milestone.
   - Operators can inspect job history directly via SQLite (e.g. DB Browser).
 
-Status lifecycle:
-  started → marker_done → openai_done → notion_done (success)
-                                       └→ failed     (error path)
+Status lifecycle (v3):
+  started → marker_done → extract_done → retrieve_done → link_done
+                                       → notion_done (success)
+                                       └→ failed       (error path)
+  (openai_done is a retained v2 alias — see VALID_STATUSES below.)
 
 All SQL uses parameterized queries — never f-string or %-format SQL.
 All public methods acquire a module-level threading.Lock for thread safety.

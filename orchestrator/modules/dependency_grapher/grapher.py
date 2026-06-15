@@ -40,21 +40,27 @@ _jinja_env = Environment(
 
 # ── Colour maps ───────────────────────────────────────────────────────────────
 
+# Keys must match the Paper Tracker Status state machine (see CLAUDE.md).
 _PAPER_STATUS_COLOURS: dict[str, str] = {
-    "s1-process-math":        "#f4a261",
-    "s1b-waiting-attachment": "#e9c46a",
-    "blocked-tags":           "#e63946",
+    "s0-inbox":               "#8d99ae",
+    "s1-skim":                "#f4a261",
+    "s1-processing":          "#e9c46a",
+    "s1b-waiting-attachment": "#d4a373",
+    "blocked-extraction":     "#e63946",
     "s2-extracted":           "#2a9d8f",
-    "s2b-linked-ai":          "#6c63ff",
-    "Promoted":               "#52b788",
+    "s2-reextract":           "#6c63ff",
+    "s2-read":                "#457b9d",
+    "s3-distilled":           "#52b788",
 }
 
+# Keys must match ALLOWED_CONCEPT_TYPES in extraction_schema.py.
 _CONCEPT_TYPE_COLOURS: dict[str, str] = {
     "Theorem":        "#6c63ff",
     "Definition":     "#2a9d8f",
     "Lemma":          "#f4a261",
     "Algorithm":      "#e9c46a",
     "Assumption":     "#e63946",
+    "Proof":          "#9d4edd",
     "ProofTechnique": "#457b9d",
 }
 

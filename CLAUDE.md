@@ -57,10 +57,12 @@ Checkpoints in the ledger: `marker_done → extract_done → retrieve_done → l
 
 ### Schedulers (APScheduler, configured in `main.py`)
 
-- **ingestion** — every 1 min: picks papers with status `s1-processing`, runs 3-stage pipeline
-- **promotion** — every 1 min: promotes reviewed KI concepts to Second Brain, resolves deferred edges
+- **ingestion** — every 10 min: picks papers with status `s1-skim` / `s2-reextract`, runs 3-stage pipeline
+- **promotion** — every 30 min: promotes reviewed KI concepts to Second Brain, resolves deferred edges
 - **arxiv_sniper** — daily 06:00 UTC: keyword-based ArXiv auto-ingest
-- **dependency_grapher** — every 1 min: builds interactive HTML concept graphs
+- **dependency_grapher** — every 12 h: builds interactive HTML concept graphs
+
+The core jobs (ingestion, promotion, grapher) also run once at startup before the scheduler begins ticking.
 
 ### Key Modules (`orchestrator/modules/`)
 

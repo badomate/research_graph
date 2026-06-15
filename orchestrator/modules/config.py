@@ -102,6 +102,16 @@ class Config(BaseSettings):
     edge_review_flag_confidence: float = 0.65
     edge_max_candidates_to_gpt: int = 20
 
+    # ── Stage 3 batch linking (opt-in) ────────────────────────────────────────
+    # When enabled, all of a paper's Stage-3 LLM linking calls are submitted as a
+    # single Message Batch (50% cheaper, processed server-side in parallel) and
+    # polled to completion. Off by default — preserves the synchronous per-concept
+    # path. Note: the two-temperature validation second pass is skipped in batch
+    # mode (single-pass routing only).
+    link_use_batch_api: bool = False
+    link_batch_poll_seconds: int = 30
+    link_batch_timeout_seconds: int = 1800
+
     # ── Hydration concurrency ─────────────────────────────────────────────────
     notion_hydration_concurrency: int = 5
 

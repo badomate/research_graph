@@ -3,11 +3,19 @@ modules/ingestion/linker.py — Stage 3 LLM linking service.
 
 Calls Claude with the dual-channel edge confirmation prompt and routes
 proposals into auto vs. suggest channels.
+
+Two execution modes share the same prompt-building and routing logic:
+  - Synchronous (default): one Claude call per concept via ``run_stage_link``.
+  - Batched (opt-in, ``link_use_batch_api``): all of a paper's concepts are
+    submitted as one Message Batch via ``run_stage_link_batch`` — 50% cheaper
+    and processed in parallel server-side, at the cost of async polling and no
+    two-temperature validation pass.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -42,13 +50,29 @@ ENABLE_TWO_TEMPERATURE_VALIDATION: bool = os.environ.get(
 class ConceptLinker:
     """Wraps Stage 3 LLM linking logic."""
 
-    def __init__(self, claude_client, config: Config | None = None) -> None:
+    _LINK_TOOL_NAME = "record_links"
+
+    def __init__(
+        self,
+        claude_client,
+        config: Config | None = None,
+        anthropic_raw=None,
+    ) -> None:
         self.claude_client = claude_client
+        # Raw (non-instructor) Anthropic client — required only for the batch path.
+        self._anthropic_raw = anthropic_raw
         self._model = config.claude_model if config is not None else CLAUDE_MODEL
         self._enable_two_temperature_validation = (
             config.enable_two_temperature_validation
             if config is not None
             else ENABLE_TWO_TEMPERATURE_VALIDATION
+        )
+        self._use_batch_api = config.link_use_batch_api if config is not None else False
+        self._batch_poll_seconds = (
+            config.link_batch_poll_seconds if config is not None else 30
+        )
+        self._batch_timeout_seconds = (
+            config.link_batch_timeout_seconds if config is not None else 1800
         )
 
     def run_stage_link(
@@ -60,7 +84,7 @@ class ConceptLinker:
         """
         Dispatch to the correct linking prompt based on candidate type.
 
-        TF-IDF path (no Qdrant): write all candidates as suggest-only, no GPT.
+        TF-IDF path (no Qdrant): write all candidates as suggest-only, no LLM call.
         Same-paper-only candidates: legacy v1 prompt.
         Cross-paper candidates: dual-channel v2 prompt.
         """
@@ -71,40 +95,46 @@ class ConceptLinker:
         is_tfidf_path = not any(c.get("_score_obj") is not None for c in candidates)
 
         if is_tfidf_path and not has_cross_paper:
-            proposals = [
-                EdgeProposal(
-                    source_concept_title=concept.title,
-                    target_concept_title=c.get("title", "(unknown)"),
-                    target_notion_page_id=c.get("id", ""),
-                    relation_type="related",
-                    direction="A_to_B",
-                    channel="suggest",
-                    confidence=0.0,
-                    justification="TF-IDF fallback — no GPT confirmation",
-                    driving_fields=["keywords"],
-                    falsifiability="",
-                    needs_review=True,
-                )
-                for c in candidates
-                if c.get("id")
-            ]
-            return CrossPaperLinkResult(proposals=proposals)
+            return self._tfidf_suggestions(concept, candidates)
 
         try:
             if has_cross_paper:
                 result = self._call_claude_link_v2(concept, candidates)
             else:
-                result = self._call_openai_link(concept, candidates)
+                result = self._call_claude_link_v1(concept, candidates)
         except Exception as exc:
             raise LinkingError(
                 f"[{run_id}] LLM linking failed for '{concept.title}'"
             ) from exc
         return result
 
-    @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=2, min=10, max=120))
-    def _call_openai_link(
+    def _tfidf_suggestions(
         self, concept: MathObject, candidates: list[dict]
-    ) -> ConceptLinkResult:
+    ) -> CrossPaperLinkResult:
+        """TF-IDF fallback (no Qdrant): emit suggest-only edges, no LLM call."""
+        proposals = [
+            EdgeProposal(
+                source_concept_title=concept.title,
+                target_concept_title=c.get("title", "(unknown)"),
+                target_notion_page_id=c.get("id", ""),
+                relation_type="related",
+                direction="A_to_B",
+                channel="suggest",
+                confidence=0.0,
+                justification="TF-IDF fallback — no LLM confirmation",
+                driving_fields=["keywords"],
+                falsifiability="",
+                needs_review=True,
+            )
+            for c in candidates
+            if c.get("id")
+        ]
+        return CrossPaperLinkResult(proposals=proposals)
+
+    @staticmethod
+    def _build_link_v1_user_message(
+        concept: MathObject, candidates: list[dict]
+    ) -> str:
         candidate_lines = "\n".join(
             f"{i + 1}. [id:{r.get('id', '')}] {r['title']}"
             + (f" [{r['hub']}]" if r.get("hub") else "")
@@ -120,15 +150,25 @@ class ConceptLinker:
             f"Prereq keywords: {', '.join(concept.prereq_keywords)}\n"
             f"Downstream keywords: {', '.join(concept.downstream_keywords)}"
         )
-        user_message = (
+        return (
             f"CONCEPT:\n{concept_summary}\n\n"
             f"CANDIDATES:\n{candidate_lines}\n\n"
             "Identify relationships. Return JSON only."
         )
+
+    @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=2, min=10, max=120))
+    def _call_claude_link_v1(
+        self, concept: MathObject, candidates: list[dict]
+    ) -> ConceptLinkResult:
+        user_message = self._build_link_v1_user_message(concept, candidates)
         return self.claude_client.messages.create(
             model=self._model,
             max_tokens=4096,
-            system=LINKING_SYSTEM_PROMPT_V1,
+            system=[{
+                "type": "text",
+                "text": LINKING_SYSTEM_PROMPT_V1,
+                "cache_control": {"type": "ephemeral"},
+            }],
             messages=[{"role": "user", "content": user_message}],
             response_model=ConceptLinkResult,
         )
@@ -223,7 +263,7 @@ class ConceptLinker:
         return "\n".join(src_lines)
 
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=10, max=60))
-    def _call_edge_confirmation_gpt(
+    def _call_edge_confirmation(
         self,
         concept: MathObject,
         candidates: list[dict],
@@ -233,7 +273,13 @@ class ConceptLinker:
         return self.claude_client.messages.create(
             model=self._model,
             max_tokens=4096,
-            system=EDGE_CONFIRMATION_SYSTEM_PROMPT,
+            # Static system prompt reused for every concept's edge confirmation —
+            # cache it so only the per-concept candidate block is full-price.
+            system=[{
+                "type": "text",
+                "text": EDGE_CONFIRMATION_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
             messages=[{"role": "user", "content": user_message}],
             response_model=CrossPaperLinkResult,
             temperature=temperature,
@@ -258,7 +304,7 @@ class ConceptLinker:
             return first_pass_auto
 
         try:
-            second_pass_result = self._call_edge_confirmation_gpt(
+            second_pass_result = self._call_edge_confirmation(
                 concept, filtered_candidates, temperature=0.3
             )
         except Exception:
@@ -291,13 +337,28 @@ class ConceptLinker:
         self, concept: MathObject, candidates: list[dict]
     ) -> CrossPaperLinkResult:
         try:
-            raw_result = self._call_edge_confirmation_gpt(concept, candidates, temperature=0)
+            raw_result = self._call_edge_confirmation(concept, candidates, temperature=0)
         except Exception:
             logger.warning(
-                "_call_claude_link_v2: GPT call failed for '%s'.", concept.title, exc_info=True
+                "_call_claude_link_v2: edge-confirmation call failed for '%s'.",
+                concept.title, exc_info=True
             )
             return CrossPaperLinkResult()
 
+        return self._route_cross_paper(concept, candidates, raw_result, allow_two_temp=True)
+
+    def _route_cross_paper(
+        self,
+        concept: MathObject,
+        candidates: list[dict],
+        raw_result: CrossPaperLinkResult,
+        allow_two_temp: bool = True,
+    ) -> CrossPaperLinkResult:
+        """Annotate, route, and (optionally) two-temperature-validate raw proposals.
+
+        Shared by the synchronous and batch paths. ``allow_two_temp=False``
+        skips the second LLM call (used by the batch path, which is single-pass).
+        """
         scores_by_id: dict[str, CandidateScore] = {
             cand.get("id", ""): cand["_score_obj"]
             for cand in candidates
@@ -320,7 +381,7 @@ class ConceptLinker:
 
         auto_edges, suggest_edges = route_edge_proposals(raw_result.proposals, scores_by_id)
 
-        if self._enable_two_temperature_validation and auto_edges:
+        if allow_two_temp and self._enable_two_temperature_validation and auto_edges:
             same_paper_ids = {
                 c.get("id", "") for c in candidates if c.get("_concept_data") is None
             }
@@ -343,3 +404,170 @@ class ConceptLinker:
             proposals=auto_edges + suggest_edges,
             low_confidence_suggestions=[],
         )
+
+    # ── Batch path (opt-in via link_use_batch_api) ─────────────────────────────
+
+    @staticmethod
+    def _structured_tool(model_cls) -> dict:
+        """Build a forced-tool definition that mirrors instructor's tool mode."""
+        return {
+            "name": ConceptLinker._LINK_TOOL_NAME,
+            "description": (
+                (model_cls.__doc__ or "Emit the structured linking result.").strip()[:1024]
+            ),
+            "input_schema": model_cls.model_json_schema(),
+        }
+
+    @classmethod
+    def _parse_tool_message(cls, message, model_cls):
+        """Validate the forced tool_use input from a batch result Message."""
+        for block in getattr(message, "content", None) or []:
+            if getattr(block, "type", None) == "tool_use":
+                try:
+                    return model_cls.model_validate(block.input)
+                except Exception:
+                    logger.warning(
+                        "Batch: could not validate %s tool output — using empty result.",
+                        model_cls.__name__, exc_info=True,
+                    )
+                    return model_cls()
+        return model_cls()
+
+    def _build_link_batch_params(
+        self, concept: MathObject, candidates: list[dict], kind: str
+    ) -> dict:
+        """Build the Messages params for one concept's batch request (v1 or v2)."""
+        if kind == "v2":
+            system_prompt = EDGE_CONFIRMATION_SYSTEM_PROMPT
+            user_message = self._build_link_v2_user_message(concept, candidates)
+            tool = self._structured_tool(CrossPaperLinkResult)
+        else:
+            system_prompt = LINKING_SYSTEM_PROMPT_V1
+            user_message = self._build_link_v1_user_message(concept, candidates)
+            tool = self._structured_tool(ConceptLinkResult)
+        return {
+            "model": self._model,
+            "max_tokens": 4096,
+            "system": [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [{"role": "user", "content": user_message}],
+            "tools": [tool],
+            "tool_choice": {"type": "tool", "name": self._LINK_TOOL_NAME},
+        }
+
+    def run_stage_link_batch(
+        self,
+        concept_candidates: list[tuple[MathObject, str, list[dict]]],
+        run_id: str,
+    ) -> dict[str, ConceptLinkResult | CrossPaperLinkResult]:
+        """
+        Stage-3 linking via the Message Batches API (50% cost, async).
+
+        ``concept_candidates`` is a list of (concept, ki_page_id, candidates).
+        Concepts needing no LLM call (no candidates / TF-IDF-only) are resolved
+        locally; the rest are submitted as a single batch and polled to
+        completion. Returns ``{ki_page_id: result}`` — a missing key means that
+        concept's batch item errored or timed out (logged), and it is left
+        unlinked for this run rather than re-billed synchronously.
+        """
+        results: dict[str, ConceptLinkResult | CrossPaperLinkResult] = {}
+        requests: list[dict] = []
+        meta: dict[str, tuple] = {}  # custom_id -> (ki_page_id, concept, candidates, kind)
+
+        for idx, (concept, ki_page_id, candidates) in enumerate(concept_candidates):
+            if not candidates:
+                results[ki_page_id] = ConceptLinkResult()
+                continue
+            has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
+            is_tfidf_path = not any(c.get("_score_obj") is not None for c in candidates)
+            if is_tfidf_path and not has_cross_paper:
+                results[ki_page_id] = self._tfidf_suggestions(concept, candidates)
+                continue
+            kind = "v2" if has_cross_paper else "v1"
+            custom_id = f"link_{idx}"
+            requests.append({
+                "custom_id": custom_id,
+                "params": self._build_link_batch_params(concept, candidates, kind),
+            })
+            meta[custom_id] = (ki_page_id, concept, candidates, kind)
+
+        if not requests:
+            return results
+
+        if self._enable_two_temperature_validation:
+            logger.warning(
+                "[%s] Batch linking routes auto edges single-pass; "
+                "two-temperature validation is skipped in batch mode.", run_id,
+            )
+
+        logger.info(
+            "[%s] Stage 3: submitting %d concept(s) as one batch.", run_id, len(requests)
+        )
+        messages_by_id = self._submit_and_poll(requests, run_id)
+
+        for custom_id, (ki_page_id, concept, candidates, kind) in meta.items():
+            message = messages_by_id.get(custom_id)
+            if message is None:
+                logger.warning(
+                    "[%s] Batch: no result for concept '%s' — left unlinked this run.",
+                    run_id, concept.title,
+                )
+                continue
+            if kind == "v2":
+                raw = self._parse_tool_message(message, CrossPaperLinkResult)
+                results[ki_page_id] = self._route_cross_paper(
+                    concept, candidates, raw, allow_two_temp=False
+                )
+            else:
+                results[ki_page_id] = self._parse_tool_message(message, ConceptLinkResult)
+
+        return results
+
+    def _submit_and_poll(self, requests: list[dict], run_id: str) -> dict:
+        """Submit one Message Batch, block until it ends (or times out), return
+        ``{custom_id: Message}`` for succeeded items."""
+        if self._anthropic_raw is None:
+            raise LinkingError(
+                f"[{run_id}] Batch linking requires a raw Anthropic client "
+                "(anthropic_raw was not provided to ConceptLinker)."
+            )
+
+        batch = self._anthropic_raw.messages.batches.create(requests=requests)
+        logger.info(
+            "[%s] Batch %s submitted (%d request(s)); polling every %ds.",
+            run_id, batch.id, len(requests), self._batch_poll_seconds,
+        )
+
+        deadline = time.monotonic() + self._batch_timeout_seconds
+        while True:
+            current = self._anthropic_raw.messages.batches.retrieve(batch.id)
+            if current.processing_status == "ended":
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[%s] Batch %s exceeded %ds timeout — cancelling.",
+                    run_id, batch.id, self._batch_timeout_seconds,
+                )
+                try:
+                    self._anthropic_raw.messages.batches.cancel(batch.id)
+                except Exception:
+                    logger.warning("[%s] Batch %s cancel failed.", run_id, batch.id, exc_info=True)
+                break
+            time.sleep(self._batch_poll_seconds)
+
+        out: dict = {}
+        try:
+            for result in self._anthropic_raw.messages.batches.results(batch.id):
+                if result.result.type == "succeeded":
+                    out[result.custom_id] = result.result.message
+                else:
+                    logger.warning(
+                        "[%s] Batch item %s did not succeed: %s",
+                        run_id, result.custom_id, result.result.type,
+                    )
+        except Exception:
+            logger.exception("[%s] Batch %s: failed to retrieve results.", run_id, batch.id)
+        return out

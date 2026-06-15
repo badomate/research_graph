@@ -6,9 +6,11 @@ import logging
 import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
+from modules.arxiv_sniper import ArXivSniper
 from modules.config import Config, get_config
 from modules.dependency_grapher import DependencyGrapher
 from modules.ingestion import IngestionEngine
@@ -37,6 +39,10 @@ def _load_config() -> Config:
 
 def run_dependency_grapher() -> None:
     DependencyGrapher().run()
+
+
+def run_arxiv_sniper(config: Config) -> None:
+    ArXivSniper(config=config).run()
 
 
 def _run_startup_once(config: Config, vector_index: VectorIndexEngine | None) -> None:
@@ -97,6 +103,15 @@ def main() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=120,
+    )
+    scheduler.add_job(
+        lambda: run_arxiv_sniper(config),
+        trigger=CronTrigger(hour=6, minute=0),
+        id="arxiv_sniper",
+        name="ArXiv Sniper",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
 
     logger.info("Orchestrator starting - %d job(s) scheduled.", len(scheduler.get_jobs()))

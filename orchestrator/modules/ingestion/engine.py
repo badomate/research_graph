@@ -72,7 +72,9 @@ class IngestionEngine:
         self._pdf_fetcher = PdfFetcherService(self.notion, self._ledger, self.config)
         self._extractor = ExtractionService(self.claude_client, self.anthropic_raw, self.config)
         self._retriever = CandidateRetriever(self.notion, self._vector_index, self.config)
-        self._linker = ConceptLinker(self.claude_client, self.config)
+        self._linker = ConceptLinker(
+            self.claude_client, self.config, anthropic_raw=self.anthropic_raw
+        )
         self._ki_writer = KnowledgeInboxWriter(self.notion, self.knowledge_inbox_db)
 
     @staticmethod
@@ -284,8 +286,6 @@ class IngestionEngine:
                 run_id=run_id, tokens=cleaned_tokens,
             )
             extraction = self._extractor.run_extraction(markdown_text, cleaned_tokens, hubs, run_id)
-            if job_id is not None:
-                self._ledger.update_status(job_id, "openai_done")
 
             # Stage 1 / Step 3: Patch Paper Tracker metadata
             logger.info("[%s] Stage 1: patching Notion paper row ...", run_id)
@@ -420,15 +420,7 @@ class IngestionEngine:
 
             # Stage 3: LLM linking
             structured_log(logger, "info", "Stage 3: LLM linking", run_id=run_id)
-            for concept, ki_page_id, candidates in concept_candidates:
-                try:
-                    link_result = self._linker.run_stage_link(concept, candidates, run_id)
-                    self._ki_writer.update_knowledge_item_graph_data(ki_page_id, link_result)
-                except Exception as exc:
-                    logger.exception(
-                        "[%s] Link stage failed for concept '%s'; error_type=%s",
-                        run_id, concept.title, type(exc).__name__,
-                    )
+            self._run_link_stage(concept_candidates, run_id)
             if job_id is not None:
                 self._ledger.update_status(job_id, "link_done")
 
@@ -472,6 +464,47 @@ class IngestionEngine:
                     "[%s] Could not write error context to Notion Paper Tracker.", run_id
                 )
             raise
+
+    def _run_link_stage(
+        self,
+        concept_candidates: list[tuple[MathObject, str, list[dict]]],
+        run_id: str,
+    ) -> None:
+        """Execute Stage 3 either as one batch (opt-in) or per-concept (default).
+
+        On any hard failure of the batch path, fall through to the synchronous
+        per-concept path so edges are still created.
+        """
+        if self.config.link_use_batch_api:
+            try:
+                results = self._linker.run_stage_link_batch(concept_candidates, run_id)
+            except Exception:
+                logger.exception(
+                    "[%s] Stage 3: batch linking failed — falling back to per-concept.",
+                    run_id,
+                )
+            else:
+                for _concept, ki_page_id, _candidates in concept_candidates:
+                    link_result = results.get(ki_page_id)
+                    if link_result is None:
+                        continue
+                    try:
+                        self._ki_writer.update_knowledge_item_graph_data(ki_page_id, link_result)
+                    except Exception:
+                        logger.exception(
+                            "[%s] Stage 3: failed to write graph data for %s",
+                            run_id, ki_page_id,
+                        )
+                return
+
+        for concept, ki_page_id, candidates in concept_candidates:
+            try:
+                link_result = self._linker.run_stage_link(concept, candidates, run_id)
+                self._ki_writer.update_knowledge_item_graph_data(ki_page_id, link_result)
+            except Exception:
+                logger.exception(
+                    "[%s] Link stage failed for concept '%s'", run_id, concept.title
+                )
 
     def _inject_ki_pages_into_index(
         self,
@@ -643,14 +676,7 @@ class IngestionEngine:
             self._retriever.update_knowledge_item_candidates(ki_page_id, candidates)
             concept_candidates.append((concept, ki_page_id, candidates))
 
-        for concept, ki_page_id, candidates in concept_candidates:
-            try:
-                link_result = self._linker.run_stage_link(concept, candidates, run_id)
-                self._ki_writer.update_knowledge_item_graph_data(ki_page_id, link_result)
-            except Exception:
-                logger.exception(
-                    "[%s] Re-extraction: link stage failed for '%s'", run_id, concept.title
-                )
+        self._run_link_stage(concept_candidates, run_id)
 
         self.notion.update_page(
             page_id=page_id,

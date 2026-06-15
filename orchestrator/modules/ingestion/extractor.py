@@ -5,11 +5,9 @@ Dispatches to single-shot, two-pass, or section-by-section extraction.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from typing import Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -49,16 +47,36 @@ _SKIP_SECTION_KEYWORDS = (
     "proof of", "proofs of", "deferred", "technical lemma",
 )
 
-MAX_REPAIR_ERRORS = 5
+
+# cl100k_base (OpenAI's tokenizer) is only an approximation for Claude — it
+# undercounts by ~15-20% on prose and considerably more on LaTeX-dense math.
+# Since this estimate gates chunking and input truncation, apply a safety margin
+# so dense papers chunk early enough rather than silently overrunning the budget.
+_CLAUDE_TOKEN_MARGIN = 1.2
+
+
+def _build_extraction_user_message(markdown: str) -> str:
+    """Build the Stage-1 extraction user message (kept pure for testability)."""
+    return (
+        "Extract structured knowledge from the following paper.\n\n"
+        "INSTRUCTIONS\n"
+        "- Follow the schema strictly.\n"
+        "- Prefer 3–12 high-value concepts.\n"
+        "- Do not output theorem/lemma numbers as titles.\n"
+        "- Do not include proof-only microlemmas.\n\n"
+        "PAPER MARKDOWN:\n\n"
+        f"{markdown[:100_000]}"
+    )
 
 
 def _count_tokens(text: str) -> int:
     try:
         import tiktoken  # type: ignore
         enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        approx = len(enc.encode(text))
     except Exception:
-        return len(text) // 4
+        approx = len(text) // 4
+    return int(approx * _CLAUDE_TOKEN_MARGIN)
 
 
 def is_dense_paper(markdown: str, token_count: int) -> bool:
@@ -284,7 +302,11 @@ class ExtractionService:
             result = self.claude_client.messages.create(
                 model=self._model,
                 max_tokens=1000,
-                system=self._SKELETON_SYSTEM_PROMPT,
+                system=[{
+                    "type": "text",
+                    "text": self._SKELETON_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[{
                     "role": "user",
                     "content": (
@@ -339,7 +361,7 @@ class ExtractionService:
         self, markdown: str, hubs: dict[str, str], run_id: str
     ) -> ExtractionResult:
         try:
-            result = self._call_openai(markdown, hubs)
+            result = self._call_claude_extract(markdown, hubs)
         except Exception as exc:
             raise ExtractionError(
                 f"[{run_id}] Claude extraction failed after retries"
@@ -354,56 +376,27 @@ class ExtractionService:
         return result
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
-    def _call_openai(self, markdown: str, hubs: dict[str, str]) -> ExtractionResult:
+    def _call_claude_extract(self, markdown: str, hubs: dict[str, str]) -> ExtractionResult:
         hub_names_str = (
             ", ".join(f'"{name}"' for name in hubs) if hubs else '"Uncategorized"'
         )
         system_prompt = EXTRACTION_SYSTEM_PROMPT.replace(
             "[INJECT_DYNAMIC_HUBS_HERE]", hub_names_str
         )
+        user_message = _build_extraction_user_message(markdown)
         result = self.claude_client.messages.create(
             model=self._model,
             max_tokens=8192,
-            system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Extract structured knowledge from the following "
-                    " "
-                    "INSTRUCTIONS"
-                    "- Follow the schema strictly."
-                    "- Prefer 3–12 high-value concepts."
-                    "- Do not output theorem/lemma numbers as titles."
-                    "- Do not include proof-only microlemmas."
-                    " "
-                    "PAPER MARKDOWN:\n\n"
-                    f"{markdown[:100_000]}"
-                ),
+            # The system prompt (with injected hubs) is stable across every paper
+            # and concept in a run — cache it so only the per-paper markdown is
+            # billed at full input price after the first call.
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
             }],
+            messages=[{"role": "user", "content": user_message}],
             response_model=ExtractionResult,
         )
         logger.info("Claude extraction response received.")
         return result
-
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=30))
-    def _call_openai_repair(
-        self, invalid_output: dict[str, Any], error_summary: str
-    ) -> dict[str, Any]:
-        response = self.anthropic_raw.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=(
-                "You are a JSON repair assistant. Fix the following JSON to match "
-                "the required schema. Return only valid JSON, no explanation."
-            ),
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"The following JSON failed validation with these errors:\n"
-                    f"{error_summary}\n\n"
-                    f"Invalid JSON:\n{json.dumps(invalid_output, indent=2)}\n\n"
-                    "Return the corrected JSON."
-                ),
-            }],
-        )
-        return json.loads(response.content[0].text)

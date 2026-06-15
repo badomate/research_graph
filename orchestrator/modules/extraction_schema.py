@@ -1,7 +1,7 @@
 """
-modules/extraction_schema.py — Pydantic models for OpenAI extraction output
+modules/extraction_schema.py — Pydantic models for Claude extraction output
 ────────────────────────────────────────────────────────────────────────────
-Defines the canonical schema that the OpenAI extraction prompt must produce,
+Defines the canonical schema that the Claude extraction prompt must produce,
 plus link-stage models and validation helpers.
 
 EXTRACTION_VERSION should be bumped whenever the prompt or schema changes

@@ -4,7 +4,7 @@ modules/arxiv_sniper.py — Module 2: ArXiv Sniper
 Daily job (06:00) that:
 
   1. Queries export.arxiv.org for configurable mathematical keywords.
-  2. Sends each abstract to ChatGPT (gpt-4o) for a relevance score (1–10).
+  2. Sends each abstract to Claude for a relevance score (1–10).
   3. Creates a Notion "Paper Tracker" row (Status = s0-inbox, Tag = Automated-Radar)
      for every paper scoring >= threshold (default 8).
 
@@ -181,7 +181,7 @@ class ArXivSniper:
         logger.info("ArXiv: score >= %d — creating Notion row …", self.threshold)
         self._create_notion_row(entry, score, justification)
 
-    # ── OpenAI scoring ────────────────────────────────────────────────────────
+    # ── Claude scoring ──────────────────────────────────────────────────────────
 
     def _score_relevance(self, title: str, abstract: str) -> tuple[int, str]:
         """Ask Claude to score relevance; return (score, justification)."""
