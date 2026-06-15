@@ -27,17 +27,26 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
-    # ── Notion ────────────────────────────────────────────────────────────────
-    notion_token: str
-    notion_paper_tracker_db_id: str
-    notion_knowledge_inbox_db_id: str
-    notion_second_brain_db_id: str
+    # ── Database (SQLite source of truth; replaces Notion) ──────────────────────
+    # Default targets the shared Docker volume; override for local dev, e.g.
+    #   DATABASE_URL=sqlite:///./app.db
+    database_url: str = "sqlite:////data/app.db"
+    # Where uploaded PDFs are stored (in-app "Add Paper").
+    uploads_dir: str = "/data/uploads"
+
+    # ── Notion (DEPRECATED — being removed; kept optional during the cutover) ──
+    notion_token: str = ""
+    notion_paper_tracker_db_id: str = ""
+    notion_knowledge_inbox_db_id: str = ""
+    notion_second_brain_db_id: str = ""
     notion_edges_db_id: str = ""
     notion_deferred_edges_db_id: str = ""
     notion_projects_db_id: str = ""
 
     # ── Anthropic / LLM ───────────────────────────────────────────────────────
-    anthropic_api_key: str
+    # Optional so the stack boots with zero config; extraction logs a warning and
+    # is skipped if unset.
+    anthropic_api_key: str = ""
     claude_model: str = "claude-sonnet-4-6"
     claude_fast_model: str = "claude-sonnet-4-6"
 
@@ -55,15 +64,18 @@ class Config(BaseSettings):
     )
     retrieve_candidates_k: int = 30
 
-    # ── Koofr / WebDAV ────────────────────────────────────────────────────────
-    koofr_user: str
-    koofr_app_password: str
+    # ── Koofr / WebDAV (optional — only the Zotero-attachment intake path) ─────
+    koofr_user: str = ""
+    koofr_app_password: str = ""
     koofr_pdf_path: str = "/zotero"
     koofr_markdown_path: str = "/zotero_markdown"
 
-    # ── Zotero ────────────────────────────────────────────────────────────────
-    zotero_user_id: str
-    zotero_api_key: str
+    # ── Zotero (optional — intake sync + attachment/notes fetch) ────────────────
+    zotero_user_id: str = ""
+    zotero_api_key: str = ""
+    # Background poller that imports new Zotero library items (replaces Notero).
+    zotero_poll_enabled: bool = False
+    zotero_poll_minutes: int = 60
 
     # ── Pipeline I/O ──────────────────────────────────────────────────────────
     marker_api_url: str = "http://marker-api:8080"

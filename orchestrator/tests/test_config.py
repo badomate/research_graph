@@ -1,48 +1,37 @@
-"""Tests for modules/config.py — Config validation."""
+"""Tests for modules/config.py — Config validation.
+
+The app now boots with zero configuration (SQLite + sensible defaults); external
+service credentials are optional. Only the candidate-scoring weight-sum invariant
+is still enforced.
+"""
 import os
+import sys
+
 import pytest
 from pydantic import ValidationError
 
 
-_REQUIRED_FIELDS = {
-    "NOTION_TOKEN": "tok",
-    "NOTION_PAPER_TRACKER_DB_ID": "db1",
-    "NOTION_KNOWLEDGE_INBOX_DB_ID": "db2",
-    "NOTION_SECOND_BRAIN_DB_ID": "db3",
-    "ANTHROPIC_API_KEY": "key",
-    "KOOFR_USER": "user",
-    "KOOFR_APP_PASSWORD": "pass",
-    "ZOTERO_USER_ID": "zid",
-    "ZOTERO_API_KEY": "zkey",
-}
-
-
-_OPTIONAL_ENVS = [
-    "NOTION_EDGES_DB_ID", "NOTION_DEFERRED_EDGES_DB_ID", "NOTION_PROJECTS_DB_ID",
-    "CLAUDE_MODEL", "CLAUDE_FAST_MODEL", "QDRANT_URL", "VECTOR_EMBEDDING_BACKEND",
-    "RETRIEVE_CANDIDATES_K", "ENABLE_VECTOR_INDEX", "MARKER_API_URL",
-    "PIPELINE_TMP_DIR", "TOKEN_THRESHOLD_CHUNK", "NAMED_TOOL_MATCH_THRESHOLD",
+_MANAGED_ENVS = [
+    "DATABASE_URL", "ANTHROPIC_API_KEY", "CLAUDE_MODEL", "CLAUDE_FAST_MODEL",
+    "QDRANT_URL", "VECTOR_EMBEDDING_BACKEND", "RETRIEVE_CANDIDATES_K",
+    "ENABLE_VECTOR_INDEX", "VECTOR_INDEX_ENABLED", "MARKER_API_URL",
+    "ZOTERO_POLL_ENABLED", "ZOTERO_POLL_MINUTES",
     "WEIGHT_QDRANT", "WEIGHT_NAMED_TOOL", "WEIGHT_ASSUMPTION_OVERLAP",
     "WEIGHT_SETTING_CONTAINMENT", "WEIGHT_KEYWORD_JACCARD",
-    "EDGE_AUTO_CREATE_CONFIDENCE", "EDGE_REVIEW_FLAG_CONFIDENCE",
 ]
 
 
-def _make_config(env: dict):
-    """Import Config fresh inside a controlled env, isolated from real .env."""
-    import sys
-    # Back up everything we'll touch (supplied keys + optionals we clear).
-    all_keys = list(env.keys()) + _OPTIONAL_ENVS
-    backup = {k: os.environ.get(k) for k in all_keys}
+def _make_config(env: dict | None = None):
+    """Import Config fresh inside a controlled env, isolated from the real .env."""
+    env = env or {}
+    backup = {k: os.environ.get(k) for k in list(env.keys()) + _MANAGED_ENVS}
     try:
-        # Clear optional vars so real .env values don't bleed in.
-        for k in _OPTIONAL_ENVS:
+        for k in _MANAGED_ENVS:
             if k not in env:
                 os.environ.pop(k, None)
         for k, v in env.items():
             os.environ[k] = v
-        if "modules.config" in sys.modules:
-            del sys.modules["modules.config"]
+        sys.modules.pop("modules.config", None)
         from modules.config import Config
         return Config(_env_file=None)
     finally:
@@ -51,41 +40,30 @@ def _make_config(env: dict):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = orig
-        if "modules.config" in sys.modules:
-            del sys.modules["modules.config"]
+        sys.modules.pop("modules.config", None)
 
 
 class TestConfigValidation:
-    def test_raises_when_notion_token_missing(self):
-        env = {k: v for k, v in _REQUIRED_FIELDS.items() if k != "NOTION_TOKEN"}
-        env.pop("NOTION_TOKEN", None)
-        # Ensure key is absent
-        os.environ.pop("NOTION_TOKEN", None)
-        with pytest.raises(ValidationError):
-            _make_config(env)
-
-    def test_raises_when_anthropic_key_missing(self):
-        env = {k: v for k, v in _REQUIRED_FIELDS.items() if k != "ANTHROPIC_API_KEY"}
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-        with pytest.raises(ValidationError):
-            _make_config(env)
-
-    def test_loads_with_all_required_fields(self):
-        cfg = _make_config(_REQUIRED_FIELDS)
-        assert cfg.notion_token == "tok"
-        assert cfg.anthropic_api_key == "key"
-        assert cfg.koofr_user == "user"
-        assert cfg.zotero_user_id == "zid"
+    def test_boots_with_zero_config(self):
+        cfg = _make_config({})
+        assert cfg.anthropic_api_key == ""          # optional now
+        assert cfg.database_url.startswith("sqlite")
 
     def test_defaults(self):
-        cfg = _make_config(_REQUIRED_FIELDS)
+        cfg = _make_config({})
         assert cfg.claude_model == "claude-sonnet-4-6"
         assert cfg.qdrant_url == "http://localhost:6333"
         assert cfg.retrieve_candidates_k == 30
-        assert cfg.notion_edges_db_id == ""
+        assert cfg.zotero_poll_enabled is False
+
+    def test_database_url_override(self):
+        cfg = _make_config({"DATABASE_URL": "sqlite:///./custom.db"})
+        assert cfg.database_url == "sqlite:///./custom.db"
 
     def test_optional_fields_can_be_overridden(self):
-        env = {**_REQUIRED_FIELDS, "RETRIEVE_CANDIDATES_K": "50", "NOTION_EDGES_DB_ID": "edges_db"}
-        cfg = _make_config(env)
+        cfg = _make_config({"RETRIEVE_CANDIDATES_K": "50"})
         assert cfg.retrieve_candidates_k == 50
-        assert cfg.notion_edges_db_id == "edges_db"
+
+    def test_weights_must_sum_to_one(self):
+        with pytest.raises(ValidationError):
+            _make_config({"WEIGHT_QDRANT": "0.99", "WEIGHT_NAMED_TOOL": "0.99"})
