@@ -1,14 +1,38 @@
 {% extends "base.html" %}
 {% block title %}Find · paper_pipeline{% endblock %}
 {% block content %}
-<div class="page-head"><h1>Find papers</h1></div>
+<div class="page-head"><h1>Find papers</h1>
+  <div class="head-links"><a href="/external{% if q %}?q={{ q|urlencode }}{% endif %}">External search ↗</a></div>
+</div>
 <form class="card form-inline" action="/find" method="get" role="search">
   <input name="q" value="{{ q }}" placeholder="Search title, authors, abstract, notes, parsed text…"
          autocomplete="off" autofocus style="flex:1">
+  <select name="mode" aria-label="search mode">
+    <option value="exact" {% if mode != 'semantic' %}selected{% endif %}>exact</option>
+    <option value="semantic" {% if mode == 'semantic' %}selected{% endif %}>semantic</option>
+  </select>
   <button class="btn btn-primary" type="submit">Search</button>
 </form>
 
-{% if q %}
+{% if q and mode == 'semantic' %}
+<p class="muted">{{ sem_results|length }} semantic result(s) for “{{ q }}”
+  {% if sem_results %}<span class="pill">{{ sem_results[0].backend }}</span>{% endif %}.</p>
+{% for r in sem_results %}
+<div class="card result">
+  <div class="card-title"><a href="/papers/{{ r.paper.id }}">{{ r.paper.title }}</a>
+    <span class="pill">score {{ r.score }}</span></div>
+  <div class="muted">{{ r.paper.authors }}</div>
+  <div class="why">best chunk{% if r.chunk.heading %} (<strong>{{ r.chunk.heading }}</strong>){% endif %}:
+    <em>{{ r.snippet }}</em></div>
+  <div class="meta-row">
+    <a class="btn btn-link" href="/papers/{{ r.paper.id }}">open</a>
+    <a class="btn btn-link" href="/papers/{{ r.paper.id }}/scope">analyze</a>
+  </div>
+</div>
+{% else %}
+<p class="muted">No semantic matches. Papers must be parsed first (chunks are the index).</p>
+{% endfor %}
+{% elif q %}
 <p class="muted">{{ results|length }} result(s) for “{{ q }}”.</p>
 {% for r in results %}
 <div class="card result">
@@ -26,7 +50,8 @@
 <p class="muted">No matches. Try fewer / different terms.</p>
 {% endfor %}
 {% else %}
-<p class="muted">Type a query to search local papers and parsed content. External search
-(arXiv / Semantic Scholar / Crossref) is Phase 2.</p>
+<p class="muted">Type a query to search local papers and parsed content. Switch to
+<strong>semantic</strong> mode for vector ranking over parsed chunks, or use
+<a href="/external">external search</a> for unsaved papers.</p>
 {% endif %}
 {% endblock %}

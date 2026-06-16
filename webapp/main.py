@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 from modules import cost  # noqa: E402
+from modules import external_search as ext_search  # noqa: E402
 from modules.metadata import fetch_arxiv_metadata, fetch_doi_metadata  # noqa: E402
 from modules.parsing import scope_utils  # noqa: E402
 from modules.config import get_config  # noqa: E402
@@ -36,6 +37,7 @@ from modules.store import (  # noqa: E402
     JobStatus,
     PaperRole,
     PaperStatus,
+    RegionLabel,
     RelationType,
     ScopePurpose,
     Store,
@@ -639,9 +641,66 @@ def organize_remove(paper_id: str, kind: str = Form(...), target_id: str = Form(
 # ── Unified local search (papers + parsed chunks) ────────────────────────────────
 
 @app.get("/find", response_class=HTMLResponse)
-def find_page(request: Request, q: str = ""):
-    results = store.search_papers(q) if q.strip() else []
-    return render("find.html", _ctx(request, q=q, results=results))
+def find_page(request: Request, q: str = "", mode: str = "exact"):
+    results: list = []
+    sem_results: list = []
+    if q.strip():
+        if mode == "semantic":
+            from modules.semantic_search import semantic_search
+            sem_results = semantic_search(store, q)
+        else:
+            results = store.search_papers(q)
+    return render("find.html", _ctx(
+        request, q=q, mode=mode, results=results, sem_results=sem_results))
+
+
+# ── External search (arXiv / Semantic Scholar / Crossref) ────────────────────────
+
+@app.get("/external", response_class=HTMLResponse)
+async def external_page(request: Request, q: str = "", sources: str = ""):
+    chosen = [s for s in sources.split(",") if s] or list(ext_search.SOURCES)
+    results: list[dict] = []
+    if q.strip():
+        found = await run_in_threadpool(ext_search.external_search, q, chosen, 10)
+        # Flag results we already have locally (by arxiv id / doi).
+        for r in found:
+            existing = store.find_paper_by_external(arxiv_id=r.arxiv_id, doi=r.doi)
+            results.append({"r": r, "saved": existing.id if existing else ""})
+    return render("external.html", _ctx(
+        request, q=q, results=results, sources=ext_search.SOURCES, chosen=chosen,
+        all_collections=store.list_collections(), all_projects=store.list_projects()))
+
+
+@app.post("/external/save")
+def external_save(
+    request: Request, action: str = Form("save"),
+    title: str = Form(""), authors: str = Form(""), abstract: str = Form(""),
+    arxiv_id: str = Form(""), doi: str = Form(""), pdf_url: str = Form(""),
+    collection_id: str = Form(""), project_id: str = Form(""), role: str = Form("maybe_relevant"),
+):
+    existing = store.find_paper_by_external(arxiv_id=arxiv_id.strip(), doi=doi.strip())
+    if existing is not None:
+        paper = existing
+    else:
+        paper = store.create_paper(
+            title=title or arxiv_id or doi or "Untitled paper", authors=authors,
+            arxiv_id=arxiv_id.strip(),
+            arxiv_url=f"https://arxiv.org/abs/{arxiv_id.strip()}" if arxiv_id.strip() else "",
+            doi=doi.strip(), one_liner=abstract[:500], source="manual",
+            status=PaperStatus.S1_SKIM.value,
+        )
+    if collection_id:
+        store.add_paper_to_collection(paper.id, collection_id, role=role)
+    if project_id:
+        store.add_paper_to_project(paper.id, project_id, role=role)
+    if action in ("save_parse", "save_triage"):
+        scope = store.create_parse_scope(paper.id, name="full", purpose="triage",
+                                         scope_json={"kind": "full", "page_ranges": [], "regions": []})
+        store.create_parse_job(paper_id=paper.id, parse_scope_id=scope.id)
+    if action == "save_triage":
+        # Runs once the parse produces chunks (the analysis worker defers until then).
+        store.create_analysis_job(paper_id=paper.id, analysis_type="triage_summary", chunk_ids=[])
+    return RedirectResponse(url=f"/papers/{paper.id}", status_code=303)
 
 
 # ── Cost estimate (AJAX for the scope builder) ───────────────────────────────────
@@ -694,6 +753,29 @@ def scope_builder(request: Request, paper_id: str):
         marker_price=_CFG.marker_price_per_page))
 
 
+@app.post("/papers/{paper_id}/scope/suggest", response_class=HTMLResponse)
+def suggest_scope(request: Request, paper_id: str, sections: str = Form(""), total_pages: str = Form("")):
+    """Skip-proof helper: propose a scope from typed TOC lines or prior chunks."""
+    from modules.parsing import skip_proof
+    paper = store.get_paper(paper_id)
+    if paper is None:
+        return RedirectResponse(url="/", status_code=303)
+    try:
+        total = int(total_pages) if total_pages.strip() else None
+    except ValueError:
+        total = None
+    secs = skip_proof.parse_section_lines(sections)
+    if not secs:
+        secs = skip_proof.sections_from_chunks(store.chunks_for_paper(paper_id), total)
+    proposal = skip_proof.propose_scope(secs, total)
+    proposal["pages_string"] = skip_proof.ranges_to_string(proposal["scope_json"]["page_ranges"])
+    return render("scope.html", _ctx(
+        request, paper=paper, scopes=store.list_parse_scopes(paper_id),
+        parse_jobs=store.list_parse_jobs(paper_id),
+        analysis_jobs=store.list_analysis_jobs(paper_id),
+        marker_price=_CFG.marker_price_per_page, proposal=proposal, sections_text=sections))
+
+
 @app.post("/papers/{paper_id}/scopes")
 def create_scope_and_parse(paper_id: str, name: str = Form("scope"),
                            purpose: str = Form("manual"), kind: str = Form("page_range"),
@@ -707,6 +789,44 @@ def create_scope_and_parse(paper_id: str, name: str = Form("scope"),
         store.create_parse_job(
             paper_id=paper_id, parse_scope_id=scope.id, selected_pages=selected,
             cost_estimate=cost.estimate_marker_cost(selected, _CFG.marker_price_per_page).cost,
+        )
+    return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
+
+
+@app.get("/papers/{paper_id}/regions", response_class=HTMLResponse)
+def region_selector(request: Request, paper_id: str):
+    paper = store.get_paper(paper_id)
+    if paper is None:
+        return RedirectResponse(url="/", status_code=303)
+    return render("regions.html", _ctx(
+        request, paper=paper, region_labels=[r.value for r in RegionLabel]))
+
+
+@app.post("/papers/{paper_id}/scopes/regions")
+def create_region_scope(paper_id: str, name: str = Form("regions"),
+                        regions_json: str = Form("[]"), pages: str = Form(""),
+                        enqueue: str = Form("1")):
+    import json
+    try:
+        regions = json.loads(regions_json) or []
+    except ValueError:
+        regions = []
+    # Keep only well-formed regions (page:int, bbox:4 floats, label:str).
+    clean = []
+    for r in regions:
+        bbox = r.get("bbox")
+        if isinstance(r.get("page"), int) and isinstance(bbox, list) and len(bbox) == 4:
+            clean.append({"page": r["page"], "bbox": [float(x) for x in bbox],
+                          "label": r.get("label", "other")})
+    ranges = _parse_ranges(pages)
+    kind = "mixed" if (clean and ranges) else ("regions" if clean else "page_range")
+    scope_json = {"kind": kind, "page_ranges": ranges, "regions": clean}
+    scope = store.create_parse_scope(paper_id, name=name, purpose="manual", scope_json=scope_json)
+    if enqueue == "1" and (clean or ranges):
+        units = scope_utils.page_count({"kind": kind, "page_ranges": ranges}) + len(clean)
+        store.create_parse_job(
+            paper_id=paper_id, parse_scope_id=scope.id, selected_pages=units,
+            cost_estimate=cost.estimate_marker_cost(units, _CFG.marker_price_per_page).cost,
         )
     return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
 

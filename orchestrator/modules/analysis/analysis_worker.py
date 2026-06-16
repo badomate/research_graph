@@ -103,6 +103,17 @@ class AnalysisWorker:
             # Default to all of the paper's chunks if none were explicitly selected.
             chunks = self.store.chunks_for_paper(job.paper_id)
         if not chunks:
+            # Defer (re-queue) while a parse for this paper is still pending/running —
+            # supports "save + triage", where the analysis is created before parsing
+            # finishes. Give up after enough attempts so it can't loop forever.
+            pending_parse = [
+                j for j in self.store.list_parse_jobs(job.paper_id)
+                if j.status in (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+            ]
+            if pending_parse and job.attempts < 30:
+                self.store.update_analysis_job(job_id, status=JobStatus.PENDING.value,
+                                               error="waiting for parse to produce chunks")
+                return
             self.store.update_analysis_job(
                 job_id, status=JobStatus.FAILED.value, error="no parsed chunks to analyze"
             )

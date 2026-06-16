@@ -67,6 +67,30 @@ def to_marker_page_range(pages: list[int]) -> str:
     return ",".join(parts)
 
 
+def bbox_to_cropbox(
+    mediabox: tuple[float, float, float, float], bbox: list[float]
+) -> tuple[float, float, float, float]:
+    """Convert a normalized top-left bbox to a PDF cropbox (points, bottom-left origin).
+
+    ``mediabox`` is (left, bottom, right, top) in PDF points (as pypdf exposes it).
+    ``bbox`` is [x0, y0, x1, y1] in [0,1], top-left origin (the UI's convention):
+    (x0,y0) is the top-left corner, (x1,y1) the bottom-right. Returns
+    (llx, lly, urx, ury) ready for ``page.cropbox``.
+    """
+    left, bottom, right, top = mediabox
+    width = right - left
+    height = top - bottom
+    x0, y0, x1, y1 = bbox
+    x0, x1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
+    y0, y1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
+    llx = left + x0 * width
+    urx = left + x1 * width
+    # y is flipped: top-left y0 maps to the higher PDF y.
+    ury = bottom + (1.0 - y0) * height
+    lly = bottom + (1.0 - y1) * height
+    return (llx, lly, urx, ury)
+
+
 def scope_summary(scope_json: dict, total_pages: int | None = None) -> dict:
     """Human-facing summary for the UI: selected/skipped pages + region count."""
     sel = selected_pages(scope_json, total_pages)

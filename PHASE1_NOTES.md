@@ -27,6 +27,8 @@ Phase 2/3 items (region drawing + crop parsing, external arXiv/S2/Crossref searc
 skip-proof auto-suggester, full novelty aggregation, version-diff UI) are scoped
 but **not** in this pass — clean seams are left for them.
 
+> **Phase 2 is now implemented** — see [PHASE2_NOTES.md](PHASE2_NOTES.md).
+
 ## Running
 
 Nothing new is required to boot. New tables auto-create via `create_all` on a

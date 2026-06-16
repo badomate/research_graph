@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}External search · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>External search</h1>
+  <div class="head-links"><a href="/find">← local search</a></div>
+</div>
+<form class="card form-inline" action="/external" method="get" role="search">
+  <input name="q" value="{{ q }}" placeholder="Search arXiv / Semantic Scholar / Crossref…"
+         autocomplete="off" autofocus style="flex:1">
+  <input type="hidden" name="sources" value="{{ chosen|join(',') }}">
+  <button class="btn btn-primary" type="submit">Search</button>
+</form>
+<p class="muted">Sources (in preference order): {{ chosen|join(', ') }}. Results are
+<strong>not</strong> saved automatically — pick an action per paper.</p>
+
+{% for row in results %}
+{% set r = row.r %}
+<div class="card result">
+  <div class="card-title">{{ r.title }}
+    {% if row.saved %}<a class="pill" href="/papers/{{ row.saved }}">already saved →</a>{% endif %}
+  </div>
+  <div class="muted">{{ r.authors }}{% if r.year %} · {{ r.year }}{% endif %}
+    {% if r.venue %} · {{ r.venue }}{% endif %} · <span class="pill">{{ r.source }}</span>
+    {% if r.arxiv_id %}· arXiv:{{ r.arxiv_id }}{% endif %}{% if r.doi %}· doi:{{ r.doi }}{% endif %}</div>
+  {% if r.abstract %}<p class="why">{{ r.abstract[:320] }}{% if r.abstract|length > 320 %}…{% endif %}</p>{% endif %}
+  <form action="/external/save" method="post" class="save-form">
+    <input type="hidden" name="title" value="{{ r.title }}">
+    <input type="hidden" name="authors" value="{{ r.authors }}">
+    <input type="hidden" name="abstract" value="{{ r.abstract }}">
+    <input type="hidden" name="arxiv_id" value="{{ r.arxiv_id }}">
+    <input type="hidden" name="doi" value="{{ r.doi }}">
+    <input type="hidden" name="pdf_url" value="{{ r.pdf_url }}">
+    <div class="meta-row">
+      <select name="project_id" aria-label="add to project">
+        <option value="">— project —</option>
+        {% for p in all_projects %}<option value="{{ p.id }}">📁 {{ p.name }}</option>{% endfor %}
+      </select>
+      <select name="collection_id" aria-label="add to collection">
+        <option value="">— collection —</option>
+        {% for c in all_collections %}<option value="{{ c.id }}">🗂 {{ c.name }}</option>{% endfor %}
+      </select>
+      <select name="role" aria-label="role">
+        {% for role in paper_roles %}<option value="{{ role }}">{{ role.replace('_',' ') }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="meta-row">
+      <button class="btn btn-primary" type="submit" name="action" value="save">Save</button>
+      <button class="btn" type="submit" name="action" value="save_parse"
+              {% if not r.arxiv_id %}title="parsing needs an arXiv PDF"{% endif %}>Save + parse</button>
+      <button class="btn" type="submit" name="action" value="save_triage"
+              {% if not r.arxiv_id %}title="triage needs a parsable PDF"{% endif %}>Save + triage</button>
+      {% if r.url %}<a class="btn btn-link" href="{{ r.url }}" target="_blank" rel="noopener">source ↗</a>{% endif %}
+    </div>
+  </form>
+</div>
+{% else %}
+{% if q %}<p class="muted">No external results for “{{ q }}”.</p>
+{% else %}<p class="muted">Search arXiv, Semantic Scholar and Crossref for papers you
+haven't saved yet.</p>{% endif %}
+{% endfor %}
+{% endblock %}

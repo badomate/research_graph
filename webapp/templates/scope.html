@@ -4,10 +4,44 @@
 <div class="page-head">
   <h1>Selective parse — {{ paper.title }}</h1>
   <div class="head-links"><a href="/papers/{{ paper.id }}">← paper</a> ·
+    <a href="/papers/{{ paper.id }}/regions">draw regions</a> ·
     <a href="/papers/{{ paper.id }}/pdf" target="_blank">open PDF</a></div>
 </div>
 <p class="muted">Choose exactly which pages Marker extracts. Skip long proof appendices.
 Region selection (drawing boxes) is Phase 2; page ranges are live now.</p>
+
+<details class="card" {% if proposal %}open{% endif %}>
+  <summary>Skip-proof helper — propose a scope for a math-heavy paper</summary>
+  <p class="muted">Paste section lines from the PDF's contents (e.g. <code>1-8 Introduction</code>,
+    <code>9-30 Proof of Theorem 2</code>). Leave blank to use the headings of a prior parse.
+    Proofs, technical lemmas and appendices are skipped by default; nothing runs until you accept.</p>
+  <form action="/papers/{{ paper.id }}/scope/suggest" method="post">
+    <textarea name="sections" rows="5" placeholder="1-2 Abstract&#10;3-8 Introduction&#10;9-12 Assumptions and main results&#10;13-34 Proof of the main theorem&#10;35-38 Numerical experiments&#10;39 Conclusion">{{ sections_text or '' }}</textarea>
+    <div class="meta-row">
+      <input name="total_pages" placeholder="total pages (optional)" style="width:12rem">
+      <button class="btn" type="submit">Suggest scope</button>
+    </div>
+  </form>
+  {% if proposal %}
+  <div class="estimate">
+    <strong>Proposed:</strong> keep {{ proposal.selected_pages|length }} page(s),
+    skip {{ proposal.skipped_pages|length }} page(s).
+    <span class="muted">Selected: {{ proposal.pages_string or '—' }}</span>
+  </div>
+  <table class="data">
+    <tr><th>section</th><th>pages</th><th>decision</th><th>reason</th></tr>
+    {% for d in proposal.decisions %}
+    <tr>
+      <td>{{ d.heading }}</td>
+      <td>{{ d.pages[0] }}{% if d.pages[1] != d.pages[0] %}-{{ d.pages[1] }}{% endif %}</td>
+      <td class="{{ 'status-succeeded' if d.decision=='keep' else 'status-failed' }}">{{ d.decision }}</td>
+      <td class="muted">{{ d.reason }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Accept by reviewing the pages below (pre-filled) and clicking “queue parse”.</p>
+  {% endif %}
+</details>
 
 <form class="card" action="/papers/{{ paper.id }}/scopes" method="post">
   <div class="form-grid">
@@ -23,7 +57,8 @@ Region selection (drawing boxes) is Phase 2; page ranges are live now.</p>
         <option value="full">full paper</option>
       </select>
     </label>
-    <label>Pages <input name="pages" id="pages" placeholder="1-8, 35-40" oninput="recalc()"></label>
+    <label>Pages <input name="pages" id="pages" placeholder="1-8, 35-40"
+                       value="{{ proposal.pages_string if proposal else '' }}" oninput="recalc()"></label>
   </div>
   <div class="estimate" id="estimate">
     selected pages: <strong id="selCount">0</strong> ·
@@ -37,7 +72,7 @@ Region selection (drawing boxes) is Phase 2; page ranges are live now.</p>
 <p class="muted">Analysis runs on parsed chunks only (never the raw PDF). Output lands in
 the <a href="/suggestions?paper_id={{ paper.id }}">suggestion review queue</a>, never the accepted DB.</p>
 <form class="card form-inline" action="/papers/{{ paper.id }}/analyze" method="post">
-  <select name="analysis_type">
+  <select name="analysis_type" aria-label="analysis type">
     {% for a in analysis_types %}<option value="{{ a }}">{{ a.replace('_',' ') }}</option>{% endfor %}
   </select>
   <input name="instruction" placeholder="optional instruction (e.g. ignore proofs)">

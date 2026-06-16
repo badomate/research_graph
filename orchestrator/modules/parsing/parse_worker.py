@@ -95,6 +95,41 @@ class ParseWorker:
 
         return len(PdfReader(str(src)).pages)
 
+    @staticmethod
+    def _range_pages(scope_json: dict, total_pages: int) -> list[int]:
+        """1-indexed pages from page_ranges only (regions handled separately)."""
+        kind = (scope_json or {}).get("kind", "full")
+        if kind == "full":
+            return list(range(1, total_pages + 1))
+        pages: set[int] = set()
+        for rng in (scope_json.get("page_ranges") or []):
+            if not rng:
+                continue
+            lo, hi = int(rng[0]), int(rng[-1])
+            if lo > hi:
+                lo, hi = hi, lo
+            pages.update(range(lo, hi + 1))
+        return sorted(p for p in pages if 1 <= p <= total_pages)
+
+    def _crop_region(self, src: Path, page_1indexed: int, bbox: list[float], dest: Path) -> None:
+        """Write a single-page PDF cropped to ``bbox`` (normalized, top-left origin)."""
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import RectangleObject
+
+        reader = PdfReader(str(src))
+        page = reader.pages[page_1indexed - 1]
+        mb = page.mediabox
+        cropbox = scope_utils.bbox_to_cropbox(
+            (float(mb.left), float(mb.bottom), float(mb.right), float(mb.top)), bbox
+        )
+        writer = PdfWriter()
+        writer.add_page(page)
+        new_page = writer.pages[0]
+        new_page.cropbox = RectangleObject(cropbox)
+        new_page.mediabox = RectangleObject(cropbox)
+        with dest.open("wb") as fh:
+            writer.write(fh)
+
     # -- Marker ----------------------------------------------------------------
 
     def _call_marker(self, pdf_path: Path) -> str:
@@ -170,7 +205,7 @@ class ParseWorker:
         scope = self.store.get_parse_scope(job.parse_scope_id) if job.parse_scope_id else None
         scope_json = scope.scope_json if scope else {"kind": "full"}
 
-        tmp_subset: Path | None = None
+        tmp_files: list[Path] = []
         try:
             src = self._resolve_original_pdf(paper)
             pdf_bytes = src.read_bytes()
@@ -185,9 +220,10 @@ class ParseWorker:
                 return
 
             total_pages = self._pdf_page_count(src)
-            pages = scope_utils.selected_pages(scope_json, total_pages)
-            if not pages:                       # full / empty → whole document
-                pages = list(range(1, total_pages + 1))
+            range_pages = self._range_pages(scope_json, total_pages)
+            regions = scope_json.get("regions") or []
+            if not range_pages and not regions:     # nothing explicit → whole document
+                range_pages = list(range(1, total_pages + 1))
 
             # Record the original PDF as an artifact (provenance root).
             self.store.add_artifact(
@@ -196,59 +232,98 @@ class ParseWorker:
                 meta={"total_pages": total_pages},
             )
 
-            # Subset.
-            fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="subset_", dir=str(self.uploads_dir) if self.uploads_dir.exists() else None)
-            os.close(fd)
-            tmp_subset = Path(tmp_name)
-            n_pages = self._subset_pdf(src, pages, tmp_subset)
-            subset_bytes = tmp_subset.read_bytes()
-            self.store.add_artifact(
-                paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.SUBSET_PDF.value,
-                path=str(tmp_subset), content_hash=_sha256_bytes(subset_bytes),
-                meta={"pages": pages},
-            )
+            chunk_rows: list[dict] = []
+            ordinal = 0
 
-            # Marker.
-            markdown = self._call_marker(tmp_subset)
-            if not markdown.strip():
-                raise RuntimeError("Marker returned empty markdown")
-            self.store.add_artifact(
-                paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.MARKER_MARKDOWN.value,
-                text=markdown, content_hash=_sha256_bytes(markdown.encode()),
-                page_from=pages[0], page_to=pages[-1], meta={"pages": pages},
-            )
-
-            # Chunks.
-            raw_chunks = self._split_markdown(markdown)
-            chunk_rows = [
-                dict(
-                    paper_id=paper.id, parse_job_id=job.id, ordinal=i,
-                    kind="heading" if rc["heading"] else "text",
-                    heading=rc["heading"], text=rc["text"],
-                    page_from=pages[0], page_to=pages[-1],
-                    token_estimate=estimate_tokens(rc["text"]),
-                    content_hash=_sha256_bytes(rc["text"].encode()),
+            # 1) Page-range subset → one Marker pass over those whole pages.
+            if range_pages:
+                fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="subset_",
+                                                dir=str(self.uploads_dir) if self.uploads_dir.exists() else None)
+                os.close(fd)
+                tmp_subset = Path(tmp_name)
+                tmp_files.append(tmp_subset)
+                self._subset_pdf(src, range_pages, tmp_subset)
+                self.store.add_artifact(
+                    paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.SUBSET_PDF.value,
+                    path=str(tmp_subset), content_hash=_sha256_bytes(tmp_subset.read_bytes()),
+                    page_from=range_pages[0], page_to=range_pages[-1], meta={"pages": range_pages},
                 )
-                for i, rc in enumerate(raw_chunks)
-            ]
+                markdown = self._call_marker(tmp_subset)
+                if not markdown.strip():
+                    raise RuntimeError("Marker returned empty markdown for page subset")
+                self.store.add_artifact(
+                    paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.MARKER_MARKDOWN.value,
+                    text=markdown, content_hash=_sha256_bytes(markdown.encode()),
+                    page_from=range_pages[0], page_to=range_pages[-1], meta={"pages": range_pages},
+                )
+                for rc in self._split_markdown(markdown):
+                    chunk_rows.append(dict(
+                        paper_id=paper.id, parse_job_id=job.id, ordinal=ordinal,
+                        kind="heading" if rc["heading"] else "text",
+                        heading=rc["heading"], text=rc["text"],
+                        page_from=range_pages[0], page_to=range_pages[-1],
+                        token_estimate=estimate_tokens(rc["text"]),
+                        content_hash=_sha256_bytes(rc["text"].encode()),
+                    ))
+                    ordinal += 1
+
+            # 2) Region crops → one Marker pass per labeled rectangle, provenance kept.
+            for region in regions:
+                page = region.get("page")
+                bbox = region.get("bbox")
+                label = region.get("label", "other")
+                if not isinstance(page, int) or not bbox or page < 1 or page > total_pages:
+                    continue
+                fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="crop_",
+                                                dir=str(self.uploads_dir) if self.uploads_dir.exists() else None)
+                os.close(fd)
+                tmp_crop = Path(tmp_name)
+                tmp_files.append(tmp_crop)
+                self._crop_region(src, page, bbox, tmp_crop)
+                self.store.add_artifact(
+                    paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.REGION_CROP.value,
+                    path=str(tmp_crop), content_hash=_sha256_bytes(tmp_crop.read_bytes()),
+                    page_from=page, page_to=page, bbox=bbox, meta={"label": label},
+                )
+                region_md = self._call_marker(tmp_crop)
+                self.store.add_artifact(
+                    paper_id=paper.id, parse_job_id=job.id, kind=ArtifactKind.MARKER_MARKDOWN.value,
+                    text=region_md, content_hash=_sha256_bytes(region_md.encode()),
+                    page_from=page, page_to=page, bbox=bbox, meta={"label": label},
+                )
+                if region_md.strip():
+                    chunk_rows.append(dict(
+                        paper_id=paper.id, parse_job_id=job.id, ordinal=ordinal,
+                        kind=label, heading=label.replace("_", " ").title(), text=region_md.strip(),
+                        page_from=page, page_to=page, bbox=bbox,
+                        token_estimate=estimate_tokens(region_md),
+                        content_hash=_sha256_bytes(region_md.encode()),
+                    ))
+                    ordinal += 1
+
+            if not chunk_rows:
+                raise RuntimeError("parse produced no content (empty subset and regions)")
             self.store.add_chunks(chunk_rows)
 
-            est = estimate_marker_cost(n_pages, self.config.marker_price_per_page)
+            n_units = len(range_pages) + len(regions)   # regions billed ~1 page each
+            est = estimate_marker_cost(n_units, self.config.marker_price_per_page)
             self.store.update_parse_job(
                 job_id, status=JobStatus.SUCCEEDED.value, backend=ParseBackend.MARKER_API.value,
-                selected_pages=n_pages, input_hash=input_hash, marker_version=MARKER_VERSION,
+                selected_pages=n_units, input_hash=input_hash, marker_version=MARKER_VERSION,
                 cost_estimate=est.cost, cost_actual=est.cost, error="",
             )
-            logger.info("[parse %s] succeeded: %d pages, %d chunks", job_id, n_pages, len(chunk_rows))
+            logger.info("[parse %s] succeeded: %d page(s) + %d region(s), %d chunks",
+                        job_id, len(range_pages), len(regions), len(chunk_rows))
         except Exception as exc:  # noqa: BLE001 — record failure, don't crash the scheduler
             logger.exception("[parse %s] failed", job_id)
             self.store.update_parse_job(job_id, status=JobStatus.FAILED.value, error=str(exc)[:1000])
         finally:
-            if tmp_subset is not None and tmp_subset.exists():
-                # Keep the subset only if it became the recorded artifact path on success.
-                fresh = self.store.get_parse_job(job_id)
-                if fresh is None or fresh.status != JobStatus.SUCCEEDED.value:
-                    tmp_subset.unlink(missing_ok=True)
+            fresh = self.store.get_parse_job(job_id)
+            succeeded = fresh is not None and fresh.status == JobStatus.SUCCEEDED.value
+            # Keep artifact PDFs on success (they're referenced); clean up on failure.
+            if not succeeded:
+                for f in tmp_files:
+                    f.unlink(missing_ok=True)
 
     def run_pending(self, limit: int = 5) -> int:
         """Drain up to ``limit`` pending parse jobs. Returns the number processed."""
