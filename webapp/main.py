@@ -27,7 +27,9 @@ from fastapi import FastAPI, Form, Request, UploadFile  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from fastapi.templating import Jinja2Templates  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
 
+from modules.metadata import fetch_arxiv_metadata, fetch_doi_metadata  # noqa: E402
 from modules.store import (  # noqa: E402
     ConceptState,
     EdgeStatus,
@@ -142,6 +144,8 @@ async def create_paper(
     pdf: UploadFile | None = None,
 ):
     pdf_path = ""
+    authors = ""
+    abstract = ""
     if pdf is not None and pdf.filename:
         uploads = Path(os.environ.get("UPLOADS_DIR", "./uploads"))
         uploads.mkdir(parents=True, exist_ok=True)
@@ -150,12 +154,28 @@ async def create_paper(
         pdf_path = str(dest)
         if not title:
             title = pdf.filename.rsplit(".", 1)[0]
+
+    # Enrich from arXiv/DOI metadata (off the event loop) when no PDF was uploaded.
+    if not pdf_path and (arxiv_id.strip() or doi.strip()):
+        meta = None
+        if arxiv_id.strip():
+            meta = await run_in_threadpool(fetch_arxiv_metadata, arxiv_id)
+        elif doi.strip():
+            meta = await run_in_threadpool(fetch_doi_metadata, doi)
+        if meta:
+            title = title or meta.get("title", "")
+            authors = meta.get("authors", "")
+            abstract = meta.get("abstract", "")
+
     if not title:
         title = arxiv_id or doi or "Untitled paper"
     paper = store.create_paper(
         title=title,
+        authors=authors,
         arxiv_id=arxiv_id.strip(),
+        arxiv_url=f"https://arxiv.org/abs/{arxiv_id.strip()}" if arxiv_id.strip() else "",
         doi=doi.strip(),
+        one_liner=abstract[:500],
         pdf_path=pdf_path,
         source="manual",
         status=PaperStatus.S1_SKIM.value,

@@ -1,6 +1,5 @@
 # modules/ingestion - Core Ingestion Engine package
 from .extractor import is_dense_paper
-from ..notion_client_wrapper import NotionClientWrapper
 from . import engine as _engine_module
 from ..scoring.candidate_scorer import (
     EDGE_AUTO_CREATE_CONFIDENCE,

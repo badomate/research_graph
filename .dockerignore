@@ -3,3 +3,13 @@
 **/.pytest_cache
 **/__pycache__
 graph_output
+**/*.pyc
+*.db
+*.db-shm
+*.db-wal
+app.db*
+webapp_dev.db*
+uploads/
+**/*.zip
+.venv/
+venv/

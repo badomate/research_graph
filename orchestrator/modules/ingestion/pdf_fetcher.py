@@ -21,7 +21,7 @@ from ..config import Config
 from ..exceptions import KoofrError, MarkerError, ZoteroError
 from ..job_ledger import JobLedger
 from ..logging_utils import structured_log
-from ..notion_client_wrapper import NotionClientWrapper
+from ..store import Store
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +52,11 @@ class PdfFetcherService:
 
     def __init__(
         self,
-        notion: NotionClientWrapper,
+        store: Store,
         ledger: JobLedger,
         config: Config | None = None,
     ) -> None:
-        self.notion = notion
+        self.store = store
         self._ledger = ledger
         self._webdav = self._build_webdav_client(config)
         self.marker_url = config.marker_api_url if config is not None else os.environ.get("MARKER_API_URL", "http://marker-api:8080")
@@ -136,24 +136,17 @@ class PdfFetcherService:
         pdf_children.sort(key=lambda x: x[1].get("fileSize", 0), reverse=True)
         return parent_key, pdf_children[0][0]
 
-    def resolve_keys_and_update_notion(
-        self, page_id: str, zotero_uri: str, parent_key: str, run_id: str
+    def resolve_keys_and_update(
+        self, paper_id: str, zotero_uri: str, parent_key: str, run_id: str
     ) -> tuple[str, str] | None:
         resolved = self._resolve_attachment_key(zotero_uri, parent_key)
         if resolved is None:
             return None
         _parent_key, attachment_key = resolved
         try:
-            self.notion.update_page(
-                page_id=page_id,
-                properties={
-                    "Zotero Attachment Key": {
-                        "rich_text": self.notion.rich_text(attachment_key)
-                    }
-                },
-            )
+            self.store.update_paper(paper_id, attachment_key=attachment_key)
         except Exception:
-            logger.warning("[%s] Could not write Zotero Attachment Key to Notion.", run_id)
+            logger.warning("[%s] Could not write attachment key to store.", run_id)
         return _parent_key, attachment_key
 
     # -- Koofr -----------------------------------------------------------------
@@ -271,14 +264,29 @@ class PdfFetcherService:
 
     # -- Main entry point ------------------------------------------------------
 
+    def markdown_from_local_pdf(
+        self, pdf_path: str, run_id: str, paper_id: str
+    ) -> tuple[str, int | None]:
+        """Convert an uploaded/local PDF via Marker (bypasses Koofr/Zotero)."""
+        local_pdf = Path(pdf_path)
+        if not local_pdf.exists():
+            raise KoofrError(f"[{run_id}] Uploaded PDF not found: {pdf_path}")
+        pdf_sha256 = self._sha256(local_pdf)
+        self.store.update_paper(paper_id, pdf_sha256=pdf_sha256)
+        job_id = self._ledger.start_job(paper_id, pdf_sha256, EXTRACTION_VERSION)
+        try:
+            markdown_text = self._call_marker(local_pdf)
+        except Exception as exc:
+            raise MarkerError(f"[{run_id}] Marker OCR failed") from exc
+        return self.strip_boilerplate(markdown_text), job_id
+
     def pdf_to_markdown(
         self,
         attachment_key: str,
         run_id: str,
         zip_remote: str,
         primary_pdf_filename: str | None,
-        page_id: str,
-        props: dict,
+        paper_id: str,
     ) -> tuple[str, int | None] | tuple[None, None]:
         """
         Return (markdown_text, job_id) using a Koofr markdown cache.
@@ -318,10 +326,7 @@ class PdfFetcherService:
 
         pdf_sha256 = self._sha256(local_pdf)
         structured_log(logger, "info", "PDF SHA256 computed", run_id=run_id, sha256=pdf_sha256[:16])
-        self.notion.update_page(
-            page_id=page_id,
-            properties={"PDF SHA256": {"rich_text": self.notion.rich_text(pdf_sha256)}},
-        )
+        self.store.update_paper(paper_id, pdf_sha256=pdf_sha256)
         job_id = self._ledger.start_job(attachment_key, pdf_sha256, EXTRACTION_VERSION)
         structured_log(logger, "info", "JobLedger job started", run_id=run_id, job_id=job_id)
 

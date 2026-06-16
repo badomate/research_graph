@@ -1,8 +1,8 @@
 # ── Core scheduling ──────────────────────────────────────────────────────────
 APScheduler==3.10.4
 
-# ── Notion API ────────────────────────────────────────────────────────────────
-notion-client==2.2.1
+# ── Database (SQLite source of truth; replaces Notion) ─────────────────────────
+sqlmodel>=0.0.22,<0.1
 
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 # Kept for embeddings only (vector_index.py). Generation calls migrated to Claude.

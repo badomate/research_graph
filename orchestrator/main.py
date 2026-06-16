@@ -1,4 +1,4 @@
-"""Central APScheduler entry point for the paper pipeline."""
+"""Central APScheduler entry point for the paper pipeline (SQLite Store backend)."""
 
 from __future__ import annotations
 
@@ -12,10 +12,11 @@ from dotenv import load_dotenv
 
 from modules.arxiv_sniper import ArXivSniper
 from modules.config import Config, get_config
-from modules.dependency_grapher import DependencyGrapher
 from modules.ingestion import IngestionEngine
 from modules.promotion import PromotionEngine
+from modules.store import Store, make_engine
 from modules.vector_index import VectorIndexEngine
+from modules.zotero_intake import ZoteroIntake
 
 
 load_dotenv()
@@ -37,26 +38,20 @@ def _load_config() -> Config:
         sys.exit(1)
 
 
-def run_dependency_grapher() -> None:
-    DependencyGrapher().run()
-
-
 def run_arxiv_sniper(config: Config) -> None:
     ArXivSniper(config=config).run()
 
 
+def run_zotero_intake(config: Config) -> None:
+    ZoteroIntake(config=config).run()
+
+
 def _run_startup_once(config: Config, vector_index: VectorIndexEngine | None) -> None:
-    """Run the core jobs once before the scheduler starts ticking."""
     startup_jobs = [
-        (
-            "Core Ingestion Engine",
-            lambda: IngestionEngine(vector_index=vector_index, config=config).run(),
-        ),
-        (
-            "Promotion Engine",
-            lambda: PromotionEngine(vector_index=vector_index, config=config).run(),
-        ),
-        ("Dependency Grapher", run_dependency_grapher),
+        ("Core Ingestion Engine",
+         lambda: IngestionEngine(vector_index=vector_index, config=config).run()),
+        ("Promotion Engine",
+         lambda: PromotionEngine(vector_index=vector_index, config=config).run()),
     ]
     logger.info("Startup pass: running %d job(s) once now.", len(startup_jobs))
     for name, fn in startup_jobs:
@@ -65,54 +60,43 @@ def _run_startup_once(config: Config, vector_index: VectorIndexEngine | None) ->
             fn()
             logger.info("Startup pass: %s complete.", name)
         except Exception as exc:
-            logger.exception(
-                "Startup pass: %s failed; scheduler will continue. error_type=%s",
-                name,
-                type(exc).__name__,
-            )
+            logger.exception("Startup pass: %s failed; error_type=%s", name, type(exc).__name__)
 
 
 def main() -> None:
     config = _load_config()
+
+    # Ensure the shared database exists before any worker touches it.
+    Store(make_engine(config.database_url)).create_all()
+
     vector_index = VectorIndexEngine(config) if config.vector_index_enabled else None
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(
         lambda: IngestionEngine(vector_index=vector_index, config=config).run(),
         trigger=IntervalTrigger(minutes=10),
-        id="ingestion",
-        name="Core Ingestion Engine",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60,
-    )
-    scheduler.add_job(
-        run_dependency_grapher,
-        trigger=IntervalTrigger(hours=12),
-        id="dependency_grapher",
-        name="Dependency Grapher",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=300,
+        id="ingestion", name="Core Ingestion Engine",
+        max_instances=1, coalesce=True, misfire_grace_time=60,
     )
     scheduler.add_job(
         lambda: PromotionEngine(vector_index=vector_index, config=config).run(),
         trigger=IntervalTrigger(minutes=30),
-        id="promotion",
-        name="Promotion Engine",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=120,
+        id="promotion", name="Promotion Engine",
+        max_instances=1, coalesce=True, misfire_grace_time=120,
     )
     scheduler.add_job(
         lambda: run_arxiv_sniper(config),
         trigger=CronTrigger(hour=6, minute=0),
-        id="arxiv_sniper",
-        name="ArXiv Sniper",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
+        id="arxiv_sniper", name="ArXiv Sniper",
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
+    if config.zotero_poll_enabled:
+        scheduler.add_job(
+            lambda: run_zotero_intake(config),
+            trigger=IntervalTrigger(minutes=config.zotero_poll_minutes),
+            id="zotero_intake", name="Zotero Intake Poller",
+            max_instances=1, coalesce=True, misfire_grace_time=300,
+        )
 
     logger.info("Orchestrator starting - %d job(s) scheduled.", len(scheduler.get_jobs()))
     for job in scheduler.get_jobs():

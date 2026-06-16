@@ -187,6 +187,14 @@ class Store:
             concept_id, state=ConceptState.PROMOTED.value, promoted_at=_now()
         )
 
+    def hubs(self) -> dict[str, str]:
+        """Return {hub title: concept id} for all hubs (the ALLOWED_HUBS source)."""
+        return {
+            c.effective_title: c.id
+            for c in self.list_concepts(state=ConceptState.HUB.value)
+            if c.effective_title
+        }
+
     def upsert_hub(self, name: str) -> Concept:
         existing = self.find_promoted_by_title(name)
         if existing:
@@ -259,6 +267,34 @@ class Store:
             if status is not None:
                 stmt = stmt.where(Edge.status == status)
             return list(s.exec(stmt))
+
+    def verify_auto_edges_between_promoted(self) -> int:
+        """Promote proposed auto-channel edges to verified once both endpoints
+        are in the Second Brain (promoted or hub). Returns the count verified."""
+        promoted_ids = {c.id for c in self.second_brain_index()}
+        verified = 0
+        with new_session(self._engine) as s:
+            proposed = list(
+                s.exec(
+                    select(Edge).where(
+                        Edge.status == EdgeStatus.PROPOSED.value,
+                        Edge.channel == "auto",
+                    )
+                )
+            )
+            for edge in proposed:
+                if (
+                    edge.source_concept_id in promoted_ids
+                    and edge.target_concept_id in promoted_ids
+                ):
+                    edge.status = EdgeStatus.VERIFIED.value
+                    edge.needs_review = False
+                    edge.updated_at = _now()
+                    s.add(edge)
+                    verified += 1
+            if verified:
+                s.commit()
+        return verified
 
     def resolve_deferred_edges(self, title_index: dict[str, str] | None = None) -> int:
         """Link deferred edges whose raw target title now matches a promoted concept.

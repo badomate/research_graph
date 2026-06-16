@@ -24,7 +24,7 @@ from xml.etree import ElementTree
 
 import anthropic
 
-from .notion_client_wrapper import NotionClientWrapper
+from .store import PaperStatus, Store, make_engine
 
 if TYPE_CHECKING:
     from modules.config import Config
@@ -59,16 +59,11 @@ class ArXivSniper:
     ARXIV_DELAY_SECONDS = 3  # hard constraint per ArXiv ToS
 
     def __init__(self, config: "Config | None" = None) -> None:
-        self.notion = NotionClientWrapper(config=config)
-        api_key = (
-            config.anthropic_api_key if config is not None else os.environ["ANTHROPIC_API_KEY"]
-        )
-        self.claude = anthropic.Anthropic(api_key=api_key)
-        self.paper_tracker_db = (
-            config.notion_paper_tracker_db_id
-            if config is not None
-            else os.environ["NOTION_PAPER_TRACKER_DB_ID"]
-        )
+        from .config import get_config
+        config = config or get_config()
+        self.store = Store(make_engine(config.database_url))
+        self.store.create_all()
+        self.claude = anthropic.Anthropic(api_key=config.anthropic_api_key)
         raw_keywords = (
             config.arxiv_keywords
             if config is not None
@@ -178,8 +173,8 @@ class ArXivSniper:
         if score < self.threshold:
             return
 
-        logger.info("ArXiv: score >= %d — creating Notion row …", self.threshold)
-        self._create_notion_row(entry, score, justification)
+        logger.info("ArXiv: score >= %d — creating paper row …", self.threshold)
+        self._create_paper_row(entry, score, justification)
 
     # ── Claude scoring ──────────────────────────────────────────────────────────
 
@@ -207,24 +202,22 @@ class ArXivSniper:
         data = json.loads(raw)
         return int(data["score"]), str(data.get("justification", ""))
 
-    # ── Notion row creation ───────────────────────────────────────────────────
+    # ── Paper row creation ────────────────────────────────────────────────────
 
-    def _create_notion_row(
+    def _create_paper_row(
         self, entry: dict, score: int, justification: str
     ) -> None:
-        title = entry["title"]
         url = entry["url"]
+        arxiv_id = url.rstrip("/").split("/")[-1]
+        if self.store.find_paper_by_external(arxiv_id=arxiv_id):
+            logger.info("ArXiv: %s already in the database — skipping.", arxiv_id)
+            return
         note = f"ArXiv score: {score}/10 — {justification}\n\nURL: {url}"
-
-        self.notion.create_page(
-            parent={"database_id": self.paper_tracker_db},
-            properties={
-                "Name": self.notion.title_prop(title),
-                "Status": self.notion.select_prop("s0-inbox"),
-                "Tags": self.notion.multi_select_prop(["Automated-Radar"]),
-                "ArXiv URL": {"url": url},
-                "AI Notes": {
-                    "rich_text": self.notion.rich_text(note)
-                },
-            },
+        self.store.create_paper(
+            title=entry["title"],
+            arxiv_id=arxiv_id,
+            arxiv_url=url,
+            source="arxiv",
+            status=PaperStatus.S0_INBOX.value,
+            ai_notes=note,
         )

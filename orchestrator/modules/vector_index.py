@@ -1263,13 +1263,14 @@ class VectorIndexEngine:
             )
             return
 
-        # Lazy Notion client initialisation — only needed for rebuild().
-        if self._notion is None:
-            try:
-                from .notion_client_wrapper import NotionClientWrapper
-            except ImportError:
-                from notion_client_wrapper import NotionClientWrapper  # type: ignore[no-redef]
-            self._notion = NotionClientWrapper()
+        # Notion-backed rebuild is no longer supported (state lives in SQLite now).
+        # The index is maintained incrementally via index_concept()/promote_concept();
+        # a Store-backed full rebuild can be added later if needed.
+        logger.warning(
+            "VectorIndexEngine.rebuild: Notion-backed rebuild removed — "
+            "the index is maintained incrementally. No-op."
+        )
+        return
 
         # 1. Drop and recreate all three collections atomically.
         logger.info(

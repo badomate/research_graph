@@ -6,17 +6,15 @@ or TF-IDF fallback.
 """
 from __future__ import annotations
 
-import concurrent.futures
-import json
 import logging
 import math
 import os
 import re
-from typing import Dict, Optional
+from typing import Dict
 
 from ..config import Config
 from ..extraction_schema import MathObject
-from ..notion_client_wrapper import NotionClientWrapper
+from ..store import Store
 from ..scoring.candidate_scorer import (
     CandidateScore,
     ConceptData,
@@ -45,11 +43,11 @@ class CandidateRetriever:
 
     def __init__(
         self,
-        notion: NotionClientWrapper,
+        store: Store,
         vector_index=None,
         config: Config | None = None,
     ) -> None:
-        self.notion = notion
+        self.store = store
         self._vector_index = vector_index
         self._retrieve_candidates_k = (
             config.retrieve_candidates_k if config is not None else RETRIEVE_CANDIDATES_K
@@ -179,88 +177,21 @@ class CandidateRetriever:
         ]
 
     def hydrate_candidates(self, candidate_ids: list[str]) -> Dict[str, ConceptData]:
-        """Fetch full Notion page data for candidate IDs concurrently."""
-        if not candidate_ids:
-            return {}
-
-        def _fetch_one(page_id: str) -> tuple[str, ConceptData | None]:
-            try:
-                page = self.notion.get_page(page_id)
-                props = page.get("properties", {})
-
-                def _text(key: str) -> str:
-                    try:
-                        segs = props[key]["rich_text"]
-                        return "".join(s.get("plain_text", "") for s in segs)
-                    except (KeyError, TypeError):
-                        return ""
-
-                def _select(key: str) -> str:
-                    try:
-                        return props[key]["select"]["name"] or ""
-                    except (KeyError, TypeError):
-                        return ""
-
-                def _multi(key: str) -> list[str]:
-                    try:
-                        return [o["name"] for o in props[key]["multi_select"]]
-                    except (KeyError, TypeError):
-                        return []
-
-                title = ""
-                try:
-                    title = props["Name"]["title"][0]["plain_text"] or ""
-                except (KeyError, IndexError, TypeError):
-                    pass
-                if not title:
-                    for v in props.values():
-                        if v.get("type") == "title":
-                            try:
-                                title = v["title"][0]["plain_text"] or ""
-                                break
-                            except (KeyError, IndexError, TypeError):
-                                pass
-
-                import re as _re
-                title = _re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
-
-                return page_id, ConceptData(
-                    notion_page_id=page_id,
-                    title=title or "(unknown)",
-                    concept_type=_select("Type") or _select("Concept Type") or "Definition",
-                    statement_latex=_text("Statement LaTeX"),
-                    assumptions=_text("Assumptions"),
-                    conclusion=_text("Conclusion") or _text("Interpretation"),
-                    setting=_multi("Setting"),
-                    named_tools=_multi("Named Tools"),
-                    keywords=_multi("Keywords"),
-                )
-            except Exception:
-                logger.debug(
-                    "hydrate_candidates: failed to fetch page %s — skipping.",
-                    page_id, exc_info=True,
-                )
-                return page_id, None
-
+        """Load full ConceptData for candidate concept IDs from the Store."""
         results: Dict[str, ConceptData] = {}
-        max_workers = min(self._hydration_concurrency, len(candidate_ids))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_fetch_one, pid): pid for pid in candidate_ids}
-            for future in concurrent.futures.as_completed(futures):
-                pid, data = future.result()
-                if data is not None:
-                    results[pid] = data
+        for cid in candidate_ids:
+            c = self.store.get_concept(cid)
+            if c is None:
+                continue
+            results[cid] = ConceptData(
+                notion_page_id=c.id,
+                title=c.effective_title or "(unknown)",
+                concept_type=c.type or "Definition",
+                statement_latex=c.statement_latex,
+                assumptions=c.assumptions,
+                conclusion=c.conclusion or c.interpretation,
+                setting=list(c.setting or []),
+                named_tools=list(c.named_tools or []),
+                keywords=list(c.canonical_keywords or []),
+            )
         return results
-
-    def update_knowledge_item_candidates(
-        self, ki_page_id: str, candidates: list[dict]
-    ) -> None:
-        slim = [{k: v for k, v in c.items() if not k.startswith("_")} for c in candidates]
-        s = json.dumps(slim, ensure_ascii=False)
-        while len(s) > NOTION_BLOCK_MAX_CHARS and len(slim) > 1:
-            slim.pop()
-            s = json.dumps(slim, ensure_ascii=False)
-        self.notion.update_page(
-            page_id=ki_page_id,
-            properties={"Candidate Matches": {"rich_text": self.notion.rich_text(s)}},
-        )

@@ -34,15 +34,6 @@ class Config(BaseSettings):
     # Where uploaded PDFs are stored (in-app "Add Paper").
     uploads_dir: str = "/data/uploads"
 
-    # ── Notion (DEPRECATED — being removed; kept optional during the cutover) ──
-    notion_token: str = ""
-    notion_paper_tracker_db_id: str = ""
-    notion_knowledge_inbox_db_id: str = ""
-    notion_second_brain_db_id: str = ""
-    notion_edges_db_id: str = ""
-    notion_deferred_edges_db_id: str = ""
-    notion_projects_db_id: str = ""
-
     # ── Anthropic / LLM ───────────────────────────────────────────────────────
     # Optional so the stack boots with zero config; extraction logs a warning and
     # is skipped if unset.
