@@ -319,6 +319,162 @@ class Store:
                 s.commit()
         return resolved
 
+    # ── Filtering / bulk / authoring (UI daily-use) ───────────────────────────
+
+    def query_concepts(
+        self,
+        *,
+        states: list[str] | None = None,
+        paper_id: str | None = None,
+        type: str | None = None,
+        hub: str | None = None,
+        verification: str | None = None,
+        min_confidence: float | None = None,
+        q: str | None = None,
+        sort: str = "title",
+    ) -> list[Concept]:
+        """Flexible concept query (filters applied in Python — single-user scale)."""
+        with new_session(self._engine) as s:
+            stmt = select(Concept)
+            if states:
+                stmt = stmt.where(Concept.state.in_(states))
+            if paper_id:
+                stmt = stmt.where(Concept.paper_id == paper_id)
+            rows = list(s.exec(stmt))
+
+        ql = (q or "").lower().strip()
+
+        def _match(c: Concept) -> bool:
+            if type and c.type != type:
+                return False
+            if hub is not None and (c.suggested_hub or "Uncategorized") != hub:
+                return False
+            if verification and c.verification_status != verification:
+                return False
+            if min_confidence is not None and (c.ai_confidence or 0) < min_confidence:
+                return False
+            if ql:
+                hay = " ".join([
+                    c.effective_title, c.statement_latex or "", c.conclusion or "",
+                    c.aliases or "", " ".join(c.canonical_keywords or []),
+                ]).lower()
+                if ql not in hay:
+                    return False
+            return True
+
+        out = [c for c in rows if _match(c)]
+        if sort == "confidence":
+            out.sort(key=lambda c: c.ai_confidence or 0, reverse=True)
+        elif sort == "recent":
+            out.sort(key=lambda c: c.created_at, reverse=True)
+        else:
+            out.sort(key=lambda c: c.effective_title.lower())
+        return out
+
+    def set_verification_bulk(self, concept_ids: list[str], status: str) -> int:
+        if not concept_ids:
+            return 0
+        n = 0
+        with new_session(self._engine) as s:
+            for cid in concept_ids:
+                c = s.get(Concept, cid)
+                if c is not None:
+                    c.verification_status = status
+                    c.updated_at = _now()
+                    s.add(c)
+                    n += 1
+            s.commit()
+        return n
+
+    def paper_review_counts(self, paper_id: str) -> dict[str, int]:
+        inbox = self.concepts_for_paper(paper_id, state=ConceptState.INBOX.value)
+        counts = {"total": len(inbox), "verified": 0, "rejected": 0, "unverified": 0}
+        for c in inbox:
+            counts[c.verification_status] = counts.get(c.verification_status, 0) + 1
+        return counts
+
+    def distinct_hubs(self) -> list[str]:
+        hubs = {(c.suggested_hub or "Uncategorized") for c in self.list_concepts()}
+        return sorted(hubs, key=str.lower)
+
+    def distinct_types(self) -> list[str]:
+        return sorted({c.type for c in self.list_concepts() if c.type})
+
+    def promote_paper(self, paper_id: str) -> dict[str, int]:
+        """One-click: promote a paper's verified concepts + verify ready auto-edges."""
+        inbox = self.concepts_for_paper(paper_id, state=ConceptState.INBOX.value)
+        verified = [c for c in inbox if c.verification_status == VerificationStatus.VERIFIED.value]
+        promoted = sum(1 for c in verified if self.promote_concept(c.id))
+        edges = self.verify_auto_edges_between_promoted()
+        self.set_paper_status(paper_id, PaperStatus.S3_DISTILLED.value)
+        return {"promoted": promoted, "edges_verified": edges}
+
+    def add_manual_edge(
+        self, source_id: str, target_id: str, relation_type: str, rationale: str = ""
+    ) -> Edge | None:
+        if not source_id or not target_id or source_id == target_id:
+            return None
+        return self.create_edge(
+            source_concept_id=source_id,
+            target_concept_id=target_id,
+            relation_type=relation_type,
+            channel="manual",
+            status=EdgeStatus.VERIFIED.value,
+            needs_review=False,
+            ai_confidence=1.0,
+            rationale=rationale,
+            justification=rationale,
+        )
+
+    def delete_edge(self, edge_id: str) -> None:
+        with new_session(self._engine) as s:
+            e = s.get(Edge, edge_id)
+            if e is not None:
+                s.delete(e)
+                s.commit()
+
+    def delete_concept(self, concept_id: str) -> None:
+        with new_session(self._engine) as s:
+            for e in s.exec(
+                select(Edge).where(
+                    (Edge.source_concept_id == concept_id)
+                    | (Edge.target_concept_id == concept_id)
+                )
+            ):
+                s.delete(e)
+            c = s.get(Concept, concept_id)
+            if c is not None:
+                s.delete(c)
+            s.commit()
+
+    def merge_concepts(self, source_id: str, into_id: str) -> bool:
+        """Repoint source's edges onto `into`, then delete source. Drops self-loops."""
+        if not source_id or not into_id or source_id == into_id:
+            return False
+        with new_session(self._engine) as s:
+            into = s.get(Concept, into_id)
+            src = s.get(Concept, source_id)
+            if into is None or src is None:
+                return False
+            edges = list(s.exec(
+                select(Edge).where(
+                    (Edge.source_concept_id == source_id)
+                    | (Edge.target_concept_id == source_id)
+                )
+            ))
+            for e in edges:
+                if e.source_concept_id == source_id:
+                    e.source_concept_id = into_id
+                if e.target_concept_id == source_id:
+                    e.target_concept_id = into_id
+                if e.source_concept_id == e.target_concept_id:
+                    s.delete(e)
+                else:
+                    s.add(e)
+            s.delete(src)
+            s.commit()
+        return True
+
     # ── Projects (minimal) ───────────────────────────────────────────────────────
 
     def list_projects(self) -> list[Project]:

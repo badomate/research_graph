@@ -1,30 +1,53 @@
 {% extends "base.html" %}
 {% block title %}Papers · paper_pipeline{% endblock %}
 {% block content %}
+{% if imported %}
+  <div class="callout {% if imported == '-1' %}bad{% else %}warn{% endif %}">
+    {% if imported == '-1' %}Zotero sync failed — check ZOTERO_USER_ID / ZOTERO_API_KEY and the logs.
+    {% elif imported == '0' %}Zotero sync: no new papers.
+    {% else %}Imported {{ imported }} new paper(s) from Zotero (now in Inbox — set them to Queued to process).{% endif %}
+  </div>
+{% endif %}
+
 <div class="page-head">
-  <h1>Papers</h1>
-  <p class="muted">{{ total }} total</p>
+  <h1>Papers <span class="muted">{{ total }}</span></h1>
+  <div class="row">
+    {% if zotero_configured %}
+    <form method="post" action="/zotero/sync"><button class="btn sm" type="submit">⟳ Sync Zotero</button></form>
+    {% endif %}
+    <form class="row" method="get" action="/">
+      <input name="q" value="{{ q }}" placeholder="Filter papers…" autocomplete="off">
+      <button class="btn sm" type="submit">Filter</button>
+    </form>
+  </div>
 </div>
 
 {% if not columns %}
-  <div class="empty">No papers yet. <a href="/papers/new">Add one</a> to get started.</div>
+  <div class="empty">No papers{% if q %} match "{{ q }}"{% endif %}. <a href="/papers/new">Add one</a>.</div>
 {% endif %}
 
 {% for col in columns %}
-<section class="status-group">
-  <h2 class="status-h"><span class="dot" style="--c:{{ col.meta.color }}"></span>
-    {{ col.meta.label }} <span class="muted">{{ col.papers|length }}</span></h2>
-  <ul class="paper-list">
-    {% for p in col.papers %}
-    <li class="paper-row">
-      <a class="paper-link" href="/papers/{{ p.id }}">
-        <span class="paper-title">{{ p.title }}</span>
-        {% if p.one_liner %}<span class="paper-sub muted">{{ p.one_liner }}</span>{% endif %}
-      </a>
+<div class="section-h"><span class="dot" style="--c:{{ col.meta.color }}"></span>
+  {{ col.meta.label }} <span class="muted">{{ col.papers|length }}</span></div>
+<div class="rows">
+  {% for p in col.papers %}
+  <div class="drow">
+    <div class="main">
+      <a class="title" href="/papers/{{ p.id }}">{{ p.title }}</a>
+      <div class="sub">{{ p.authors or p.one_liner or '' }}</div>
+    </div>
+    <div class="meta">
+      {% if p.pdf_path or p.arxiv_id or p.arxiv_url or p.doi %}
+        <a class="btn sm" href="/papers/{{ p.id }}/pdf" target="_blank" rel="noopener" title="view PDF">PDF</a>{% endif %}
       {% if p.extraction_count %}<span class="muted nowrap">{{ p.extraction_count }} concepts</span>{% endif %}
-    </li>
-    {% endfor %}
-  </ul>
-</section>
+      {% if p.status == 's2-extracted' %}
+        <a class="btn sm btn-primary" href="/papers/{{ p.id }}/review">Review</a>
+      {% elif p.status == 'blocked-extraction' %}
+        <span class="pill bad-pill">blocked</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
 {% endfor %}
 {% endblock %}

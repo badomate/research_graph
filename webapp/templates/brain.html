@@ -2,30 +2,34 @@
 {% block title %}Second Brain · paper_pipeline{% endblock %}
 {% block content %}
 <div class="page-head">
-  <div><h1>Second Brain</h1><p class="muted">{{ count }} promoted concept(s)</p></div>
+  <h1>Second Brain <span class="muted">{{ count }}</span></h1>
 </div>
 
-<form class="search-bar" method="get" action="/brain">
-  <input class="inp" name="q" value="{{ q }}" placeholder="Filter by title or keyword…"
-         autocomplete="off">
+<form class="filters" method="get" action="/brain">
+  <input name="q" value="{{ q }}" placeholder="Search title / keywords / statement…" autocomplete="off">
+  <select name="type" aria-label="type filter">
+    <option value="">any type</option>
+    {% for t in types %}<option value="{{ t }}" {% if cur_type == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+  </select>
+  <select name="hub" aria-label="hub filter">
+    <option value="">any hub</option>
+    {% for h in hubs %}<option value="{{ h }}" {% if cur_hub == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+  </select>
+  <select name="sort" aria-label="sort">
+    {% for s, lbl in [('title','title'),('confidence','confidence'),('recent','newest')] %}
+    <option value="{{ s }}" {% if sort == s %}selected{% endif %}>sort: {{ lbl }}</option>{% endfor %}
+  </select>
+  <button class="btn sm" type="submit">Apply</button>
 </form>
 
 {% if not grouped %}
-  <div class="empty">No promoted concepts yet. Verify concepts in the
-    <a href="/review">review queue</a> and promote their paper.</div>
+  <div class="empty">No concepts match. Verify some in the <a href="/review">review queue</a> and promote.</div>
 {% endif %}
 
 {% for hub, items in grouped %}
-<section class="status-group">
-  <h2 class="status-h">{{ hub }} <span class="muted">{{ items|length }}</span></h2>
-  <ul class="concept-mini-list">
-    {% for c in items %}
-    <li>
-      <a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
-      <span class="type-badge sm">{{ c.type }}</span>
-    </li>
-    {% endfor %}
-  </ul>
-</section>
+<div class="section-h">{{ hub }} <span class="muted">{{ items|length }}</span></div>
+<div class="rows">
+  {% for c in items %}{% include "partials/_concept_row.html" %}{% endfor %}
+</div>
 {% endfor %}
 {% endblock %}

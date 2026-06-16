@@ -29,9 +29,12 @@ TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
 ZOTERO_API_BASE = "https://api.zotero.org"
 EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
 
-_ZOTERO_PARENT_RE = re.compile(r"zotero\.org/[^/]+/items/([A-Z0-9]{8})(?:/|$)")
+# Accept every Zotero URI form: web profile (zotero.org/<user>/items/KEY),
+# API/library (zotero.org/users/<id>/items/KEY), and the "Copy Zotero URI"
+# select form (zotero://select/library/items/KEY).
+_ZOTERO_PARENT_RE = re.compile(r"zotero(?:\.org|://)[^?#]*?/items/([A-Z0-9]{8})(?:/|$)")
 _ZOTERO_ATTACH_RE = re.compile(
-    r"zotero\.org/[^/]+/items/[A-Z0-9]{8}/attachment/([A-Z0-9]{8})"
+    r"zotero(?:\.org|://)[^?#]*?/items/[A-Z0-9]{8}/attachment/([A-Z0-9]{8})"
 )
 
 _BOILERPLATE_RE = re.compile(
@@ -64,7 +67,10 @@ class PdfFetcherService:
         self.zotero_user_id = config.zotero_user_id if config is not None else os.environ["ZOTERO_USER_ID"]
         self.zotero_api_key = config.zotero_api_key if config is not None else os.environ["ZOTERO_API_KEY"]
         self.koofr_markdown_dir = config.koofr_markdown_path if config is not None else os.environ.get("KOOFR_MARKDOWN_PATH", "/zotero_markdown")
-        self._ensure_koofr_markdown_dir()
+        koofr_user = config.koofr_user if config is not None else os.environ.get("KOOFR_USER", "")
+        # Only touch Koofr when it's actually configured — uploads/arXiv bypass it.
+        if koofr_user:
+            self._ensure_koofr_markdown_dir()
 
     @staticmethod
     def _build_webdav_client(config: Config | None = None) -> WebDAVClient:

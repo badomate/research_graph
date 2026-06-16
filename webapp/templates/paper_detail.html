@@ -2,45 +2,64 @@
 {% block title %}{{ paper.title }} · paper_pipeline{% endblock %}
 {% block content %}
 <div class="page-head">
-  <a class="btn" href="/">← papers</a>
+  <a class="btn sm" href="/">← papers</a>
 </div>
 
-<h1 class="paper-h">{{ paper.title }}</h1>
+<h1>{{ paper.title }}</h1>
 {% set sm = status_meta.get(paper.status, {"label": paper.status, "color": "#888"}) %}
-<div class="meta-row">
+<div class="row">
   <span class="pill" style="--c:{{ sm.color }}">{{ sm.label }}</span>
   {% if paper.authors %}<span class="muted">{{ paper.authors }}</span>{% endif %}
-  {% if paper.arxiv_id %}<a class="muted" href="https://arxiv.org/abs/{{ paper.arxiv_id }}" target="_blank">arXiv:{{ paper.arxiv_id }}</a>{% endif %}
+  {% if paper.arxiv_id %}<a class="muted" href="https://arxiv.org/abs/{{ paper.arxiv_id }}" target="_blank" rel="noopener">arXiv:{{ paper.arxiv_id }}</a>{% endif %}
+  {% if paper.doi %}<a class="muted" href="https://doi.org/{{ paper.doi }}" target="_blank" rel="noopener">doi</a>{% endif %}
 </div>
-
 {% if paper.one_liner %}<p class="lead">{{ paper.one_liner }}</p>{% endif %}
 {% if paper.extraction_error %}<div class="callout bad">{{ paper.extraction_error }}</div>{% endif %}
 
-<div class="actions-bar">
-  {% if concepts %}<a class="btn btn-primary" href="/papers/{{ paper.id }}/review">Review {{ concepts|length }} concept(s)</a>{% endif %}
-  <form method="post" action="/papers/{{ paper.id }}/status" class="inline-form">
-    <select name="status">
-      {% for s, m in status_meta.items() %}
-      <option value="{{ s }}" {% if s == paper.status %}selected{% endif %}>{{ m.label }} ({{ s }})</option>
-      {% endfor %}
-    </select>
-    <button class="btn" type="submit">Set status</button>
-  </form>
+{# ── Action bar ── #}
+<div class="toolbar">
+  {% if concepts %}<a class="btn sm btn-primary" href="/papers/{{ paper.id }}/review">Review ({{ concepts|length }})</a>{% endif %}
+  {% if paper.pdf_path or paper.arxiv_id or paper.arxiv_url or paper.doi %}
+    <a class="btn sm" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noopener">View PDF</a>{% endif %}
+  <a class="btn sm" href="/papers/{{ paper.id }}/concepts/new">+ Concept</a>
+  {% if counts and counts.verified %}
+    <form method="post" action="/papers/{{ paper.id }}/promote"
+          onsubmit="return confirm('Promote {{ counts.verified }} verified concept(s)?')">
+      <button class="btn sm btn-primary" type="submit">Promote {{ counts.verified }} →</button>
+    </form>
+  {% endif %}
+  <span class="grow"></span>
+  {% if counts and counts.total %}
+    <span class="muted nowrap">{{ counts.verified }}/{{ counts.total }} verified</span>
+    <span class="progress"><i style="width: {{ 100 * counts.verified / counts.total }}%"></i></span>
+  {% endif %}
+  <details><summary class="btn sm">Status…</summary>
+    <form class="row" method="post" action="/papers/{{ paper.id }}/status" style="margin-top:6px">
+      <select name="status" aria-label="set status">
+        {% for s, m in status_meta.items() %}
+        <option value="{{ s }}" {% if s == paper.status %}selected{% endif %}>{{ m.label }} ({{ s }})</option>{% endfor %}
+      </select>
+      <button class="btn sm" type="submit">Set</button>
+    </form>
+  </details>
+  <details><summary class="btn sm">Zotero link…</summary>
+    <form class="row" method="post" action="/papers/{{ paper.id }}/link" style="margin-top:6px">
+      <input class="inp" name="zotero_uri" value="{{ paper.zotero_uri }}"
+             placeholder="https://www.zotero.org/users/…/items/XXXXXXXX" aria-label="Zotero URI" style="flex:1;min-width:240px">
+      <button class="btn sm" type="submit">Link</button>
+    </form>
+  </details>
 </div>
+{% if paper.extraction_error and 'Zotero URI' in paper.extraction_error %}
+  <p class="muted">Tip: in Zotero, right-click the item → <em>Copy Zotero URI</em>, paste it in “Zotero link”, then set status to Queued. The PDF must also be synced to Koofr.</p>
+{% endif %}
 
-<h2>Concepts</h2>
+<div class="section-h">Concepts <span class="muted">{{ concepts|length }}</span></div>
 {% if not concepts %}
-  <p class="muted">No concepts extracted yet.</p>
+  <p class="muted">No concepts yet. <a href="/papers/{{ paper.id }}/concepts/new">Add one</a> or run extraction.</p>
 {% else %}
-<ul class="concept-mini-list">
-  {% for c in concepts %}
-  {% set vm = verif_meta.get(c.verification_status, {"label": c.verification_status, "color":"#888"}) %}
-  <li>
-    <a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
-    <span class="type-badge sm">{{ c.type }}</span>
-    <span class="pill sm" style="--c:{{ vm.color }}">{{ vm.label }}</span>
-  </li>
-  {% endfor %}
-</ul>
+<div class="rows">
+  {% for c in concepts %}{% include "partials/_concept_row.html" %}{% endfor %}
+</div>
 {% endif %}
 {% endblock %}

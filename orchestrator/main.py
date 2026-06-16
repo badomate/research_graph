@@ -47,7 +47,11 @@ def run_zotero_intake(config: Config) -> None:
 
 
 def _run_startup_once(config: Config, vector_index: VectorIndexEngine | None) -> None:
-    startup_jobs = [
+    startup_jobs = []
+    if config.zotero_poll_enabled:
+        # Import immediately on boot so enabling the poller isn't a 1-interval wait.
+        startup_jobs.append(("Zotero Intake", lambda: run_zotero_intake(config)))
+    startup_jobs += [
         ("Core Ingestion Engine",
          lambda: IngestionEngine(vector_index=vector_index, config=config).run()),
         ("Promotion Engine",

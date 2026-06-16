@@ -1,13 +1,12 @@
 """
 webapp/main.py — the paper_pipeline web UI (replaces Notion).
 
-Server-rendered FastAPI + Jinja + HTMX. Reads/writes the same SQLite database the
-orchestrator uses (the ``Store`` from orchestrator/modules/store). Designed to be
-fast and low-friction: one-click verify/reject, inline edits, keyboard review.
+Server-rendered FastAPI + Jinja + HTMX over the shared SQLite ``Store``. Built for
+daily use: filtered browsing, bulk review, one-click promotion, and manual
+authoring of concepts and edges.
 
 Run locally:
     DATABASE_URL=sqlite:///./app.db uvicorn webapp.main:app --reload
-    # then open http://127.0.0.1:8000
 """
 from __future__ import annotations
 
@@ -15,16 +14,13 @@ import os
 import sys
 from pathlib import Path
 
-# Make the orchestrator's modules importable (Store lives there).
 _ORCH = (Path(__file__).resolve().parent.parent / "orchestrator").resolve()
 if str(_ORCH) not in sys.path:
     sys.path.insert(0, str(_ORCH))
-
-# Local-friendly default so `uvicorn webapp.main:app` just works without env.
 os.environ.setdefault("DATABASE_URL", "sqlite:///./app.db")
 
 from fastapi import FastAPI, Form, Request, UploadFile  # noqa: E402
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse  # noqa: E402
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from fastapi.templating import Jinja2Templates  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
@@ -34,6 +30,7 @@ from modules.store import (  # noqa: E402
     ConceptState,
     EdgeStatus,
     PaperStatus,
+    RelationType,
     Store,
     VerificationStatus,
 )
@@ -42,8 +39,23 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 store = Store()
 
+_template_response = templates.TemplateResponse
+
+
+def render(name: str, ctx: dict):
+    """Render via the modern Starlette signature (request, name, context).
+
+    The legacy positional (name, context) form was removed in newer Starlette, so
+    we always pass the request first; every ctx here is built by ``_ctx`` and
+    includes "request".
+    """
+    return _template_response(ctx["request"], name, ctx)
+
 app = FastAPI(title="paper_pipeline")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+CONCEPT_TYPES = ["Definition", "Theorem", "Lemma", "Algorithm", "Assumption", "Proof", "ProofTechnique"]
+RELATION_TYPES = [r.value for r in RelationType]
 
 
 @app.on_event("startup")
@@ -51,7 +63,7 @@ def _startup() -> None:
     store.create_all()
 
 
-# ── Display metadata (kept tiny + muted; the UI should not be noisy) ───────────
+# ── Display metadata ───────────────────────────────────────────────────────────
 
 STATUS_META: dict[str, dict] = {
     "s0-inbox": {"label": "Inbox", "color": "#8d99ae"},
@@ -64,13 +76,7 @@ STATUS_META: dict[str, dict] = {
     "s2-read": {"label": "Promoting", "color": "#4a8fbf"},
     "s3-distilled": {"label": "Done", "color": "#5aa469"},
 }
-
-# Order papers columns flow in on the dashboard.
-STATUS_ORDER = [
-    "s0-inbox", "s1-skim", "s1-processing", "s1b-waiting-attachment",
-    "blocked-extraction", "s2-extracted", "s2-reextract", "s2-read", "s3-distilled",
-]
-
+STATUS_ORDER = list(STATUS_META)
 VERIF_META = {
     "unverified": {"label": "Unverified", "color": "#9aa0a6"},
     "verified": {"label": "Verified", "color": "#5aa469"},
@@ -79,27 +85,18 @@ VERIF_META = {
 
 
 def _ctx(request: Request, **extra) -> dict:
-    """Common template context (nav counts etc.)."""
-    pending = sum(
-        1 for c in store.list_concepts(state=ConceptState.INBOX.value)
-        if c.verification_status == VerificationStatus.UNVERIFIED.value
-    )
+    pending = len(store.query_concepts(
+        states=[ConceptState.INBOX.value], verification=VerificationStatus.UNVERIFIED.value
+    ))
     base = {
-        "request": request,
-        "status_meta": STATUS_META,
-        "verif_meta": VERIF_META,
-        "pending_review": pending,
+        "request": request, "status_meta": STATUS_META, "verif_meta": VERIF_META,
+        "pending_review": pending, "concept_types": CONCEPT_TYPES, "relation_types": RELATION_TYPES,
     }
     base.update(extra)
     return base
 
 
-def _is_htmx(request: Request) -> bool:
-    return request.headers.get("HX-Request") == "true"
-
-
 def _edge_view(edge) -> dict:
-    """Resolve an edge into a flat dict the templates can render directly."""
     target = store.get_concept(edge.target_concept_id) if edge.target_concept_id else None
     source = store.get_concept(edge.source_concept_id)
     return {
@@ -110,77 +107,81 @@ def _edge_view(edge) -> dict:
     }
 
 
+def _parse_keywords(raw: str) -> list[str]:
+    return [k.strip() for k in (raw or "").split(",") if k.strip()]
+
+
 # ── Papers dashboard ───────────────────────────────────────────────────────────
 
-
 @app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request):
+def dashboard(request: Request, q: str = "", imported: str = ""):
     papers = store.list_papers()
-    by_status: dict[str, list] = {s: [] for s in STATUS_ORDER}
+    if q.strip():
+        ql = q.lower()
+        papers = [p for p in papers if ql in p.title.lower() or ql in (p.authors or "").lower()]
+    by_status: dict[str, list] = {}
     for p in papers:
         by_status.setdefault(p.status, []).append(p)
     columns = [
         {"status": s, "meta": STATUS_META.get(s, {"label": s, "color": "#888"}), "papers": by_status.get(s, [])}
-        for s in STATUS_ORDER
-        if by_status.get(s)
+        for s in STATUS_ORDER if by_status.get(s)
     ]
-    return templates.TemplateResponse(
-        "papers.html",
-        _ctx(request, columns=columns, total=len(papers)),
-    )
+    zotero_configured = bool(os.environ.get("ZOTERO_USER_ID") and os.environ.get("ZOTERO_API_KEY"))
+    return render("papers.html", _ctx(
+        request, columns=columns, total=len(papers), q=q,
+        zotero_configured=zotero_configured, imported=imported))
+
+
+@app.post("/zotero/sync")
+def zotero_sync():
+    """Import new Zotero items now (the Sync button)."""
+    from modules.zotero_intake import ZoteroIntake
+    try:
+        n = ZoteroIntake().run()
+    except Exception:  # never 500 the dashboard over an intake hiccup
+        n = -1
+    return RedirectResponse(url=f"/?imported={n}", status_code=303)
 
 
 @app.get("/papers/new", response_class=HTMLResponse)
 def add_paper_form(request: Request):
-    return templates.TemplateResponse("add_paper.html", _ctx(request))
+    return render("add_paper.html", _ctx(request))
 
 
 @app.post("/papers")
 async def create_paper(
-    request: Request,
-    title: str = Form(""),
-    arxiv_id: str = Form(""),
-    doi: str = Form(""),
-    pdf: UploadFile | None = None,
+    request: Request, title: str = Form(""), arxiv_id: str = Form(""),
+    doi: str = Form(""), zotero_uri: str = Form(""), pdf: UploadFile | None = None,
 ):
-    pdf_path = ""
-    authors = ""
-    abstract = ""
+    pdf_path = authors = abstract = ""
     if pdf is not None and pdf.filename:
         uploads = Path(os.environ.get("UPLOADS_DIR", "./uploads"))
         uploads.mkdir(parents=True, exist_ok=True)
         dest = uploads / pdf.filename
         dest.write_bytes(await pdf.read())
         pdf_path = str(dest)
-        if not title:
-            title = pdf.filename.rsplit(".", 1)[0]
-
-    # Enrich from arXiv/DOI metadata (off the event loop) when no PDF was uploaded.
+        title = title or pdf.filename.rsplit(".", 1)[0]
     if not pdf_path and (arxiv_id.strip() or doi.strip()):
-        meta = None
-        if arxiv_id.strip():
-            meta = await run_in_threadpool(fetch_arxiv_metadata, arxiv_id)
-        elif doi.strip():
-            meta = await run_in_threadpool(fetch_doi_metadata, doi)
+        meta = (await run_in_threadpool(fetch_arxiv_metadata, arxiv_id) if arxiv_id.strip()
+                else await run_in_threadpool(fetch_doi_metadata, doi))
         if meta:
             title = title or meta.get("title", "")
-            authors = meta.get("authors", "")
-            abstract = meta.get("abstract", "")
-
-    if not title:
-        title = arxiv_id or doi or "Untitled paper"
+            authors, abstract = meta.get("authors", ""), meta.get("abstract", "")
+    title = title or arxiv_id or doi or "Untitled paper"
     paper = store.create_paper(
-        title=title,
-        authors=authors,
-        arxiv_id=arxiv_id.strip(),
+        title=title, authors=authors, arxiv_id=arxiv_id.strip(),
         arxiv_url=f"https://arxiv.org/abs/{arxiv_id.strip()}" if arxiv_id.strip() else "",
-        doi=doi.strip(),
-        one_liner=abstract[:500],
-        pdf_path=pdf_path,
-        source="manual",
-        status=PaperStatus.S1_SKIM.value,
+        doi=doi.strip(), zotero_uri=zotero_uri.strip(), one_liner=abstract[:500],
+        pdf_path=pdf_path, source="manual", status=PaperStatus.S1_SKIM.value,
     )
     return RedirectResponse(url=f"/papers/{paper.id}", status_code=303)
+
+
+@app.post("/papers/{paper_id}/link")
+def set_paper_link(paper_id: str, zotero_uri: str = Form("")):
+    """Attach a Zotero URI to a manually-added paper so its Koofr PDF resolves."""
+    store.update_paper(paper_id, zotero_uri=zotero_uri.strip())
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.get("/papers/{paper_id}", response_class=HTMLResponse)
@@ -189,55 +190,132 @@ def paper_detail(request: Request, paper_id: str):
     if paper is None:
         return RedirectResponse(url="/", status_code=303)
     concepts = store.concepts_for_paper(paper_id)
-    return templates.TemplateResponse(
-        "paper_detail.html",
-        _ctx(request, paper=paper, concepts=concepts),
-    )
+    return render("paper_detail.html", _ctx(
+        request, paper=paper, concepts=concepts, counts=store.paper_review_counts(paper_id)))
+
+
+@app.get("/papers/{paper_id}/pdf")
+def paper_pdf(paper_id: str):
+    """View the paper: serve an uploaded PDF inline, else redirect to arXiv/DOI."""
+    paper = store.get_paper(paper_id)
+    if paper is None:
+        return RedirectResponse(url="/", status_code=303)
+    if paper.pdf_path and Path(paper.pdf_path).exists():
+        return FileResponse(
+            paper.pdf_path, media_type="application/pdf",
+            filename=Path(paper.pdf_path).name, content_disposition_type="inline",
+        )
+    if paper.arxiv_id:
+        return RedirectResponse(url=f"https://arxiv.org/pdf/{paper.arxiv_id}", status_code=307)
+    if paper.arxiv_url:
+        return RedirectResponse(url=paper.arxiv_url, status_code=307)
+    if paper.doi:
+        return RedirectResponse(url=f"https://doi.org/{paper.doi}", status_code=307)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/status")
-def set_paper_status(request: Request, paper_id: str, status: str = Form(...)):
+def set_paper_status(paper_id: str, status: str = Form(...)):
     store.set_paper_status(paper_id, status)
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
-# ── Review queue (the core workflow) ───────────────────────────────────────────
+@app.post("/papers/{paper_id}/promote")
+def promote_paper(paper_id: str):
+    store.promote_paper(paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+# ── Manual concept authoring ────────────────────────────────────────────────────
+
+@app.get("/papers/{paper_id}/concepts/new", response_class=HTMLResponse)
+def new_concept_form(request: Request, paper_id: str):
+    paper = store.get_paper(paper_id)
+    return render("concept_new.html", _ctx(request, paper=paper))
+
+
+@app.post("/papers/{paper_id}/concepts")
+def create_concept(
+    paper_id: str, title: str = Form(...), type: str = Form("Definition"),
+    statement_latex: str = Form(""), assumptions: str = Form(""), conclusion: str = Form(""),
+    suggested_hub: str = Form(""), keywords: str = Form(""),
+):
+    c = store.create_concept(
+        paper_id=paper_id, title=title, type=type, statement_latex=statement_latex,
+        assumptions=assumptions, conclusion=conclusion, suggested_hub=suggested_hub,
+        canonical_keywords=_parse_keywords(keywords),
+        verification_status=VerificationStatus.VERIFIED.value,  # hand-authored = trusted
+    )
+    return RedirectResponse(url=f"/concepts/{c.id}", status_code=303)
+
+
+# ── Review queue (filters + bulk) ────────────────────────────────────────────────
+
+def _render_review(request: Request, *, paper, filters: dict):
+    concepts = store.query_concepts(
+        states=[ConceptState.INBOX.value],
+        paper_id=paper.id if paper else None,
+        type=filters.get("type") or None,
+        hub=filters.get("hub") or None,
+        verification=filters.get("verification") or None,
+        min_confidence=filters.get("min_confidence"),
+        q=filters.get("q") or None,
+        sort=filters.get("sort") or "confidence",
+    )
+    cards = [{"concept": c, "edges": [_edge_view(e) for e in store.proposed_edges_for_concept(c.id)]}
+             for c in concepts]
+    ctx = _ctx(
+        request, cards=cards, paper=paper, filters=filters,
+        base_url=f"/papers/{paper.id}/review" if paper else "/review",
+        hubs=store.distinct_hubs(), types=store.distinct_types(),
+        counts=store.paper_review_counts(paper.id) if paper else None,
+    )
+    return ctx
+
+
+def _filters_from_query(type: str, hub: str, verification: str, min_confidence: str, q: str, sort: str) -> dict:
+    mc = None
+    try:
+        mc = float(min_confidence) if min_confidence else None
+    except ValueError:
+        mc = None
+    return {"type": type, "hub": hub, "verification": verification, "min_confidence": mc, "q": q, "sort": sort}
 
 
 @app.get("/review", response_class=HTMLResponse)
-def review_all(request: Request):
-    concepts = [
-        c for c in store.list_concepts(state=ConceptState.INBOX.value)
-        if c.verification_status == VerificationStatus.UNVERIFIED.value
-    ]
-    return _render_review(request, concepts, title="Review queue", paper=None)
+def review_all(request: Request, type: str = "", hub: str = "",
+               verification: str = "unverified", min_confidence: str = "", q: str = "", sort: str = "confidence"):
+    filters = _filters_from_query(type, hub, verification, min_confidence, q, sort)
+    return render("review.html", _render_review(request, paper=None, filters=filters))
 
 
 @app.get("/papers/{paper_id}/review", response_class=HTMLResponse)
-def review_paper(request: Request, paper_id: str):
+def review_paper(request: Request, paper_id: str, type: str = "", hub: str = "",
+                 verification: str = "", min_confidence: str = "", q: str = "", sort: str = "confidence"):
     paper = store.get_paper(paper_id)
-    concepts = store.concepts_for_paper(paper_id, state=ConceptState.INBOX.value)
-    return _render_review(request, concepts, title=paper.title if paper else "Review", paper=paper)
+    filters = _filters_from_query(type, hub, verification, min_confidence, q, sort)
+    return render("review.html", _render_review(request, paper=paper, filters=filters))
 
 
-def _render_review(request: Request, concepts, title: str, paper):
-    cards = [
-        {"concept": c, "edges": [_edge_view(e) for e in store.proposed_edges_for_concept(c.id)]}
-        for c in concepts
-    ]
-    return templates.TemplateResponse(
-        "review.html",
-        _ctx(request, cards=cards, review_title=title, paper=paper),
-    )
+@app.post("/concepts/bulk", response_class=HTMLResponse)
+def bulk_action(
+    request: Request, action: str = Form(...), ids: list[str] = Form(default=[]),
+    paper_id: str = Form(""), type: str = Form(""), hub: str = Form(""),
+    verification: str = Form("unverified"), min_confidence: str = Form(""),
+    q: str = Form(""), sort: str = Form("confidence"),
+):
+    status = VerificationStatus.VERIFIED.value if action == "verify" else VerificationStatus.REJECTED.value
+    store.set_verification_bulk(ids, status)
+    paper = store.get_paper(paper_id) if paper_id else None
+    filters = _filters_from_query(type, hub, verification, min_confidence, q, sort)
+    return render("partials/_review_list.html", _render_review(request, paper=paper, filters=filters))
 
 
 def _card_response(request: Request, concept_id: str):
     concept = store.get_concept(concept_id)
     edges = [_edge_view(e) for e in store.proposed_edges_for_concept(concept_id)]
-    return templates.TemplateResponse(
-        "partials/_concept_card.html",
-        _ctx(request, card={"concept": concept, "edges": edges}),
-    )
+    return render("partials/_concept_card.html",
+                                      _ctx(request, card={"concept": concept, "edges": edges}))
 
 
 @app.post("/concepts/{concept_id}/verify", response_class=HTMLResponse)
@@ -259,43 +337,49 @@ def concept_card(request: Request, concept_id: str):
 
 @app.get("/concepts/{concept_id}/edit", response_class=HTMLResponse)
 def edit_concept_form(request: Request, concept_id: str):
-    concept = store.get_concept(concept_id)
-    return templates.TemplateResponse(
-        "partials/_concept_edit.html",
-        _ctx(request, concept=concept),
-    )
+    return render("partials/_concept_edit.html",
+                                      _ctx(request, concept=store.get_concept(concept_id)))
 
 
 @app.post("/concepts/{concept_id}", response_class=HTMLResponse)
 def save_concept(
-    request: Request,
-    concept_id: str,
-    corrected_title: str = Form(""),
-    statement_latex: str = Form(""),
-    assumptions: str = Form(""),
-    conclusion: str = Form(""),
+    request: Request, concept_id: str, corrected_title: str = Form(""), type: str = Form(""),
+    suggested_hub: str = Form(""), statement_latex: str = Form(""), assumptions: str = Form(""),
+    conclusion: str = Form(""), interpretation: str = Form(""), keywords: str = Form(""),
     reviewer_notes: str = Form(""),
 ):
-    store.update_concept(
-        concept_id,
-        corrected_title=corrected_title.strip(),
-        statement_latex=statement_latex,
-        assumptions=assumptions,
-        conclusion=conclusion,
-        reviewer_notes=reviewer_notes,
+    fields = dict(
+        corrected_title=corrected_title.strip(), statement_latex=statement_latex,
+        assumptions=assumptions, conclusion=conclusion, interpretation=interpretation,
+        canonical_keywords=_parse_keywords(keywords), reviewer_notes=reviewer_notes,
     )
-    return _card_response(request, concept_id)
+    if type:
+        fields["type"] = type
+    fields["suggested_hub"] = suggested_hub
+    store.update_concept(concept_id, **fields)
+    if request.headers.get("HX-Request") == "true":
+        return _card_response(request, concept_id)
+    return RedirectResponse(url=f"/concepts/{concept_id}", status_code=303)
 
 
-# ── Edge accept / reject ───────────────────────────────────────────────────────
+@app.post("/concepts/{concept_id}/delete")
+def delete_concept(concept_id: str):
+    c = store.get_concept(concept_id)
+    back = f"/papers/{c.paper_id}" if (c and c.paper_id) else "/brain"
+    store.delete_concept(concept_id)
+    return RedirectResponse(url=back, status_code=303)
 
+
+@app.post("/concepts/{concept_id}/merge")
+def merge_concept(concept_id: str, into_id: str = Form(...)):
+    store.merge_concepts(concept_id, into_id)
+    return RedirectResponse(url=f"/concepts/{into_id}", status_code=303)
+
+
+# ── Edges ───────────────────────────────────────────────────────────────────────
 
 def _edge_response(request: Request, edge_id: str):
-    edge = store.get_edge(edge_id)
-    return templates.TemplateResponse(
-        "partials/_edge.html",
-        _ctx(request, ev=_edge_view(edge)),
-    )
+    return render("partials/_edge.html", _ctx(request, ev=_edge_view(store.get_edge(edge_id))))
 
 
 @app.post("/edges/{edge_id}/accept", response_class=HTMLResponse)
@@ -310,27 +394,34 @@ def reject_edge(request: Request, edge_id: str):
     return _edge_response(request, edge_id)
 
 
-# ── Second Brain ───────────────────────────────────────────────────────────────
+@app.post("/concepts/{concept_id}/edges")
+def add_edge(concept_id: str, target_id: str = Form(...), relation_type: str = Form("related"),
+             rationale: str = Form("")):
+    store.add_manual_edge(concept_id, target_id, relation_type, rationale)
+    return RedirectResponse(url=f"/concepts/{concept_id}", status_code=303)
 
+
+@app.post("/edges/{edge_id}/delete")
+def delete_edge(edge_id: str, back: str = Form("/brain")):
+    store.delete_edge(edge_id)
+    return RedirectResponse(url=back, status_code=303)
+
+
+# ── Second Brain ─────────────────────────────────────────────────────────────────
 
 @app.get("/brain", response_class=HTMLResponse)
-def brain(request: Request, q: str = ""):
-    concepts = store.list_concepts(state=ConceptState.PROMOTED.value)
-    if q:
-        ql = q.lower()
-        concepts = [
-            c for c in concepts
-            if ql in c.effective_title.lower()
-            or any(ql in k.lower() for k in c.canonical_keywords)
-        ]
+def brain(request: Request, q: str = "", type: str = "", hub: str = "", sort: str = "title"):
+    concepts = store.query_concepts(
+        states=[ConceptState.PROMOTED.value, ConceptState.HUB.value],
+        type=type or None, hub=hub or None, q=q or None, sort=sort,
+    )
     groups: dict[str, list] = {}
     for c in concepts:
         groups.setdefault(c.suggested_hub or "Uncategorized", []).append(c)
     grouped = sorted(groups.items(), key=lambda kv: kv[0].lower())
-    return templates.TemplateResponse(
-        "brain.html",
-        _ctx(request, grouped=grouped, q=q, count=len(concepts)),
-    )
+    return render("brain.html", _ctx(
+        request, grouped=grouped, q=q, count=len(concepts), sort=sort,
+        cur_type=type, cur_hub=hub, hubs=store.distinct_hubs(), types=store.distinct_types()))
 
 
 @app.get("/concepts/{concept_id}", response_class=HTMLResponse)
@@ -342,18 +433,17 @@ def concept_detail(request: Request, concept_id: str):
     outgoing = [_edge_view(e) for e in edges if e.source_concept_id == concept_id]
     incoming = [_edge_view(e) for e in edges if e.target_concept_id == concept_id]
     paper = store.get_paper(concept.paper_id) if concept.paper_id else None
-    return templates.TemplateResponse(
-        "concept_detail.html",
-        _ctx(request, concept=concept, outgoing=outgoing, incoming=incoming, paper=paper),
-    )
+    others = [c for c in store.list_concepts() if c.id != concept_id]
+    others.sort(key=lambda c: c.effective_title.lower())
+    return render("concept_detail.html", _ctx(
+        request, concept=concept, outgoing=outgoing, incoming=incoming, paper=paper, others=others))
 
 
-# ── Graph ──────────────────────────────────────────────────────────────────────
-
+# ── Graph / search ───────────────────────────────────────────────────────────────
 
 @app.get("/graph", response_class=HTMLResponse)
 def graph_page(request: Request):
-    return templates.TemplateResponse("graph.html", _ctx(request))
+    return render("graph.html", _ctx(request))
 
 
 @app.get("/api/graph.json")
@@ -361,16 +451,10 @@ def graph_json(verified_only: bool = True):
     return JSONResponse(store.graph_data(verified_only=verified_only))
 
 
-# ── Search ───────────────────────────────────────────────────────────────────
-
-
 @app.get("/search", response_class=HTMLResponse)
 def search(request: Request, q: str = ""):
-    results = store.search_concepts(q) if q.strip() else []
-    return templates.TemplateResponse(
-        "search.html",
-        _ctx(request, q=q, results=results),
-    )
+    results = store.query_concepts(q=q, sort="confidence") if q.strip() else []
+    return render("search.html", _ctx(request, q=q, results=results))
 
 
 @app.get("/health")

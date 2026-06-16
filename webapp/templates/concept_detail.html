@@ -1,37 +1,37 @@
 {% extends "base.html" %}
 {% block title %}{{ concept.effective_title }} · paper_pipeline{% endblock %}
 {% block content %}
-<div class="page-head"><a class="btn" href="/brain">← brain</a></div>
+<div class="page-head"><a class="btn sm" href="/brain">← brain</a></div>
 
 <div class="card-head">
   <span class="type-badge">{{ concept.type }}</span>
   <h1 class="card-title">{{ concept.effective_title }}</h1>
+  {% set vm = verif_meta.get(concept.verification_status) %}
+  {% if vm %}<span class="pill" style="--c:{{ vm.color }}">{{ vm.label }}</span>{% endif %}
 </div>
-{% if concept.suggested_hub %}<p class="muted">Hub: {{ concept.suggested_hub }}
-  {% if paper %}· from <a href="/papers/{{ paper.id }}">{{ paper.title }}</a>{% endif %}</p>{% endif %}
+<p class="muted">
+  {% if concept.suggested_hub %}Hub: {{ concept.suggested_hub }}{% endif %}
+  {% if paper %} · from <a href="/papers/{{ paper.id }}">{{ paper.title }}</a>{% endif %}
+  · state: {{ concept.state }}
+</p>
 
-{% if concept.statement_latex %}
-<div class="field"><div class="field-label">Statement</div>
+{% if concept.statement_latex %}<div class="field"><div class="field-label">Statement</div>
   <div class="math-block">{{ concept.statement_latex }}</div></div>{% endif %}
-{% if concept.assumptions %}
-<div class="field"><div class="field-label">Assumptions</div>
-  <div class="math-inline">{{ concept.assumptions }}</div></div>{% endif %}
-{% if concept.conclusion %}
-<div class="field"><div class="field-label">Conclusion</div>
-  <div class="math-inline">{{ concept.conclusion }}</div></div>{% endif %}
-{% if concept.interpretation %}
-<div class="field"><div class="field-label">Interpretation</div>
-  <div class="math-inline">{{ concept.interpretation }}</div></div>{% endif %}
-{% if concept.proof_idea %}
-<div class="field"><div class="field-label">Proof idea</div>
-  <div class="math-inline">{{ concept.proof_idea }}</div></div>{% endif %}
+{% if concept.assumptions %}<div class="field"><span class="field-label">Assumptions</span>
+  <span class="math-inline">{{ concept.assumptions }}</span></div>{% endif %}
+{% if concept.conclusion %}<div class="field"><span class="field-label">Conclusion</span>
+  <span class="math-inline">{{ concept.conclusion }}</span></div>{% endif %}
+{% if concept.interpretation %}<div class="field"><span class="field-label">Interpretation</span>
+  <span class="math-inline">{{ concept.interpretation }}</span></div>{% endif %}
+{% if concept.proof_idea %}<div class="field"><span class="field-label">Proof idea</span>
+  <span class="math-inline">{{ concept.proof_idea }}</span></div>{% endif %}
+{% if concept.canonical_keywords %}<div class="chips">
+  {% for k in concept.canonical_keywords %}<span class="chip">{{ k }}</span>{% endfor %}</div>{% endif %}
 
-{% if concept.canonical_keywords %}
-<div class="chips">{% for k in concept.canonical_keywords %}<span class="chip">{{ k }}</span>{% endfor %}</div>{% endif %}
-
-{% if outgoing or incoming %}
-<h2>Connections</h2>
+{# ── Connections ── #}
+<div class="section-h">Connections</div>
 <div class="edges">
+  {% set allow_delete = true %}{% set back = '/concepts/' + concept.id %}
   {% for ev in outgoing %}{% include "partials/_edge.html" %}{% endfor %}
   {% for ev in incoming %}
     <div class="edge edge-{{ ev.edge.status }}">
@@ -40,6 +40,59 @@
       <span class="muted">(this)</span>
     </div>
   {% endfor %}
+  {% if not outgoing and not incoming %}<p class="muted">No edges yet.</p>{% endif %}
 </div>
-{% endif %}
+
+{# ── Authoring ── #}
+<div class="toolbar" style="margin-top:14px">
+  <details><summary class="btn sm">✎ Edit</summary>
+    <form class="stack" method="post" action="/concepts/{{ concept.id }}" style="margin-top:8px">
+      <label class="fl">Title</label>
+      <input class="inp" name="corrected_title" value="{{ concept.corrected_title or concept.title }}">
+      <div class="row">
+        <select class="inp" name="type" style="flex:1" aria-label="type">
+          {% for t in concept_types %}<option value="{{ t }}" {% if concept.type == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+        </select>
+        <input class="inp" name="suggested_hub" style="flex:2" value="{{ concept.suggested_hub }}" placeholder="hub">
+      </div>
+      <label class="fl">Statement (LaTeX)</label>
+      <textarea class="inp mono" name="statement_latex" rows="3">{{ concept.statement_latex }}</textarea>
+      <label class="fl">Assumptions</label><textarea class="inp" name="assumptions" rows="2">{{ concept.assumptions }}</textarea>
+      <label class="fl">Conclusion</label><textarea class="inp" name="conclusion" rows="2">{{ concept.conclusion }}</textarea>
+      <label class="fl">Interpretation</label><textarea class="inp" name="interpretation" rows="2">{{ concept.interpretation }}</textarea>
+      <label class="fl">Keywords</label><input class="inp" name="keywords" value="{{ concept.canonical_keywords | join(', ') }}">
+      <div style="margin-top:6px"><button class="btn sm btn-primary" type="submit">Save</button></div>
+    </form>
+  </details>
+
+  <details><summary class="btn sm">+ Edge</summary>
+    <form class="row" method="post" action="/concepts/{{ concept.id }}/edges" style="margin-top:8px">
+      <select class="inp" name="relation_type" aria-label="relation">
+        {% for r in relation_types %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+      </select>
+      <select class="inp" name="target_id" aria-label="target concept" required>
+        <option value="">target…</option>
+        {% for o in others %}<option value="{{ o.id }}">{{ o.effective_title }}</option>{% endfor %}
+      </select>
+      <button class="btn sm" type="submit">Add</button>
+    </form>
+  </details>
+
+  <details><summary class="btn sm">⤵ Merge</summary>
+    <form class="row" method="post" action="/concepts/{{ concept.id }}/merge" style="margin-top:8px"
+          onsubmit="return confirm('Merge this concept into the selected one? This deletes this concept and repoints its edges.')">
+      <select class="inp" name="into_id" aria-label="merge into" required>
+        <option value="">merge into…</option>
+        {% for o in others %}<option value="{{ o.id }}">{{ o.effective_title }}</option>{% endfor %}
+      </select>
+      <button class="btn sm" type="submit">Merge</button>
+    </form>
+  </details>
+
+  <span class="grow"></span>
+  <form method="post" action="/concepts/{{ concept.id }}/delete"
+        onsubmit="return confirm('Delete this concept and its edges?')">
+    <button class="btn sm btn-bad" type="submit">Delete</button>
+  </form>
+</div>
 {% endblock %}

@@ -1,0 +1,16 @@
+{# Hidden filter state — included with bulk POSTs so the re-render matches the view. #}
+<input type="hidden" name="paper_id" value="{{ paper.id if paper else '' }}">
+<input type="hidden" name="type" value="{{ filters.type or '' }}">
+<input type="hidden" name="hub" value="{{ filters.hub or '' }}">
+<input type="hidden" name="verification" value="{{ filters.verification or '' }}">
+<input type="hidden" name="min_confidence" value="{{ filters.min_confidence if filters.min_confidence is not none else '' }}">
+<input type="hidden" name="q" value="{{ filters.q or '' }}">
+<input type="hidden" name="sort" value="{{ filters.sort or 'confidence' }}">
+
+{% if not cards %}
+  <div class="empty">Nothing matches. Adjust filters, or you're all caught up. ✓</div>
+{% else %}
+  <div class="review-list">
+    {% for card in cards %}{% include "partials/_concept_card.html" %}{% endfor %}
+  </div>
+{% endif %}

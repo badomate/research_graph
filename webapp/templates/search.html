@@ -2,18 +2,15 @@
 {% block title %}Search · paper_pipeline{% endblock %}
 {% block content %}
 <h1>Search</h1>
-<form class="search-bar" method="get" action="/search">
-  <input class="inp" name="q" value="{{ q }}" placeholder="Search concepts…" autofocus autocomplete="off">
+<form class="filters" method="get" action="/search">
+  <input name="q" value="{{ q }}" placeholder="Search title / keywords / statement / conclusion…"
+         autofocus autocomplete="off" style="flex:1">
+  <button class="btn sm" type="submit">Search</button>
 </form>
 {% if q %}
   <p class="muted">{{ results|length }} result(s) for "{{ q }}"</p>
-  <ul class="concept-mini-list">
-    {% for c in results %}
-    <li><a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
-      <span class="type-badge sm">{{ c.type }}</span>
-      <span class="pill sm" style="--c:{{ verif_meta.get(c.verification_status, {}).get('color', '#888') }}">{{ c.state }}</span>
-    </li>
-    {% endfor %}
-  </ul>
+  <div class="rows">
+    {% for c in results %}{% include "partials/_concept_row.html" %}{% endfor %}
+  </div>
 {% endif %}
 {% endblock %}

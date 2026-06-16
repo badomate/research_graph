@@ -145,3 +145,49 @@ def test_graph_data_verified_only(store):
 def test_normalize_title():
     assert normalize_title("Itô's Lemma") == normalize_title("Itôs Lemma")
     assert normalize_title("  Foo   Bar ") == "foo bar"
+
+
+def test_query_concepts_filters_and_sort(store):
+    p = store.create_paper(title="P")
+    store.create_concept(paper_id=p.id, title="Alpha", type="Theorem", suggested_hub="MFG",
+                         ai_confidence=0.9, canonical_keywords=["existence"])
+    store.create_concept(paper_id=p.id, title="Beta", type="Lemma", suggested_hub="Control",
+                         ai_confidence=0.4)
+    assert {c.title for c in store.query_concepts(type="Theorem")} == {"Alpha"}
+    assert {c.title for c in store.query_concepts(hub="Control")} == {"Beta"}
+    assert {c.title for c in store.query_concepts(min_confidence=0.8)} == {"Alpha"}
+    assert {c.title for c in store.query_concepts(q="existence")} == {"Alpha"}
+    by_conf = store.query_concepts(sort="confidence")
+    assert [c.title for c in by_conf] == ["Alpha", "Beta"]
+
+
+def test_bulk_verify_and_promote_paper(store):
+    p = store.create_paper(title="P")
+    a = store.create_concept(paper_id=p.id, title="A")
+    b = store.create_concept(paper_id=p.id, title="B")
+    assert store.set_verification_bulk([a.id, b.id], VerificationStatus.VERIFIED.value) == 2
+    counts = store.paper_review_counts(p.id)
+    assert counts == {"total": 2, "verified": 2, "rejected": 0, "unverified": 0}
+    res = store.promote_paper(p.id)
+    assert res["promoted"] == 2
+    assert store.get_paper(p.id).status == "s3-distilled"
+    assert {c.title for c in store.list_concepts(state=ConceptState.PROMOTED.value)} == {"A", "B"}
+
+
+def test_manual_edge_and_merge_and_delete(store):
+    p = store.create_paper(title="P")
+    a = store.create_concept(paper_id=p.id, title="A")
+    b = store.create_concept(paper_id=p.id, title="B")
+    c = store.create_concept(paper_id=p.id, title="C")
+    e = store.add_manual_edge(a.id, b.id, "depends_on")
+    assert e is not None and store.get_edge(e.id).status == "verified"
+    assert store.add_manual_edge(a.id, a.id, "related") is None  # no self-loops
+
+    # Merge B into C: the a→b edge should now point a→c.
+    assert store.merge_concepts(b.id, c.id) is True
+    assert store.get_concept(b.id) is None
+    assert store.get_edge(e.id).target_concept_id == c.id
+
+    store.delete_concept(a.id)
+    assert store.get_concept(a.id) is None
+    assert store.get_edge(e.id) is None  # edge deleted with its endpoint

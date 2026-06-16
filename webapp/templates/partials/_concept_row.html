@@ -1,0 +1,14 @@
+<div class="drow">
+  <div class="main">
+    <a class="title" href="/concepts/{{ c.id }}">{{ c.effective_title or "Untitled" }}</a>
+    {% if c.conclusion or c.statement_latex %}
+      <div class="sub">{{ c.conclusion or c.statement_latex }}</div>{% endif %}
+  </div>
+  <div class="meta">
+    {% if c.type %}<span class="type-badge">{{ c.type }}</span>{% endif %}
+    {% if c.suggested_hub %}<span class="muted nowrap">{{ c.suggested_hub }}</span>{% endif %}
+    {% set vm = verif_meta.get(c.verification_status) %}
+    {% if vm %}<span class="pill" style="--c:{{ vm.color }}">{{ vm.label }}</span>{% endif %}
+    {% if c.ai_confidence %}<span class="conf">{{ "%.0f"|format(c.ai_confidence * 100) }}%</span>{% endif %}
+  </div>
+</div>

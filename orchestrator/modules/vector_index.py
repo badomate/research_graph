@@ -263,18 +263,11 @@ class VectorIndexEngine:
         )
         self._openai_client: Any = None
         self._local_model: Any = None
-        # Notion client (lazily initialised on first rebuild() call).
+        # Vestigial: Notion-backed rebuild() is neutralized (state lives in SQLite).
+        # Kept so the no-op rebuild() guards still reference defined attributes.
         self._notion: Any = None
-        self._sb_db: str = (
-            config.notion_second_brain_db_id
-            if config is not None
-            else os.environ.get("NOTION_SECOND_BRAIN_DB_ID", "")
-        )
-        self._ki_db: str = (
-            config.notion_knowledge_inbox_db_id
-            if config is not None
-            else os.environ.get("NOTION_KNOWLEDGE_INBOX_DB_ID", "")
-        )
+        self._sb_db: str = ""
+        self._ki_db: str = ""
         _qdrant_url = config.qdrant_url if config is not None else _QDRANT_URL
 
         # ── Connect to Qdrant ─────────────────────────────────────────────────

@@ -2,19 +2,64 @@
 {% block title %}Review · paper_pipeline{% endblock %}
 {% block content %}
 <div class="page-head">
-  <div>
-    <h1>{{ review_title }}</h1>
-    <p class="muted">{{ cards|length }} concept(s) to review ·
-      <span class="kbd-hint">j/k move · v verify · x reject · e edit</span></p>
-  </div>
-  {% if paper %}<a class="btn" href="/papers/{{ paper.id }}">← paper</a>{% endif %}
+  <h1>{% if paper %}{{ paper.title }}{% else %}Review queue{% endif %}</h1>
+  {% if paper %}<a class="btn sm" href="/papers/{{ paper.id }}">← paper</a>{% endif %}
 </div>
 
-{% if not cards %}
-  <div class="empty">Nothing to review here. <a href="/">Back to papers</a>.</div>
-{% else %}
-  <div class="review-list" id="review-list">
-    {% for card in cards %}{% include "partials/_concept_card.html" %}{% endfor %}
-  </div>
-{% endif %}
+{# ── Filters ── #}
+<form class="filters js-autofilter" method="get" action="{{ base_url }}">
+  <select name="verification" aria-label="verification status filter">
+    <option value="" {% if not filters.verification %}selected{% endif %}>any status</option>
+    {% for v in ['unverified','verified','rejected'] %}
+    <option value="{{ v }}" {% if filters.verification == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+  </select>
+  <select name="type" aria-label="concept type filter">
+    <option value="">any type</option>
+    {% for t in types %}<option value="{{ t }}" {% if filters.type == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+  </select>
+  <select name="hub" aria-label="hub filter">
+    <option value="">any hub</option>
+    {% for h in hubs %}<option value="{{ h }}" {% if filters.hub == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+  </select>
+  <select name="min_confidence" aria-label="minimum confidence filter">
+    <option value="">any conf</option>
+    {% for mc in ['0.6','0.75','0.9'] %}
+    <option value="{{ mc }}" {% if filters.min_confidence and (filters.min_confidence|string) == mc %}selected{% endif %}>≥ {{ mc }}</option>{% endfor %}
+  </select>
+  <select name="sort" aria-label="sort order">
+    {% for s,lbl in [('confidence','confidence'),('title','title'),('recent','newest')] %}
+    <option value="{{ s }}" {% if filters.sort == s %}selected{% endif %}>sort: {{ lbl }}</option>{% endfor %}
+  </select>
+  <input name="q" value="{{ filters.q or '' }}" placeholder="filter text…" autocomplete="off">
+  <button class="btn sm" type="submit">Apply</button>
+</form>
+
+{# ── Bulk toolbar ── #}
+<div class="toolbar">
+  <button type="button" class="btn sm" data-pick="all">Select all</button>
+  <button type="button" class="btn sm" data-pick="high">Select ≥0.8</button>
+  <button type="button" class="btn sm btn-ghost" data-pick="none">Clear</button>
+  <span class="muted" id="pick-count">0 selected</span>
+  <span class="sep"></span>
+  <button type="button" class="btn sm btn-ok" hx-post="/concepts/bulk" hx-include="#review-list"
+          hx-vals='{"action":"verify"}' hx-target="#review-list" hx-swap="innerHTML">✓ Verify selected</button>
+  <button type="button" class="btn sm btn-bad" hx-post="/concepts/bulk" hx-include="#review-list"
+          hx-vals='{"action":"reject"}' hx-target="#review-list" hx-swap="innerHTML">✕ Reject selected</button>
+  <span class="grow"></span>
+  {% if counts %}
+    <span class="muted nowrap">{{ counts.verified }}/{{ counts.total }} verified</span>
+    <span class="progress"><i style="width: {{ (100 * counts.verified / counts.total) if counts.total else 0 }}%"></i></span>
+  {% endif %}
+  {% if paper %}
+    <form method="post" action="/papers/{{ paper.id }}/promote"
+          onsubmit="return confirm('Promote all verified concepts to the Second Brain?')">
+      <button class="btn sm btn-primary" type="submit">Promote paper →</button>
+    </form>
+  {% endif %}
+</div>
+<p class="muted"><span class="kbd-hint">j/k move · v verify · x reject · e edit · space select</span></p>
+
+<div id="review-list">
+  {% include "partials/_review_list.html" %}
+</div>
 {% endblock %}

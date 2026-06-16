@@ -1,26 +1,30 @@
 <article class="card concept-card editing" id="concept-{{ concept.id }}">
-  <form hx-post="/concepts/{{ concept.id }}" hx-target="#concept-{{ concept.id }}" hx-swap="outerHTML">
-    <label class="field-label">Title</label>
-    <input class="inp" name="corrected_title"
-           value="{{ concept.corrected_title or concept.title }}" placeholder="{{ concept.title }}">
-
-    <label class="field-label">Statement (LaTeX)</label>
-    <textarea class="inp mono" name="statement_latex" rows="4">{{ concept.statement_latex }}</textarea>
-
-    <label class="field-label">Assumptions</label>
+  <form class="body" hx-post="/concepts/{{ concept.id }}" hx-target="#concept-{{ concept.id }}" hx-swap="outerHTML">
+    <div class="row">
+      <input class="inp" name="corrected_title" style="flex:2"
+             value="{{ concept.corrected_title or concept.title }}" placeholder="{{ concept.title }}">
+      <select class="inp" name="type" style="flex:1" aria-label="type">
+        {% for t in concept_types %}<option value="{{ t }}" {% if concept.type == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+      </select>
+    </div>
+    <label class="fl">Hub</label>
+    <input class="inp" name="suggested_hub" value="{{ concept.suggested_hub }}">
+    <label class="fl">Statement (LaTeX)</label>
+    <textarea class="inp mono" name="statement_latex" rows="3">{{ concept.statement_latex }}</textarea>
+    <label class="fl">Assumptions</label>
     <textarea class="inp" name="assumptions" rows="2">{{ concept.assumptions }}</textarea>
-
-    <label class="field-label">Conclusion</label>
+    <label class="fl">Conclusion</label>
     <textarea class="inp" name="conclusion" rows="2">{{ concept.conclusion }}</textarea>
-
-    <label class="field-label">Reviewer notes</label>
+    <label class="fl">Interpretation</label>
+    <textarea class="inp" name="interpretation" rows="2">{{ concept.interpretation }}</textarea>
+    <label class="fl">Keywords (comma-separated)</label>
+    <input class="inp" name="keywords" value="{{ concept.canonical_keywords | join(', ') }}">
+    <label class="fl">Reviewer notes</label>
     <textarea class="inp" name="reviewer_notes" rows="2">{{ concept.reviewer_notes }}</textarea>
-
     <div class="card-actions">
-      <button class="btn btn-primary" type="submit">Save</button>
-      <button class="btn" type="button"
-              hx-get="/concepts/{{ concept.id }}/card" hx-target="#concept-{{ concept.id }}"
-              hx-swap="outerHTML">Cancel</button>
+      <button class="btn sm btn-primary" type="submit">Save</button>
+      <button class="btn sm" type="button" hx-get="/concepts/{{ concept.id }}/card"
+              hx-target="#concept-{{ concept.id }}" hx-swap="outerHTML">Cancel</button>
     </div>
   </form>
 </article>

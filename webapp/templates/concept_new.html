@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}New concept · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><a class="btn sm" href="/papers/{{ paper.id }}">← {{ paper.title }}</a></div>
+<h1>Add a concept</h1>
+<p class="muted">Hand-authored concepts are marked verified automatically.</p>
+
+<form class="stack" method="post" action="/papers/{{ paper.id }}/concepts">
+  <label class="fl">Title</label>
+  <input class="inp" name="title" required autofocus>
+  <label class="fl">Type</label>
+  <select class="inp" name="type" aria-label="type">
+    {% for t in concept_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+  </select>
+  <label class="fl">Statement (LaTeX)</label>
+  <textarea class="inp mono" name="statement_latex" rows="3"></textarea>
+  <label class="fl">Assumptions</label>
+  <textarea class="inp" name="assumptions" rows="2"></textarea>
+  <label class="fl">Conclusion</label>
+  <textarea class="inp" name="conclusion" rows="2"></textarea>
+  <label class="fl">Hub</label>
+  <input class="inp" name="suggested_hub" placeholder="e.g. Mean Field Games">
+  <label class="fl">Keywords (comma-separated)</label>
+  <input class="inp" name="keywords">
+  <div style="margin-top:8px"><button class="btn btn-primary" type="submit">Create concept</button></div>
+</form>
+{% endblock %}

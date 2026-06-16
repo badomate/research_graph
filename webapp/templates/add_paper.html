@@ -17,7 +17,10 @@
   <input class="inp" name="title" placeholder="Leave blank to derive from arXiv/PDF">
 
   <label class="field-label">…or upload a PDF</label>
-  <input class="inp" type="file" name="pdf" accept="application/pdf">
+  <input class="inp" type="file" name="pdf" accept="application/pdf" aria-label="upload PDF">
+
+  <label class="field-label">Zotero URI <span class="muted">(optional — to pull the PDF from Zotero/Koofr)</span></label>
+  <input class="inp" name="zotero_uri" placeholder="https://www.zotero.org/users/…/items/XXXXXXXX">
 
   <div><button class="btn btn-primary" type="submit">Add paper</button></div>
 </form>

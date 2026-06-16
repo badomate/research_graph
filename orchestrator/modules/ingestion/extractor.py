@@ -375,7 +375,7 @@ class ExtractionService:
                 concept.confidence = min(concept.confidence, 0.5)
         return result
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=60))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=1000, max=6000))
     def _call_claude_extract(self, markdown: str, hubs: dict[str, str]) -> ExtractionResult:
         hub_names_str = (
             ", ".join(f'"{name}"' for name in hubs) if hubs else '"Uncategorized"'
