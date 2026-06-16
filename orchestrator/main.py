@@ -42,6 +42,18 @@ def run_arxiv_sniper(config: Config) -> None:
     ArXivSniper(config=config).run()
 
 
+def run_job_workers(config: Config) -> None:
+    """Drain pending selective-parse and analysis jobs (Phase-1 workers)."""
+    from modules.analysis.analysis_worker import AnalysisWorker
+    from modules.parsing.parse_worker import ParseWorker
+
+    store = Store(make_engine(config.database_url))
+    n_parse = ParseWorker(store, config=config).run_pending(limit=5)
+    n_analysis = AnalysisWorker(store, config=config).run_pending(limit=5)
+    if n_parse or n_analysis:
+        logger.info("Job workers: ran %d parse + %d analysis job(s).", n_parse, n_analysis)
+
+
 def run_zotero_intake(config: Config) -> None:
     ZoteroIntake(config=config).run()
 
@@ -93,6 +105,12 @@ def main() -> None:
         trigger=CronTrigger(hour=6, minute=0),
         id="arxiv_sniper", name="ArXiv Sniper",
         max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_job_workers(config),
+        trigger=IntervalTrigger(minutes=1),
+        id="job_workers", name="Parse + Analysis Job Workers",
+        max_instances=1, coalesce=True, misfire_grace_time=30,
     )
     if config.zotero_poll_enabled:
         scheduler.add_job(

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}AI suggestions · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>AI suggestions {% if paper %}<span class="muted">· {{ paper.title }}</span>{% endif %}</h1>
+</div>
+<p class="muted">Everything Claude produces is quarantined here. Nothing reaches the
+accepted research DB until you <strong>Accept</strong>. Every item is
+<strong>regeneratable</strong> and keeps full version lineage.</p>
+
+<form class="filters" action="/suggestions" method="get">
+  {% if paper %}<input type="hidden" name="paper_id" value="{{ paper.id }}">{% endif %}
+  <select name="status" onchange="this.form.submit()">
+    {% for s in ['pending','edited','accepted','rejected','superseded',''] %}
+      <option value="{{ s }}" {% if cur_status==s %}selected{% endif %}>{{ s or 'all statuses' }}</option>
+    {% endfor %}
+  </select>
+  <select name="type" onchange="this.form.submit()">
+    <option value="">all types</option>
+    {% for t in suggestion_types %}<option value="{{ t }}" {% if cur_type==t %}selected{% endif %}>{{ t.replace('_',' ') }}</option>{% endfor %}
+  </select>
+</form>
+
+{% for card in cards %}
+  {% include "partials/_suggestion.html" %}
+{% else %}
+  <p class="muted">No suggestions match. Queue an analysis from a paper's
+    <em>Selective parse</em> page to generate some.</p>
+{% endfor %}
+{% endblock %}

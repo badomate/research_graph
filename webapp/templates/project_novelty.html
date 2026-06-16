@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · Novelty{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ project.name }} — novelty dashboard</h1>
+  <div class="head-links"><a href="/projects/{{ project.id }}">← back to project</a></div>
+</div>
+<p class="muted">Aggregated, human-reviewed signals. Roles come from accepted paper↔project
+links; relevant theorems from accepted math-object links.</p>
+
+<div class="grid">
+  {% set sections = [
+    ('core', 'Supports / core'),
+    ('direct_competitor', 'Direct competitors (weaken novelty)'),
+    ('baseline', 'Baseline candidates'),
+    ('theory_tool', 'Theory tools'),
+    ('background', 'Background'),
+    ('citation_only', 'Citation-only'),
+    ('maybe_relevant', 'Maybe relevant')
+  ] %}
+  {% for key, label in sections %}
+  <div class="card">
+    <div class="card-title">{{ label }}</div>
+    <ul class="list">
+      {% for p in buckets.get(key, []) %}
+        <li><a href="/papers/{{ p.id }}">{{ p.title }}</a></li>
+      {% else %}<li class="muted">—</li>{% endfor %}
+    </ul>
+  </div>
+  {% endfor %}
+  <div class="card">
+    <div class="card-title">Relevant theorems / math objects</div>
+    <ul class="list">
+      {% for mo, relevance in math_objs %}
+        <li><a href="/papers/{{ mo.paper_id }}">{{ mo.title or mo.type }}</a>
+          <span class="pill">{{ relevance.replace('_',' ') }}</span></li>
+      {% else %}<li class="muted">—</li>{% endfor %}
+    </ul>
+  </div>
+</div>
+{% endblock %}

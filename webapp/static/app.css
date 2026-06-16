@@ -167,3 +167,39 @@ label.fl { display: block; font-size: .68rem; text-transform: uppercase; letter-
   .drow .sub { white-space: normal; }
   .card-actions .btn { flex: 1; justify-content: center; }
 }
+
+/* ── Phase 1: organization, search, scopes, suggestions ── */
+.page-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.head-links { font-size:.85rem; }
+.card { border:1px solid var(--border); background:var(--surface); border-radius:8px;
+  padding:12px 14px; margin:10px 0; }
+.card-title { font-weight:600; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
+.project-card { display:block; color:inherit; text-decoration:none; }
+.project-card:hover { border-color:var(--ok); }
+.muted { color:var(--muted, #8a8f98); font-size:.85rem; }
+.meta-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px; }
+.pill { font-size:.72rem; padding:2px 8px; border-radius:10px; border:1px solid var(--border);
+  background:var(--surface); color:var(--text); display:inline-flex; align-items:center; gap:4px; }
+.org-pill a { color:inherit; }
+.form-inline { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; align-items:end; }
+.form-grid label, .form-grid input, .form-grid select { display:block; width:100%; }
+.list { list-style:none; padding:0; } .list li { padding:4px 0; border-bottom:1px solid var(--border); }
+.inline { display:inline; } .btn-link { background:none; border:none; color:var(--bad); cursor:pointer; font-size:.78rem; }
+.role-head { text-transform:capitalize; margin:14px 0 4px; font-size:.95rem; }
+.tree, .tree ul { list-style:none; padding-left:14px; } .tree li { padding:2px 0; }
+.result .why { font-size:.85rem; margin:4px 0; }
+.estimate { margin:8px 0; font-size:.9rem; }
+.data { width:100%; border-collapse:collapse; font-size:.82rem; margin:6px 0 16px; }
+.data th, .data td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); }
+.status-succeeded { color:var(--ok); } .status-failed { color:var(--bad); }
+.status-running { color:var(--warn,#d6b34a); } .status-pending { color:var(--muted,#8a8f98); }
+.suggestion .payload pre.latex { white-space:pre-wrap; background:var(--bg,#1112); padding:6px; border-radius:5px; }
+.suggestion .json { font-size:.72rem; max-height:240px; overflow:auto; }
+.suggestion .actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+.suggestion .regen input { min-width:220px; }
+.status-card-accepted { border-left:3px solid var(--ok); }
+.status-card-rejected { opacity:.5; }
+.status-card-superseded { opacity:.45; }
+.versions li.current { font-weight:600; }

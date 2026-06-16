@@ -16,12 +16,56 @@
 {% if paper.one_liner %}<p class="lead">{{ paper.one_liner }}</p>{% endif %}
 {% if paper.extraction_error %}<div class="callout bad">{{ paper.extraction_error }}</div>{% endif %}
 
+{# ── Organization: projects / collections / tags ── #}
+<div class="org">
+  <div class="org-chips">
+    {% for proj, role in orgs.projects %}
+      <span class="pill org-pill">📁 <a href="/projects/{{ proj.id }}">{{ proj.name }}</a> · {{ role.replace('_',' ') }}
+        <form class="inline" method="post" action="/papers/{{ paper.id }}/organize/remove">
+          <input type="hidden" name="kind" value="project"><input type="hidden" name="target_id" value="{{ proj.id }}">
+          <button class="btn btn-link" title="remove">×</button></form></span>
+    {% endfor %}
+    {% for col, role in orgs.collections %}
+      <span class="pill org-pill">🗂 {{ col.name }} · {{ role.replace('_',' ') }}
+        <form class="inline" method="post" action="/papers/{{ paper.id }}/organize/remove">
+          <input type="hidden" name="kind" value="collection"><input type="hidden" name="target_id" value="{{ col.id }}">
+          <button class="btn btn-link" title="remove">×</button></form></span>
+    {% endfor %}
+    {% for tag in orgs.tags %}
+      <span class="pill org-pill" style="background:{{ tag.color or '#888' }}">{{ tag.name }}
+        <form class="inline" method="post" action="/papers/{{ paper.id }}/organize/remove">
+          <input type="hidden" name="kind" value="tag"><input type="hidden" name="target_id" value="{{ tag.id }}">
+          <button class="btn btn-link" title="remove">×</button></form></span>
+    {% endfor %}
+  </div>
+  <details><summary class="btn sm">Organize…</summary>
+    <form class="row" method="post" action="/papers/{{ paper.id }}/organize" style="margin-top:6px;flex-wrap:wrap;gap:6px">
+      <select name="kind" aria-label="kind">
+        <option value="project">Project</option><option value="collection">Collection</option><option value="tag">Tag</option>
+      </select>
+      <select name="target_id" aria-label="existing">
+        <option value="">— new (type name) —</option>
+        <optgroup label="Projects">{% for p in all_projects %}<option value="{{ p.id }}">📁 {{ p.name }}</option>{% endfor %}</optgroup>
+        <optgroup label="Collections">{% for c in all_collections %}<option value="{{ c.id }}">🗂 {{ c.name }}</option>{% endfor %}</optgroup>
+        <optgroup label="Tags">{% for t in all_tags %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}</optgroup>
+      </select>
+      <input name="new_name" placeholder="or new name">
+      <select name="role" aria-label="role">
+        {% for r in paper_roles %}<option value="{{ r }}">{{ r.replace('_',' ') }}</option>{% endfor %}
+      </select>
+      <button class="btn sm btn-primary" type="submit">Add</button>
+    </form>
+  </details>
+</div>
+
 {# ── Action bar ── #}
 <div class="toolbar">
   {% if concepts %}<a class="btn sm btn-primary" href="/papers/{{ paper.id }}/review">Review ({{ concepts|length }})</a>{% endif %}
   {% if paper.pdf_path or paper.arxiv_id or paper.arxiv_url or paper.doi %}
     <a class="btn sm" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noopener">View PDF</a>{% endif %}
   <a class="btn sm" href="/papers/{{ paper.id }}/concepts/new">+ Concept</a>
+  <a class="btn sm" href="/papers/{{ paper.id }}/scope">Selective parse / analyze</a>
+  <a class="btn sm" href="/suggestions?paper_id={{ paper.id }}">Suggestions{% if suggestion_count %} ({{ suggestion_count }}){% endif %}</a>
   {% if counts and counts.verified %}
     <form method="post" action="/papers/{{ paper.id }}/promote"
           onsubmit="return confirm('Promote {{ counts.verified }} verified concept(s)?')">

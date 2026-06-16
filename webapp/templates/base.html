@@ -18,6 +18,10 @@
       <a href="/review" {% if request.url.path == '/review' %}class="active"{% endif %}>
         Review{% if pending_review %}<span class="count">{{ pending_review }}</span>{% endif %}
       </a>
+      <a href="/suggestions" {% if request.url.path == '/suggestions' %}class="active"{% endif %}>
+        Suggestions{% if pending_suggestions %}<span class="count">{{ pending_suggestions }}</span>{% endif %}
+      </a>
+      <a href="/projects" {% if request.url.path.startswith('/projects') %}class="active"{% endif %}>Projects</a>
       <a href="/brain" {% if request.url.path == '/brain' %}class="active"{% endif %}>Brain</a>
       <a href="/graph" {% if request.url.path == '/graph' %}class="active"{% endif %}>Graph</a>
     </nav>

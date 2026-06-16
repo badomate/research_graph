@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Find · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Find papers</h1></div>
+<form class="card form-inline" action="/find" method="get" role="search">
+  <input name="q" value="{{ q }}" placeholder="Search title, authors, abstract, notes, parsed text…"
+         autocomplete="off" autofocus style="flex:1">
+  <button class="btn btn-primary" type="submit">Search</button>
+</form>
+
+{% if q %}
+<p class="muted">{{ results|length }} result(s) for “{{ q }}”.</p>
+{% for r in results %}
+<div class="card result">
+  <div class="card-title"><a href="/papers/{{ r.paper.id }}">{{ r.paper.title }}</a></div>
+  <div class="muted">{{ r.paper.authors }}</div>
+  <div class="why">matched <strong>{{ r.matched_field }}</strong>: <em>{{ r.snippet }}</em></div>
+  <div class="meta-row">
+    <span class="pill">{{ "parsed" if r.parsed else "not parsed" }}</span>
+    <a class="btn btn-link" href="/papers/{{ r.paper.id }}">open</a>
+    <a class="btn btn-link" href="/papers/{{ r.paper.id }}/scope">parse pages</a>
+    <a class="btn btn-link" href="/papers/{{ r.paper.id }}/scope">run analysis</a>
+  </div>
+</div>
+{% else %}
+<p class="muted">No matches. Try fewer / different terms.</p>
+{% endfor %}
+{% else %}
+<p class="muted">Type a query to search local papers and parsed content. External search
+(arXiv / Semantic Scholar / Crossref) is Phase 2.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Collections · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Collections</h1>
+  <div class="head-links"><a href="/projects">Projects</a> · <a href="/tags">Tags</a></div>
+</div>
+
+<form class="card form-inline" action="/collections" method="post">
+  <input name="name" placeholder="New collection name" required>
+  <select name="parent_id">
+    <option value="">(top level)</option>
+    {% for c in flat %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+  </select>
+  <input name="description" placeholder="description">
+  <button class="btn btn-primary" type="submit">Create</button>
+</form>
+
+{% macro node(item) %}
+  <li>
+    <span>{{ item.collection.name }}</span>
+    <form class="inline" action="/collections/{{ item.collection.id }}/delete" method="post">
+      <button class="btn btn-link" type="submit">delete</button>
+    </form>
+    {% if item.children %}<ul>{% for ch in item.children %}{{ node(ch) }}{% endfor %}</ul>{% endif %}
+  </li>
+{% endmacro %}
+
+<ul class="tree">
+  {% for item in tree %}{{ node(item) }}{% else %}<p class="muted">No collections yet.</p>{% endfor %}
+</ul>
+{% endblock %}

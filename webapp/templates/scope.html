@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Parse scope · {{ paper.title }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Selective parse — {{ paper.title }}</h1>
+  <div class="head-links"><a href="/papers/{{ paper.id }}">← paper</a> ·
+    <a href="/papers/{{ paper.id }}/pdf" target="_blank">open PDF</a></div>
+</div>
+<p class="muted">Choose exactly which pages Marker extracts. Skip long proof appendices.
+Region selection (drawing boxes) is Phase 2; page ranges are live now.</p>
+
+<form class="card" action="/papers/{{ paper.id }}/scopes" method="post">
+  <div class="form-grid">
+    <label>Scope name <input name="name" value="intro+results"></label>
+    <label>Purpose
+      <select name="purpose">
+        {% for p in scope_purposes %}<option value="{{ p }}">{{ p.replace('_',' ') }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Kind
+      <select name="kind" id="kind">
+        <option value="page_range">page range</option>
+        <option value="full">full paper</option>
+      </select>
+    </label>
+    <label>Pages <input name="pages" id="pages" placeholder="1-8, 35-40" oninput="recalc()"></label>
+  </div>
+  <div class="estimate" id="estimate">
+    selected pages: <strong id="selCount">0</strong> ·
+    Marker est: <strong id="markerCost">$0.00</strong>
+    <span class="muted">(@ ${{ '%.3f'|format(marker_price) }}/page)</span>
+  </div>
+  <button class="btn btn-primary" type="submit">Create scope &amp; queue parse</button>
+</form>
+
+<h2>Run Claude analysis</h2>
+<p class="muted">Analysis runs on parsed chunks only (never the raw PDF). Output lands in
+the <a href="/suggestions?paper_id={{ paper.id }}">suggestion review queue</a>, never the accepted DB.</p>
+<form class="card form-inline" action="/papers/{{ paper.id }}/analyze" method="post">
+  <select name="analysis_type">
+    {% for a in analysis_types %}<option value="{{ a }}">{{ a.replace('_',' ') }}</option>{% endfor %}
+  </select>
+  <input name="instruction" placeholder="optional instruction (e.g. ignore proofs)">
+  <button class="btn btn-primary" type="submit">Queue analysis</button>
+</form>
+
+<h2>Parse jobs</h2>
+<table class="data">
+  <tr><th>status</th><th>pages</th><th>cost est</th><th>cost actual</th><th>error</th><th>when</th></tr>
+  {% for j in parse_jobs %}
+  <tr>
+    <td><span class="status-{{ j.status }}">{{ j.status }}</span></td>
+    <td>{{ j.selected_pages }}</td>
+    <td>${{ '%.3f'|format(j.cost_estimate or 0) }}</td>
+    <td>{{ '$%.3f'|format(j.cost_actual) if j.cost_actual is not none else '—' }}</td>
+    <td class="muted">{{ j.error[:60] }}</td>
+    <td class="muted">{{ j.created_at.strftime('%m-%d %H:%M') }}</td>
+  </tr>
+  {% else %}<tr><td colspan="6" class="muted">No parse jobs yet.</td></tr>{% endfor %}
+</table>
+
+<h2>Analysis jobs</h2>
+<table class="data">
+  <tr><th>type</th><th>status</th><th>in tok</th><th>out tok</th><th>cost</th><th>when</th></tr>
+  {% for j in analysis_jobs %}
+  <tr>
+    <td>{{ j.analysis_type.replace('_',' ') }}{% if j.parent_generation_id %} <span class="pill">regen</span>{% endif %}</td>
+    <td><span class="status-{{ j.status }}">{{ j.status }}</span></td>
+    <td>{{ j.input_tokens_actual or j.input_token_estimate }}</td>
+    <td>{{ j.output_tokens_actual or j.output_token_estimate }}</td>
+    <td>{{ '$%.3f'|format(j.cost_actual) if j.cost_actual is not none else '~$%.3f'|format(j.cost_estimate or 0) }}</td>
+    <td class="muted">{{ j.created_at.strftime('%m-%d %H:%M') }}</td>
+  </tr>
+  {% else %}<tr><td colspan="6" class="muted">No analysis jobs yet.</td></tr>{% endfor %}
+</table>
+
+<script>
+function parsePages(raw){
+  let n = 0;
+  (raw||"").replace(/\s/g,"").split(",").forEach(function(part){
+    if(!part) return;
+    if(part.indexOf("-")>=0){ let [a,b]=part.split("-").map(Number);
+      if(!isNaN(a)&&!isNaN(b)){ if(a>b)[a,b]=[b,a]; n += (b-a+1); } }
+    else if(!isNaN(Number(part))) n += 1;
+  });
+  return n;
+}
+async function recalc(){
+  const n = parsePages(document.getElementById("pages").value);
+  document.getElementById("selCount").textContent = n;
+  try{
+    const r = await fetch(`/api/cost/estimate?pages=${n}&analysis_type=triage_summary`);
+    const d = await r.json();
+    document.getElementById("markerCost").textContent = "$"+d.marker_cost.toFixed(3);
+  }catch(e){}
+}
+</script>
+{% endblock %}

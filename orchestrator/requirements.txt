@@ -3,6 +3,8 @@ APScheduler==3.10.4
 
 # ── Database (SQLite source of truth; replaces Notion) ─────────────────────────
 sqlmodel>=0.0.22,<0.1
+# Schema migrations (additive history; see orchestrator/alembic/).
+alembic>=1.13,<2
 
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 # Kept for embeddings only (vector_index.py). Generation calls migrated to Claude.
@@ -20,6 +22,9 @@ webdavclient3==3.14.6
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 requests>=2.32.3,<3
 urllib3==2.6.3
+
+# ── PDF subsetting (selective page parsing) ──────────────────────────────────
+pypdf>=4.2,<6
 
 # ── ArXiv ────────────────────────────────────────────────────────────────────
 feedparser==6.0.11

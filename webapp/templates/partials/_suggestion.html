@@ -1,0 +1,61 @@
+{% set sug = card.sug %}
+<div class="card suggestion status-card-{{ sug.status }}" id="sug-{{ sug.id }}">
+  <div class="meta-row">
+    <span class="pill">{{ sug.suggestion_type.replace('_',' ') }}</span>
+    <span class="pill">{{ sug.status }}</span>
+    {% if card.versions|length > 1 %}<span class="pill">v{{ card.versions|length }}</span>{% endif %}
+    <span class="muted">{{ sug.model }} · {{ sug.prompt_version }}</span>
+  </div>
+
+  {% set pl = sug.payload_json %}
+  <div class="payload">
+    {% if pl.title %}<div class="card-title">{{ pl.title }}</div>{% endif %}
+    {% if pl.text %}<p>{{ pl.text }}</p>{% endif %}
+    {% if pl.statement_latex %}<pre class="latex">{{ pl.statement_latex }}</pre>{% endif %}
+    {% if pl.assessment %}<p>{{ pl.assessment }}</p>{% endif %}
+    {% if pl.role %}<p><strong>role:</strong> {{ pl.role }} — {{ pl.rationale }}</p>{% endif %}
+    {% if pl.risk_level %}<p><strong>risk:</strong> {{ pl.risk_level }}</p>{% endif %}
+    <details><summary class="muted">raw payload + provenance</summary>
+      <pre class="json">{{ pl | tojson(indent=2) }}</pre>
+      <div class="muted">input_hash {{ sug.input_hash[:12] }} · output_hash {{ sug.output_hash[:12] }}
+        {% if sug.parent_generation_id %}· regen of {{ sug.parent_generation_id[:8] }}{% endif %}
+        {% if sug.promoted_ref_table %}· promoted → {{ sug.promoted_ref_table }}{% endif %}</div>
+    </details>
+  </div>
+
+  {% if sug.status in ['pending', 'edited'] %}
+  <div class="actions">
+    <form hx-post="/suggestions/{{ sug.id }}/accept" hx-target="#sug-{{ sug.id }}" hx-swap="outerHTML" class="inline">
+      <button class="btn btn-primary" type="submit">Accept</button>
+    </form>
+    <form hx-post="/suggestions/{{ sug.id }}/reject" hx-target="#sug-{{ sug.id }}" hx-swap="outerHTML" class="inline">
+      <button class="btn" type="submit">Reject</button>
+    </form>
+    <form hx-post="/suggestions/{{ sug.id }}/regenerate" hx-target="#sug-{{ sug.id }}" hx-swap="outerHTML" class="inline regen">
+      <input name="instruction" placeholder="regenerate instruction (optional)">
+      <button class="btn" type="submit">Regenerate</button>
+    </form>
+  </div>
+  {% elif sug.status == 'rejected' %}
+  <div class="actions">
+    <form hx-post="/suggestions/{{ sug.id }}/regenerate" hx-target="#sug-{{ sug.id }}" hx-swap="outerHTML" class="inline regen">
+      <input name="instruction" placeholder="regenerate instruction (optional)">
+      <button class="btn" type="submit">Regenerate</button>
+    </form>
+  </div>
+  {% endif %}
+
+  {% if card.versions|length > 1 %}
+  <details class="versions"><summary class="muted">version history ({{ card.versions|length }})</summary>
+    <ol>
+      {% for v in card.versions %}
+      <li class="{{ 'current' if v.id == sug.id else '' }}">
+        <span class="pill">{{ v.status }}</span>
+        {{ (v.payload_json.text or v.payload_json.title or v.payload_json.assessment or '…')[:90] }}
+        {% if v.regeneration_reason %}<span class="muted">— “{{ v.regeneration_reason }}”</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </details>
+  {% endif %}
+</div>

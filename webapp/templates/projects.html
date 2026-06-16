@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Projects · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Projects</h1>
+  <div class="head-links"><a href="/collections">Collections</a> · <a href="/tags">Tags</a></div>
+</div>
+
+<form class="card form-inline" action="/projects" method="post">
+  <input name="name" placeholder="New project name (e.g. MFG-UQ)" required>
+  <input name="description" placeholder="Short description">
+  <input name="priority" type="number" value="0" title="priority" style="width:5rem">
+  <button class="btn btn-primary" type="submit">Create</button>
+</form>
+
+<div class="grid">
+  {% for row in rows %}
+  <a class="card project-card" href="/projects/{{ row.project.id }}">
+    <div class="card-title">{{ row.project.name }}</div>
+    <div class="muted">{{ row.project.description or "—" }}</div>
+    <div class="meta-row">
+      <span class="pill">{{ row.paper_count }} paper(s)</span>
+      <span class="pill">priority {{ row.project.priority }}</span>
+      <span class="pill">{{ row.project.status }}</span>
+    </div>
+  </a>
+  {% else %}
+  <p class="muted">No projects yet. Create one above — e.g. your MFG-UQ or SGD-UQ project.</p>
+  {% endfor %}
+</div>
+{% endblock %}

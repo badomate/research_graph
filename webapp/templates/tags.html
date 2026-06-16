@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Tags · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Tags</h1>
+  <div class="head-links"><a href="/projects">Projects</a> · <a href="/collections">Collections</a></div>
+</div>
+
+<form class="card form-inline" action="/tags" method="post">
+  <input name="name" placeholder="New tag" required>
+  <input name="color" type="color" value="#4a8fbf" title="color">
+  <button class="btn btn-primary" type="submit">Create</button>
+</form>
+
+<ul class="list">
+  {% for row in rows %}
+  <li>
+    <span class="pill" style="background:{{ row.tag.color or '#888' }}">{{ row.tag.name }}</span>
+    <span class="muted">{{ row.count }} paper(s)</span>
+    <form class="inline" action="/tags/{{ row.tag.id }}/delete" method="post">
+      <button class="btn btn-link" type="submit">delete</button>
+    </form>
+  </li>
+  {% else %}<p class="muted">No tags yet.</p>{% endfor %}
+</ul>
+{% endblock %}

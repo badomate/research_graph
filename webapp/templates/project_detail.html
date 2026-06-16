@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · Projects{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ project.name }}</h1>
+  <div class="head-links">
+    <a href="/projects/{{ project.id }}/novelty">Novelty dashboard →</a>
+  </div>
+</div>
+<p class="muted">{{ project.description }}</p>
+
+<details class="card">
+  <summary>Edit project</summary>
+  <form class="form-grid" action="/projects/{{ project.id }}/update" method="post">
+    <label>Name <input name="name" value="{{ project.name }}" required></label>
+    <label>Description <input name="description" value="{{ project.description }}"></label>
+    <label>Priority <input name="priority" type="number" value="{{ project.priority }}"></label>
+    <label>Status
+      <select name="status">
+        <option value="active" {% if project.status=='active' %}selected{% endif %}>active</option>
+        <option value="archived" {% if project.status=='archived' %}selected{% endif %}>archived</option>
+      </select>
+    </label>
+    <button class="btn btn-primary" type="submit">Save</button>
+  </form>
+</details>
+
+<h2>Papers <span class="muted">({{ total }})</span></h2>
+{% for role, papers in grouped %}
+  <h3 class="role-head">{{ role.replace('_',' ') }}</h3>
+  <ul class="list">
+    {% for p in papers %}
+    <li>
+      <a href="/papers/{{ p.id }}">{{ p.title }}</a>
+      <span class="muted">{{ p.authors }}</span>
+      <form class="inline" action="/projects/{{ project.id }}/papers/{{ p.id }}/remove" method="post">
+        <button class="btn btn-link" type="submit">remove</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="muted">No papers assigned yet.</p>
+{% endfor %}
+
+<details class="card">
+  <summary>Add a paper to this project</summary>
+  <form class="form-inline" action="/projects/{{ project.id }}/papers" method="post">
+    <select name="paper_id" required>
+      <option value="" disabled selected>Pick a paper…</option>
+      {% for p in candidates %}<option value="{{ p.id }}">{{ p.title[:80] }}</option>{% endfor %}
+    </select>
+    <select name="role">
+      {% for r in paper_roles %}<option value="{{ r }}">{{ r.replace('_',' ') }}</option>{% endfor %}
+    </select>
+    <input name="note" placeholder="note (optional)">
+    <button class="btn btn-primary" type="submit">Add</button>
+  </form>
+</details>
+{% endblock %}

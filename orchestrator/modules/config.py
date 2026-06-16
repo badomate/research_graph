@@ -68,6 +68,15 @@ class Config(BaseSettings):
     zotero_poll_enabled: bool = False
     zotero_poll_minutes: int = 60
 
+    # ── Cost estimation (rates are user-configurable; set to current vendor pricing) ──
+    # Marker/Datalab is billed per page; Claude per million tokens. These drive the
+    # pre-flight estimates shown before a parse/analysis runs (see modules/cost.py).
+    marker_price_per_page: float = 0.01
+    # Defaults reflect Claude Sonnet list pricing ($/million tokens). Override per
+    # model via CLAUDE_INPUT_PRICE_PER_MTOK / CLAUDE_OUTPUT_PRICE_PER_MTOK.
+    claude_input_price_per_mtok: float = 3.0
+    claude_output_price_per_mtok: float = 15.0
+
     # ── Pipeline I/O ──────────────────────────────────────────────────────────
     marker_api_url: str = "http://marker-api:8080"
     pipeline_tmp_dir: str = "/tmp/pipeline"

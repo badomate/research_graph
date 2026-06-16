@@ -25,6 +25,7 @@ from .models import (
     Project,
     VerificationStatus,
 )
+from .research_repo import ResearchStoreMixin
 
 
 def _now() -> datetime:
@@ -39,7 +40,7 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-class Store:
+class Store(ResearchStoreMixin):
     """Repository over the SQLite database."""
 
     def __init__(self, engine: Engine | None = None) -> None:
