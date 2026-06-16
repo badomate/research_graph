@@ -3,7 +3,8 @@
   <div class="meta-row">
     <span class="pill">{{ sug.suggestion_type.replace('_',' ') }}</span>
     <span class="pill">{{ sug.status }}</span>
-    {% if card.versions|length > 1 %}<span class="pill">v{{ card.versions|length }}</span>{% endif %}
+    {% if card.versions|length > 1 %}<span class="pill">v{{ card.versions|length }}</span>
+      <a class="btn btn-link" href="/suggestions/{{ sug.id }}/compare">compare versions</a>{% endif %}
     <span class="muted">{{ sug.model }} · {{ sug.prompt_version }}</span>
   </div>
 

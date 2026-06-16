@@ -52,12 +52,58 @@ def get_engine() -> Engine:
     return _engine
 
 
+# Additive columns that ``create_all`` cannot add to a pre-existing table.
+# (New *tables* are handled by create_all; only altered tables need this.)
+# Each entry: table → [(column, sqlite_type, default_sql_or_None)].
+_ADDITIVE_COLUMNS: dict[str, list[tuple[str, str, str | None]]] = {
+    "projects": [
+        ("status", "VARCHAR", "'active'"),
+        ("priority", "INTEGER", "0"),
+        ("updated_at", "DATETIME", None),
+    ],
+}
+
+
+def _ensure_additive_columns(engine: Engine) -> None:
+    """Idempotently add new columns to pre-existing tables (lightweight migration).
+
+    ``SQLModel.metadata.create_all`` is additive only at table granularity, so an
+    older database that already has e.g. ``projects`` won't get columns added in a
+    later release. This adds them via ``ALTER TABLE … ADD COLUMN`` if missing —
+    safe to run on every startup, and tolerant of the two-process startup race
+    (duplicate-column errors are ignored).
+    """
+    from sqlalchemy import inspect, text
+    from sqlalchemy.exc import OperationalError
+
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    for table, cols in _ADDITIVE_COLUMNS.items():
+        if table not in tables:
+            continue
+        present = {c["name"] for c in insp.get_columns(table)}
+        for name, sqltype, default in cols:
+            if name in present:
+                continue
+            ddl = f"ALTER TABLE {table} ADD COLUMN {name} {sqltype}"
+            if default is not None:
+                ddl += f" DEFAULT {default}"
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))
+            except OperationalError:
+                # Another process added it first (race), or it now exists — fine.
+                pass
+
+
 def init_db(engine: Engine | None = None) -> None:
     """Create all tables if they do not exist (safe to call on every startup)."""
     # Import models so they register on SQLModel.metadata before create_all.
     from . import models  # noqa: F401
 
-    SQLModel.metadata.create_all(engine or get_engine())
+    engine = engine or get_engine()
+    SQLModel.metadata.create_all(engine)
+    _ensure_additive_columns(engine)
 
 
 def new_session(engine: Engine | None = None) -> Session:

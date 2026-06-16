@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · Graph{% endblock %}
+{% block main_class %}graph-main{% endblock %}
+{% block content %}
+<div class="graph-toolbar">
+  <strong>{{ project.name }} — knowledge graph</strong>
+  <span class="muted">project · papers · math objects · concepts</span>
+  <a class="muted" href="/projects/{{ project.id }}/novelty">← novelty dashboard</a>
+  <span class="muted" id="graph-stats"></span>
+</div>
+<div id="graph"></div>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script>
+  const TYPE_STYLE = {
+    project:     { shape: "star", color: "#e0a458" },
+    paper:       { shape: "box",  color: "#4a8fbf" },
+    math_object: { shape: "dot",  color: "#5aa469" },
+    concept:     { shape: "dot",  color: "#7a6cc4" },
+  };
+  async function loadGraph() {
+    const res = await fetch("/api/projects/{{ project.id }}/graph.json");
+    const data = await res.json();
+    const nodes = data.nodes.map(n => {
+      const st = TYPE_STYLE[n.type] || { shape: "dot", color: "#9aa0a6" };
+      return { id: n.id, label: n.label, shape: st.shape, color: st.color, _type: n.type };
+    });
+    const edges = data.edges.map(e => ({ from: e.from, to: e.to, arrows: "to", title: e.label,
+      color: { color: "#9aa0a6" } }));
+    document.getElementById("graph-stats").textContent =
+      nodes.length + " nodes · " + edges.length + " edges";
+    const network = new vis.Network(document.getElementById("graph"), { nodes, edges },
+      { interaction: { hover: true }, physics: { stabilization: { iterations: 200 } },
+        nodes: { font: { color: getComputedStyle(document.body).color } } });
+    network.on("doubleClick", p => {
+      if (!p.nodes.length) return;
+      const id = p.nodes[0];
+      if (id.startsWith("paper:")) location.href = "/papers/" + id.slice(6);
+      else if (id.startsWith("mo:")) location.href = "/math/" + id.slice(3);
+      else if (id.startsWith("concept:")) location.href = "/concepts/" + id.slice(8);
+    });
+  }
+  loadGraph();
+</script>
+{% endblock %}

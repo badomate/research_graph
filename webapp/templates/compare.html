@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Compare versions · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Version history — {{ sug.suggestion_type.replace('_',' ') }}</h1>
+  <div class="head-links">
+    <a href="/suggestions{% if sug.paper_id %}?paper_id={{ sug.paper_id }}{% endif %}">← suggestions</a>
+  </div>
+</div>
+<p class="muted">{{ versions|length }} generation(s), oldest → newest. Accepting a
+version promotes it and retires the others; restore brings an older one back.</p>
+
+<div class="compare-row">
+  {% for v in versions %}
+  <div class="card compare-col status-card-{{ v.status }}">
+    <div class="meta-row">
+      <span class="pill">v{{ loop.index }}</span>
+      <span class="pill">{{ v.status }}</span>
+      {% if loop.first %}<span class="muted">original</span>{% endif %}
+    </div>
+    {% if v.regeneration_reason %}<div class="why">instruction: <em>“{{ v.regeneration_reason }}”</em></div>{% endif %}
+    {% set pl = v.payload_json %}
+    <div class="payload">
+      {% if pl.title %}<div class="card-title">{{ pl.title }}</div>{% endif %}
+      {% if pl.text %}<p>{{ pl.text }}</p>{% endif %}
+      {% if pl.assessment %}<p>{{ pl.assessment }}</p>{% endif %}
+      {% if pl.statement_latex %}<pre class="latex">{{ pl.statement_latex }}</pre>{% endif %}
+      {% if pl.role %}<p><strong>{{ pl.role }}</strong> — {{ pl.rationale }}</p>{% endif %}
+    </div>
+    <div class="muted">{{ v.model }} · {{ v.prompt_version }} · out {{ v.output_hash[:10] }}</div>
+    <div class="actions">
+      {% if v.status == 'accepted' %}
+        <span class="pill">✓ accepted</span>
+      {% else %}
+        <form action="/suggestions/{{ v.id }}/restore" method="post" class="inline">
+          <button class="btn {{ 'btn-primary' if loop.last else '' }}" type="submit">
+            {{ 'Accept this version' if loop.last else 'Restore this version' }}</button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

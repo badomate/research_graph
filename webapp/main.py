@@ -29,12 +29,13 @@ from modules import cost  # noqa: E402
 from modules import external_search as ext_search  # noqa: E402
 from modules.metadata import fetch_arxiv_metadata, fetch_doi_metadata  # noqa: E402
 from modules.parsing import scope_utils  # noqa: E402
-from modules.config import get_config  # noqa: E402
 from modules.store import (  # noqa: E402
     AnalysisType,
     ConceptState,
     EdgeStatus,
     JobStatus,
+    MathObjectRelevance,
+    MathObjectType,
     PaperRole,
     PaperStatus,
     RegionLabel,
@@ -98,7 +99,24 @@ VERIF_META = {
 PAPER_ROLES = [r.value for r in PaperRole]
 ANALYSIS_TYPES = [a.value for a in AnalysisType]
 SCOPE_PURPOSES = [p.value for p in ScopePurpose]
-_CFG = get_config()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class _Pricing:
+    """Cost-estimate rates, read straight from env so the webapp stays light
+    (no pydantic-settings dependency — must match modules/config.py defaults)."""
+    marker_price_per_page = _env_float("MARKER_PRICE_PER_PAGE", 0.01)
+    claude_input_price_per_mtok = _env_float("CLAUDE_INPUT_PRICE_PER_MTOK", 3.0)
+    claude_output_price_per_mtok = _env_float("CLAUDE_OUTPUT_PRICE_PER_MTOK", 15.0)
+
+
+_CFG = _Pricing()
 
 
 def _ctx(request: Request, **extra) -> dict:
@@ -556,18 +574,25 @@ def project_remove_paper(project_id: str, paper_id: str):
 
 @app.get("/projects/{project_id}/novelty", response_class=HTMLResponse)
 def project_novelty(request: Request, project_id: str):
-    """Phase-3 dashboard scaffold — aggregates reviewed signals for a project."""
+    """Novelty dashboard — aggregates *accepted* signals for a project."""
     project = store.get_project(project_id)
     if project is None:
         return RedirectResponse(url="/projects", status_code=303)
-    buckets: dict[str, list] = {}
-    for paper_id, role in store.papers_in_project(project_id):
-        paper = store.get_paper(paper_id)
-        if paper is not None:
-            buckets.setdefault(role, []).append(paper)
-    math_objs = store.math_objects_for_project(project_id)
-    return render("project_novelty.html", _ctx(
-        request, project=project, buckets=buckets, math_objs=math_objs))
+    data = store.project_novelty(project_id)
+    return render("project_novelty.html", _ctx(request, project=project, data=data))
+
+
+@app.get("/projects/{project_id}/graph", response_class=HTMLResponse)
+def project_graph_page(request: Request, project_id: str):
+    project = store.get_project(project_id)
+    if project is None:
+        return RedirectResponse(url="/projects", status_code=303)
+    return render("project_graph.html", _ctx(request, project=project))
+
+
+@app.get("/api/projects/{project_id}/graph.json")
+def project_graph_json(project_id: str):
+    return JSONResponse(store.project_graph(project_id))
 
 
 # ── Collections & tags ───────────────────────────────────────────────────────────
@@ -658,7 +683,8 @@ def find_page(request: Request, q: str = "", mode: str = "exact"):
 
 @app.get("/external", response_class=HTMLResponse)
 async def external_page(request: Request, q: str = "", sources: str = ""):
-    chosen = [s for s in sources.split(",") if s] or list(ext_search.SOURCES)
+    available = ext_search.available_sources()
+    chosen = [s for s in sources.split(",") if s in available] or list(available)
     results: list[dict] = []
     if q.strip():
         found = await run_in_threadpool(ext_search.external_search, q, chosen, 10)
@@ -667,7 +693,7 @@ async def external_page(request: Request, q: str = "", sources: str = ""):
             existing = store.find_paper_by_external(arxiv_id=r.arxiv_id, doi=r.doi)
             results.append({"r": r, "saved": existing.id if existing else ""})
     return render("external.html", _ctx(
-        request, q=q, results=results, sources=ext_search.SOURCES, chosen=chosen,
+        request, q=q, results=results, sources=available, chosen=chosen,
         all_collections=store.list_collections(), all_projects=store.list_projects()))
 
 
@@ -901,6 +927,63 @@ def regenerate_suggestion(request: Request, suggestion_id: str, instruction: str
     # The new version is produced asynchronously by the analysis worker; re-render
     # the card so the reviewer sees the queued state + lineage.
     return _suggestion_card(request, suggestion_id)
+
+
+@app.get("/suggestions/{suggestion_id}/compare", response_class=HTMLResponse)
+def compare_versions(request: Request, suggestion_id: str):
+    sug = store.get_suggestion(suggestion_id)
+    if sug is None:
+        return RedirectResponse(url="/suggestions", status_code=303)
+    versions = store.suggestion_versions(suggestion_id)
+    return render("compare.html", _ctx(request, sug=sug, versions=versions))
+
+
+@app.post("/suggestions/{suggestion_id}/restore")
+def restore_version(suggestion_id: str):
+    store.restore_suggestion_version(suggestion_id)
+    return RedirectResponse(url=f"/suggestions/{suggestion_id}/compare", status_code=303)
+
+
+# ── Math object browser ──────────────────────────────────────────────────────────
+
+@app.get("/math", response_class=HTMLResponse)
+def math_browser(request: Request, q: str = "", type: str = ""):
+    objs = store.list_math_objects(type=type or None, q=q or None)
+    rows = [{"mo": mo, "paper": store.get_paper(mo.paper_id)} for mo in objs]
+    return render("math.html", _ctx(
+        request, rows=rows, q=q, cur_type=type,
+        math_types=[t.value for t in MathObjectType]))
+
+
+@app.get("/math/{math_id}", response_class=HTMLResponse)
+def math_detail(request: Request, math_id: str):
+    mo = store.get_math_object(math_id)
+    if mo is None:
+        return RedirectResponse(url="/math", status_code=303)
+    paper = store.get_paper(mo.paper_id)
+    # Which projects this object is already linked to (and with what relevance).
+    linked = {}
+    for proj in store.list_projects():
+        for m, relevance in store.math_objects_for_project(proj.id):
+            if m.id == math_id:
+                linked[proj.id] = relevance
+    return render("math_detail.html", _ctx(
+        request, mo=mo, paper=paper, all_projects=store.list_projects(), linked=linked,
+        relevances=[r.value for r in MathObjectRelevance]))
+
+
+@app.post("/math/{math_id}/link-project")
+def math_link_project(math_id: str, project_id: str = Form(...), relevance: str = Form("background")):
+    store.link_math_object_project(math_id, project_id, relevance)
+    return RedirectResponse(url=f"/math/{math_id}", status_code=303)
+
+
+@app.post("/math/{math_id}/delete")
+def math_delete(math_id: str):
+    mo = store.get_math_object(math_id)
+    back = f"/papers/{mo.paper_id}" if mo else "/math"
+    store.delete_math_object(math_id)
+    return RedirectResponse(url=back, status_code=303)
 
 
 @app.get("/health")

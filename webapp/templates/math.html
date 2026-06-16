@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Math objects · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Math objects</h1>
+  <div class="head-links">{{ rows|length }} object(s)</div>
+</div>
+<p class="muted">Definitions, theorems, lemmas, assumptions and algorithms extracted
+across papers — browse independently of the papers they came from.</p>
+
+<form class="card form-inline" action="/math" method="get">
+  <input name="q" value="{{ q }}" placeholder="Search title / statement / conclusion…" style="flex:1">
+  <select name="type" aria-label="type" onchange="this.form.submit()">
+    <option value="">all types</option>
+    {% for t in math_types %}<option value="{{ t }}" {% if cur_type==t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+  </select>
+  <button class="btn btn-primary" type="submit">Search</button>
+</form>
+
+{% for row in rows %}
+<div class="card result">
+  <div class="card-title">
+    <a href="/math/{{ row.mo.id }}">{{ row.mo.title or row.mo.type }}</a>
+    <span class="pill">{{ row.mo.type }}</span>
+  </div>
+  {% if row.mo.statement_latex %}<pre class="latex">{{ row.mo.statement_latex[:240] }}</pre>{% endif %}
+  <div class="muted">
+    {% if row.paper %}from <a href="/papers/{{ row.paper.id }}">{{ row.paper.title[:70] }}</a>{% endif %}
+    {% if row.mo.source_pages %}· pp. {{ row.mo.source_pages|join(', ') }}{% endif %}
+    · confidence {{ '%.2f'|format(row.mo.confidence) }}
+  </div>
+</div>
+{% else %}
+<p class="muted">No math objects yet. They appear here when you accept theorem /
+definition / assumption suggestions in the review queue.</p>
+{% endfor %}
+{% endblock %}

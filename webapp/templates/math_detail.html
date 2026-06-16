@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}{{ mo.title or mo.type }} · Math{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ mo.title or mo.type }} <span class="pill">{{ mo.type }}</span></h1>
+  <div class="head-links"><a href="/math">← math objects</a></div>
+</div>
+<div class="muted">
+  {% if paper %}from <a href="/papers/{{ paper.id }}">{{ paper.title }}</a>{% endif %}
+  {% if mo.source_pages %}· pp. {{ mo.source_pages|join(', ') }}{% endif %}
+  · confidence {{ '%.2f'|format(mo.confidence) }}
+</div>
+
+{% if mo.statement_latex %}<h3>Statement</h3><pre class="latex">{{ mo.statement_latex }}</pre>{% endif %}
+{% if mo.assumptions %}<h3>Assumptions</h3><p>{{ mo.assumptions }}</p>{% endif %}
+{% if mo.variables %}<h3>Variables</h3><p>{{ mo.variables }}</p>{% endif %}
+{% if mo.conclusion %}<h3>Conclusion</h3><p>{{ mo.conclusion }}</p>{% endif %}
+{% if mo.source_quotes %}<h3>Source quotes</h3>
+  <ul class="list">{% for qte in mo.source_quotes %}<li><em>{{ qte }}</em></li>{% endfor %}</ul>{% endif %}
+
+<h3>Project relevance</h3>
+<p class="muted">Link this object to a project with a relevance role (direct tool,
+competing result, missing assumption, …). Linked objects feed the project's
+novelty dashboard.</p>
+{% if linked %}
+<ul class="list">
+  {% for proj in all_projects if proj.id in linked %}
+    <li><a href="/projects/{{ proj.id }}">{{ proj.name }}</a>
+      <span class="pill">{{ linked[proj.id].replace('_',' ') }}</span></li>
+  {% endfor %}
+</ul>
+{% endif %}
+<form class="card form-inline" action="/math/{{ mo.id }}/link-project" method="post">
+  <select name="project_id" required aria-label="project">
+    <option value="" disabled selected>Pick a project…</option>
+    {% for p in all_projects %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
+  </select>
+  <select name="relevance" aria-label="relevance">
+    {% for r in relevances %}<option value="{{ r }}">{{ r.replace('_',' ') }}</option>{% endfor %}
+  </select>
+  <button class="btn btn-primary" type="submit">Link</button>
+</form>
+
+<form action="/math/{{ mo.id }}/delete" method="post" onsubmit="return confirm('Delete this math object?')">
+  <button class="btn btn-link" type="submit">delete object</button>
+</form>
+{% endblock %}

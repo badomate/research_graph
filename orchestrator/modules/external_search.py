@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
@@ -23,9 +24,17 @@ logger = logging.getLogger(__name__)
 _ARXIV_API = "https://export.arxiv.org/api/query"
 _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 _CROSSREF_API = "https://api.crossref.org/works"
+_SERPAPI_API = "https://serpapi.com/search"
 _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 SOURCES = ("arxiv", "semantic_scholar", "crossref")
+
+
+def available_sources() -> tuple[str, ...]:
+    """Sources usable right now. SerpAPI (Google Scholar) only when keyed."""
+    if os.environ.get("SERPAPI_KEY"):
+        return SOURCES + ("serpapi",)
+    return SOURCES
 
 
 @dataclass
@@ -147,6 +156,34 @@ def parse_crossref_search(payload: dict) -> list[ExternalResult]:
     return out
 
 
+def parse_serpapi_scholar(payload: dict) -> list[ExternalResult]:
+    """Parse a SerpAPI Google Scholar response → results."""
+    if not isinstance(payload, dict):
+        return []
+    out: list[ExternalResult] = []
+    for item in payload.get("organic_results", []) or []:
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        info = item.get("publication_info") or {}
+        summary = info.get("summary", "")
+        # summary looks like "A Author, B Author - Journal, 2023 - publisher"
+        year = ""
+        for tok in summary.replace(",", " ").split():
+            if tok.isdigit() and len(tok) == 4 and tok.startswith(("19", "20")):
+                year = tok
+                break
+        resources = item.get("resources") or []
+        pdf_url = next((r.get("link", "") for r in resources if r.get("file_format") == "PDF"), "")
+        out.append(ExternalResult(
+            source="serpapi", title=title,
+            authors=summary.split(" - ")[0] if " - " in summary else "",
+            year=year, abstract=item.get("snippet", ""),
+            url=item.get("link", ""), pdf_url=pdf_url,
+        ))
+    return out
+
+
 def merge_results(groups: list[list[ExternalResult]]) -> list[ExternalResult]:
     """Merge across sources, de-duping by identity and filling blank fields."""
     merged: dict[str, ExternalResult] = {}
@@ -208,10 +245,25 @@ def search_crossref(query: str, limit: int = 10) -> list[ExternalResult]:
         return []
 
 
+def search_serpapi(query: str, limit: int = 10) -> list[ExternalResult]:
+    api_key = os.environ.get("SERPAPI_KEY", "")
+    if not api_key:
+        return []
+    params = {"engine": "google_scholar", "q": query, "num": min(limit, 20), "api_key": api_key}
+    content = _get(f"{_SERPAPI_API}?{urllib.parse.urlencode(params)}")
+    if not content:
+        return []
+    try:
+        return parse_serpapi_scholar(json.loads(content))
+    except (ValueError, TypeError):
+        return []
+
+
 _SEARCHERS = {
     "arxiv": search_arxiv,
     "semantic_scholar": search_semantic_scholar,
     "crossref": search_crossref,
+    "serpapi": search_serpapi,
 }
 
 
@@ -220,7 +272,7 @@ def external_search(query: str, sources: list[str] | None = None, limit: int = 1
     query = (query or "").strip()
     if not query:
         return []
-    chosen = [s for s in (sources or SOURCES) if s in _SEARCHERS]
+    chosen = [s for s in (sources or available_sources()) if s in _SEARCHERS]
     groups = []
     for src in chosen:
         try:

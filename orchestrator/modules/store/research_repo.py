@@ -20,6 +20,7 @@ from .models import (
     AiSuggestion,
     AnalysisJob,
     Collection,
+    ConceptState,
     JobStatus,
     MathObject,
     MathObjectProject,
@@ -625,27 +626,25 @@ class ResearchStoreMixin:
             promoted_ref_table=ref_table,
             promoted_ref_id=ref_id,
         )
-        self._supersede_ancestors(suggestion_id)
+        self._supersede_other_versions(suggestion_id)
         return sug
 
     def reject_suggestion(self, suggestion_id: str) -> AiSuggestion | None:
         return self.update_suggestion(suggestion_id, status=SuggestionStatus.REJECTED.value)
 
-    def _supersede_ancestors(self, suggestion_id: str) -> None:
-        """Mark every older version in this lineage as superseded."""
-        sug = self.get_suggestion(suggestion_id)
-        if sug is None:
-            return
-        cur = sug.parent_generation_id
-        seen: set[str] = {suggestion_id}
-        while cur and cur not in seen:
-            parent = self.get_suggestion(cur)
-            if parent is None:
-                break
-            seen.add(parent.id)
-            if parent.status != SuggestionStatus.ACCEPTED.value:
-                self.update_suggestion(parent.id, status=SuggestionStatus.SUPERSEDED.value)
-            cur = parent.parent_generation_id
+    def restore_suggestion_version(self, suggestion_id: str) -> AiSuggestion | None:
+        """Revert to an earlier (superseded/rejected) version: re-activate it as the
+        accepted one and retire every other version in the chain."""
+        return self.accept_suggestion(suggestion_id)
+
+    def _supersede_other_versions(self, suggestion_id: str) -> None:
+        """Mark every *other* version in this lineage as superseded — the just-
+        accepted/restored one is the sole winner (including over a previously
+        accepted sibling, so 'restore an older version' truly reverts)."""
+        for v in self.suggestion_versions(suggestion_id):
+            if v.id == suggestion_id:
+                continue
+            self.update_suggestion(v.id, status=SuggestionStatus.SUPERSEDED.value)
 
     def _promote_suggestion(self, sug: AiSuggestion) -> tuple[str, str]:
         """Materialize an accepted suggestion into a first-class table.
@@ -767,6 +766,80 @@ class ResearchStoreMixin:
                 link.relevance = relevance
             s.add(link)
             s.commit()
+
+    def project_novelty(self, project_id: str) -> dict:
+        """Aggregate human-reviewed signals for a project's novelty dashboard.
+
+        Pulls papers (by role), accepted AI suggestions for those papers (grouped
+        by type), and the math objects linked to the project (with relevance).
+        Everything here is *accepted* — the dashboard reflects reviewed truth, not
+        raw AI output.
+        """
+        members = self.papers_in_project(project_id)
+        papers_by_role: dict[str, list[Paper]] = {}
+        paper_ids: list[str] = []
+        for paper_id, role in members:
+            paper = self.get_paper(paper_id)
+            if paper is not None:
+                papers_by_role.setdefault(role, []).append(paper)
+                paper_ids.append(paper_id)
+
+        # Accepted suggestions for the project's papers (or tagged to the project).
+        accepted: dict[str, AiSuggestion] = {}
+        for pid in paper_ids:
+            for s in self.list_suggestions(paper_id=pid, status=SuggestionStatus.ACCEPTED.value):
+                accepted[s.id] = s
+        for s in self.list_suggestions(project_id=project_id, status=SuggestionStatus.ACCEPTED.value):
+            accepted[s.id] = s
+        by_type: dict[str, list[AiSuggestion]] = {}
+        for s in accepted.values():
+            by_type.setdefault(s.suggestion_type, []).append(s)
+
+        return {
+            "papers_by_role": papers_by_role,
+            "suggestions": by_type,
+            "math_objects": self.math_objects_for_project(project_id),
+            "paper_count": len(paper_ids),
+        }
+
+    def project_graph(self, project_id: str) -> dict:
+        """Nodes + edges for a project knowledge graph: the project, its papers
+        (edge = role), and each paper's promoted concepts and math objects."""
+        nodes: list[dict] = [{"id": f"proj:{project_id}", "label": "PROJECT", "type": "project"}]
+        edges: list[dict] = []
+        seen: set[str] = {f"proj:{project_id}"}
+        project = self.get_project(project_id)
+        if project is not None:
+            nodes[0]["label"] = project.name
+
+        for paper_id, role in self.papers_in_project(project_id):
+            paper = self.get_paper(paper_id)
+            if paper is None:
+                continue
+            pnode = f"paper:{paper_id}"
+            if pnode not in seen:
+                nodes.append({"id": pnode, "label": paper.title[:60], "type": "paper", "role": role})
+                seen.add(pnode)
+            edges.append({"from": f"proj:{project_id}", "to": pnode, "label": role})
+
+            for mo in self.list_math_objects(paper_id=paper_id):
+                mnode = f"mo:{mo.id}"
+                if mnode not in seen:
+                    nodes.append({"id": mnode, "label": (mo.title or mo.type)[:50],
+                                  "type": "math_object", "mo_type": mo.type})
+                    seen.add(mnode)
+                edges.append({"from": pnode, "to": mnode, "label": mo.type})
+
+            for c in self.concepts_for_paper(paper_id):  # type: ignore[attr-defined]
+                if c.state not in (ConceptState.PROMOTED.value, ConceptState.HUB.value):
+                    continue
+                cnode = f"concept:{c.id}"
+                if cnode not in seen:
+                    nodes.append({"id": cnode, "label": c.effective_title[:50], "type": "concept"})
+                    seen.add(cnode)
+                edges.append({"from": pnode, "to": cnode, "label": "concept"})
+
+        return {"nodes": nodes, "edges": edges}
 
     def math_objects_for_project(self, project_id: str) -> list[tuple[MathObject, str]]:
         with new_session(self._engine) as s:

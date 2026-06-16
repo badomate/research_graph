@@ -211,3 +211,8 @@ label.fl { display: block; font-size: .68rem; text-transform: uppercase; letter-
 #overlay { position:absolute; left:0; top:0; cursor:crosshair; }
 .save-form { margin-top:8px; }
 textarea { width:100%; font-family:ui-monospace,monospace; font-size:.8rem; }
+
+/* ── Phase 3: version compare ── */
+.compare-row { display:flex; gap:12px; overflow-x:auto; padding-bottom:8px; }
+.compare-col { min-width:280px; max-width:340px; flex:0 0 auto; }
+.compare-col .payload { max-height:340px; overflow:auto; }
