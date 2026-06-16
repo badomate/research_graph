@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}paper_pipeline{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="/">paper<span>_</span>pipeline</a>
+    <nav>
+      <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>Papers</a>
+      <a href="/review" {% if request.url.path == '/review' %}class="active"{% endif %}>
+        Review{% if pending_review %}<span class="count">{{ pending_review }}</span>{% endif %}
+      </a>
+      <a href="/brain" {% if request.url.path == '/brain' %}class="active"{% endif %}>Brain</a>
+      <a href="/graph" {% if request.url.path == '/graph' %}class="active"{% endif %}>Graph</a>
+      <a href="/search" {% if request.url.path == '/search' %}class="active"{% endif %}>Search</a>
+    </nav>
+    <a class="btn btn-primary add" href="/papers/new">+ Add</a>
+  </header>
+
+  <main class="{% block main_class %}wrap{% endblock %}">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

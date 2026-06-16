@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Graph · paper_pipeline{% endblock %}
+{% block main_class %}graph-main{% endblock %}
+{% block content %}
+<div class="graph-toolbar">
+  <strong>Knowledge graph</strong>
+  <label class="muted"><input type="checkbox" id="incl-proposed"> include proposed edges</label>
+  <span class="muted" id="graph-stats"></span>
+</div>
+<div id="graph"></div>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script>
+  const REL_COLORS = {
+    depends_on: "#c45b5b", enables: "#5aa469", generalizes: "#4a8fbf",
+    special_case_of: "#7a6cc4", related: "#9aa0a6",
+  };
+  let network = null;
+  async function loadGraph() {
+    const incl = document.getElementById("incl-proposed").checked;
+    const res = await fetch("/api/graph.json?verified_only=" + (incl ? "false" : "true"));
+    const data = await res.json();
+    const nodes = data.nodes.map(n => ({
+      id: n.id, label: n.label,
+      shape: n.state === "hub" ? "box" : "dot",
+      color: n.state === "hub" ? "#7a6cc4" : "#4a8fbf",
+    }));
+    const edges = data.edges.map(e => ({
+      from: e.from, to: e.to, arrows: "to",
+      color: { color: REL_COLORS[e.relation_type] || "#9aa0a6" },
+      dashes: e.status === "proposed", title: e.relation_type,
+    }));
+    document.getElementById("graph-stats").textContent =
+      nodes.length + " nodes · " + edges.length + " edges";
+    network = new vis.Network(document.getElementById("graph"),
+      { nodes, edges },
+      { interaction: { hover: true }, physics: { stabilization: { iterations: 200 } },
+        nodes: { font: { color: getComputedStyle(document.body).color } } });
+    network.on("doubleClick", p => { if (p.nodes.length) location.href = "/concepts/" + p.nodes[0]; });
+  }
+  document.getElementById("incl-proposed").addEventListener("change", loadGraph);
+  loadGraph();
+</script>
+{% endblock %}

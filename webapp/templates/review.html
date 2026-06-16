@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Review · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ review_title }}</h1>
+    <p class="muted">{{ cards|length }} concept(s) to review ·
+      <span class="kbd-hint">j/k move · v verify · x reject · e edit</span></p>
+  </div>
+  {% if paper %}<a class="btn" href="/papers/{{ paper.id }}">← paper</a>{% endif %}
+</div>
+
+{% if not cards %}
+  <div class="empty">Nothing to review here. <a href="/">Back to papers</a>.</div>
+{% else %}
+  <div class="review-list" id="review-list">
+    {% for card in cards %}{% include "partials/_concept_card.html" %}{% endfor %}
+  </div>
+{% endif %}
+{% endblock %}

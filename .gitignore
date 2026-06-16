@@ -23,3 +23,4 @@ tmp/
 
 # PyVis generated assets (written alongside HTML output at runtime)
 orchestrator/lib/
+webapp_dev.db*

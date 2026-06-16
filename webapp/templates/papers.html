@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Papers · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Papers</h1>
+  <p class="muted">{{ total }} total</p>
+</div>
+
+{% if not columns %}
+  <div class="empty">No papers yet. <a href="/papers/new">Add one</a> to get started.</div>
+{% endif %}
+
+{% for col in columns %}
+<section class="status-group">
+  <h2 class="status-h"><span class="dot" style="--c:{{ col.meta.color }}"></span>
+    {{ col.meta.label }} <span class="muted">{{ col.papers|length }}</span></h2>
+  <ul class="paper-list">
+    {% for p in col.papers %}
+    <li class="paper-row">
+      <a class="paper-link" href="/papers/{{ p.id }}">
+        <span class="paper-title">{{ p.title }}</span>
+        {% if p.one_liner %}<span class="paper-sub muted">{{ p.one_liner }}</span>{% endif %}
+      </a>
+      {% if p.extraction_count %}<span class="muted nowrap">{{ p.extraction_count }} concepts</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
+{% endblock %}

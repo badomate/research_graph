@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ concept.effective_title }} · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><a class="btn" href="/brain">← brain</a></div>
+
+<div class="card-head">
+  <span class="type-badge">{{ concept.type }}</span>
+  <h1 class="card-title">{{ concept.effective_title }}</h1>
+</div>
+{% if concept.suggested_hub %}<p class="muted">Hub: {{ concept.suggested_hub }}
+  {% if paper %}· from <a href="/papers/{{ paper.id }}">{{ paper.title }}</a>{% endif %}</p>{% endif %}
+
+{% if concept.statement_latex %}
+<div class="field"><div class="field-label">Statement</div>
+  <div class="math-block">{{ concept.statement_latex }}</div></div>{% endif %}
+{% if concept.assumptions %}
+<div class="field"><div class="field-label">Assumptions</div>
+  <div class="math-inline">{{ concept.assumptions }}</div></div>{% endif %}
+{% if concept.conclusion %}
+<div class="field"><div class="field-label">Conclusion</div>
+  <div class="math-inline">{{ concept.conclusion }}</div></div>{% endif %}
+{% if concept.interpretation %}
+<div class="field"><div class="field-label">Interpretation</div>
+  <div class="math-inline">{{ concept.interpretation }}</div></div>{% endif %}
+{% if concept.proof_idea %}
+<div class="field"><div class="field-label">Proof idea</div>
+  <div class="math-inline">{{ concept.proof_idea }}</div></div>{% endif %}
+
+{% if concept.canonical_keywords %}
+<div class="chips">{% for k in concept.canonical_keywords %}<span class="chip">{{ k }}</span>{% endfor %}</div>{% endif %}
+
+{% if outgoing or incoming %}
+<h2>Connections</h2>
+<div class="edges">
+  {% for ev in outgoing %}{% include "partials/_edge.html" %}{% endfor %}
+  {% for ev in incoming %}
+    <div class="edge edge-{{ ev.edge.status }}">
+      <a href="/concepts/{{ ev.edge.source_concept_id }}">{{ ev.source_title }}</a>
+      <span class="arrow">→</span><span class="rel">{{ ev.edge.relation_type }}</span>
+      <span class="muted">(this)</span>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

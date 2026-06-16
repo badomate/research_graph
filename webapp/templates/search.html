@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Search · paper_pipeline{% endblock %}
+{% block content %}
+<h1>Search</h1>
+<form class="search-bar" method="get" action="/search">
+  <input class="inp" name="q" value="{{ q }}" placeholder="Search concepts…" autofocus autocomplete="off">
+</form>
+{% if q %}
+  <p class="muted">{{ results|length }} result(s) for "{{ q }}"</p>
+  <ul class="concept-mini-list">
+    {% for c in results %}
+    <li><a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
+      <span class="type-badge sm">{{ c.type }}</span>
+      <span class="pill sm" style="--c:{{ verif_meta.get(c.verification_status, {}).get('color', '#888') }}">{{ c.state }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+{% endblock %}

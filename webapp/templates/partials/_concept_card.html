@@ -1,0 +1,46 @@
+{% set c = card.concept %}
+<article class="card concept-card v-{{ c.verification_status }}"
+         id="concept-{{ c.id }}" data-id="{{ c.id }}" tabindex="-1">
+  <div class="card-head">
+    <span class="type-badge">{{ c.type or "Concept" }}</span>
+    <h3 class="card-title">
+      <a href="/concepts/{{ c.id }}">{{ c.effective_title or "Untitled" }}</a>
+    </h3>
+    {% set vm = verif_meta.get(c.verification_status, {"label": c.verification_status, "color": "#888"}) %}
+    <span class="pill" style="--c:{{ vm.color }}">{{ vm.label }}</span>
+    {% if c.ai_confidence is not none %}<span class="muted conf">{{ "%.0f"|format(c.ai_confidence * 100) }}%</span>{% endif %}
+  </div>
+
+  {% if c.statement_latex %}
+  <div class="field"><div class="field-label">Statement</div>
+    <div class="math-block">{{ c.statement_latex }}</div></div>
+  {% endif %}
+  {% if c.assumptions %}
+  <div class="field"><div class="field-label">Assumptions</div>
+    <div class="math-inline">{{ c.assumptions }}</div></div>
+  {% endif %}
+  {% if c.conclusion %}
+  <div class="field"><div class="field-label">Conclusion</div>
+    <div class="math-inline">{{ c.conclusion }}</div></div>
+  {% endif %}
+
+  {% if c.canonical_keywords %}
+  <div class="chips">{% for k in c.canonical_keywords %}<span class="chip">{{ k }}</span>{% endfor %}</div>
+  {% endif %}
+
+  {% if card.edges %}
+  <div class="edges">
+    <div class="field-label">Proposed edges</div>
+    {% for ev in card.edges %}{% include "partials/_edge.html" %}{% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="card-actions">
+    <button class="btn btn-ok act-verify" hx-post="/concepts/{{ c.id }}/verify"
+            hx-target="#concept-{{ c.id }}" hx-swap="outerHTML">✓ Verify</button>
+    <button class="btn btn-bad act-reject" hx-post="/concepts/{{ c.id }}/reject"
+            hx-target="#concept-{{ c.id }}" hx-swap="outerHTML">✕ Reject</button>
+    <button class="btn act-edit" hx-get="/concepts/{{ c.id }}/edit"
+            hx-target="#concept-{{ c.id }}" hx-swap="outerHTML">Edit</button>
+  </div>
+</article>

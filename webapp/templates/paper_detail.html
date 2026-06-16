@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title }} · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <a class="btn" href="/">← papers</a>
+</div>
+
+<h1 class="paper-h">{{ paper.title }}</h1>
+{% set sm = status_meta.get(paper.status, {"label": paper.status, "color": "#888"}) %}
+<div class="meta-row">
+  <span class="pill" style="--c:{{ sm.color }}">{{ sm.label }}</span>
+  {% if paper.authors %}<span class="muted">{{ paper.authors }}</span>{% endif %}
+  {% if paper.arxiv_id %}<a class="muted" href="https://arxiv.org/abs/{{ paper.arxiv_id }}" target="_blank">arXiv:{{ paper.arxiv_id }}</a>{% endif %}
+</div>
+
+{% if paper.one_liner %}<p class="lead">{{ paper.one_liner }}</p>{% endif %}
+{% if paper.extraction_error %}<div class="callout bad">{{ paper.extraction_error }}</div>{% endif %}
+
+<div class="actions-bar">
+  {% if concepts %}<a class="btn btn-primary" href="/papers/{{ paper.id }}/review">Review {{ concepts|length }} concept(s)</a>{% endif %}
+  <form method="post" action="/papers/{{ paper.id }}/status" class="inline-form">
+    <select name="status">
+      {% for s, m in status_meta.items() %}
+      <option value="{{ s }}" {% if s == paper.status %}selected{% endif %}>{{ m.label }} ({{ s }})</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Set status</button>
+  </form>
+</div>
+
+<h2>Concepts</h2>
+{% if not concepts %}
+  <p class="muted">No concepts extracted yet.</p>
+{% else %}
+<ul class="concept-mini-list">
+  {% for c in concepts %}
+  {% set vm = verif_meta.get(c.verification_status, {"label": c.verification_status, "color":"#888"}) %}
+  <li>
+    <a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
+    <span class="type-badge sm">{{ c.type }}</span>
+    <span class="pill sm" style="--c:{{ vm.color }}">{{ vm.label }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

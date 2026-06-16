@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Second Brain · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Second Brain</h1><p class="muted">{{ count }} promoted concept(s)</p></div>
+</div>
+
+<form class="search-bar" method="get" action="/brain">
+  <input class="inp" name="q" value="{{ q }}" placeholder="Filter by title or keyword…"
+         autocomplete="off">
+</form>
+
+{% if not grouped %}
+  <div class="empty">No promoted concepts yet. Verify concepts in the
+    <a href="/review">review queue</a> and promote their paper.</div>
+{% endif %}
+
+{% for hub, items in grouped %}
+<section class="status-group">
+  <h2 class="status-h">{{ hub }} <span class="muted">{{ items|length }}</span></h2>
+  <ul class="concept-mini-list">
+    {% for c in items %}
+    <li>
+      <a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
+      <span class="type-badge sm">{{ c.type }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
+{% endblock %}

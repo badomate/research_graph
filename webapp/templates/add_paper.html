@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Add paper · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><a class="btn" href="/">← papers</a></div>
+<h1>Add a paper</h1>
+<p class="muted">Paste an arXiv ID or DOI, or upload a PDF. It enters the queue and the
+  pipeline picks it up.</p>
+
+<form class="stack" method="post" action="/papers" enctype="multipart/form-data">
+  <label class="field-label">arXiv ID <span class="muted">(e.g. 2401.01234)</span></label>
+  <input class="inp" name="arxiv_id" placeholder="2401.01234">
+
+  <label class="field-label">DOI</label>
+  <input class="inp" name="doi" placeholder="10.xxxx/...">
+
+  <label class="field-label">Title <span class="muted">(optional)</span></label>
+  <input class="inp" name="title" placeholder="Leave blank to derive from arXiv/PDF">
+
+  <label class="field-label">…or upload a PDF</label>
+  <input class="inp" type="file" name="pdf" accept="application/pdf">
+
+  <div><button class="btn btn-primary" type="submit">Add paper</button></div>
+</form>
+{% endblock %}
