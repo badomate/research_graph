@@ -27,6 +27,13 @@ from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 from modules import cost  # noqa: E402
 from modules import external_search as ext_search  # noqa: E402
+from modules.pdf_resolver import (  # noqa: E402
+    build_webdav_client,
+    download_koofr_pdf,
+    resolve_zotero_attachment_key,
+    safe_pdf_filename,
+    zotero_parent_key,
+)
 from modules.metadata import fetch_arxiv_metadata, fetch_doi_metadata  # noqa: E402
 from modules.parsing import scope_utils  # noqa: E402
 from modules.store import (  # noqa: E402
@@ -50,6 +57,39 @@ from modules.store import (  # noqa: E402
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 store = Store()
+
+
+# ── In-process log ring buffer (powers the /debug console) ──────────────────────
+import logging  # noqa: E402
+from collections import deque  # noqa: E402
+
+
+class _RingBufferHandler(logging.Handler):
+    """Keeps the last N formatted log records in memory for the debug page.
+
+    Captures everything this webapp process logs — including the heavy ops the UI
+    triggers in-process (Qdrant rebuild, edge regeneration). The orchestrator runs
+    in a separate container, so its logs are via ``docker compose logs orchestrator``.
+    """
+
+    def __init__(self, capacity: int = 800) -> None:
+        super().__init__()
+        self.records: deque[str] = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(self.format(record))
+        except Exception:  # never let logging break a request
+            pass
+
+
+_LOG_BUFFER = _RingBufferHandler()
+_LOG_BUFFER.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                                            datefmt="%H:%M:%S"))
+_root_logger = logging.getLogger()
+if _root_logger.level > logging.INFO or _root_logger.level == logging.NOTSET:
+    _root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_LOG_BUFFER)
 
 _template_response = templates.TemplateResponse
 
@@ -221,6 +261,86 @@ def set_paper_link(paper_id: str, zotero_uri: str = Form("")):
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
+def _regenerate_edges_now(concept_ids: list[str]) -> int:
+    """Re-propose edges for the *accepted* (promoted/hub) concepts among the given
+    ids, against the accepted graph. Inbox concepts are skipped — edges are born at
+    promotion, so an unaccepted concept has nothing to link into yet."""
+    promoted = [
+        cid for cid in concept_ids
+        if (c := store.get_concept(cid)) is not None
+        and c.state in (ConceptState.PROMOTED.value, ConceptState.HUB.value)
+    ]
+    if not promoted:
+        return 0
+    try:
+        return _get_ingestion_engine().link_concepts_against_brain(promoted)
+    except Exception:  # never 500 a button
+        logging.getLogger("webapp").exception("edge regeneration failed")
+        return 0
+
+
+@app.post("/edges/regenerate")
+def regenerate_all_edges():
+    concepts = store.list_concepts()
+    _regenerate_edges_now([c.id for c in concepts])
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/papers/{paper_id}/edges/regenerate")
+def regenerate_paper_edges(paper_id: str):
+    concepts = store.concepts_for_paper(paper_id)
+    _regenerate_edges_now([c.id for c in concepts])
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.post("/concepts/{concept_id}/edges/regenerate")
+def regenerate_concept_edges(concept_id: str):
+    _regenerate_edges_now([concept_id])
+    return RedirectResponse(url=f"/concepts/{concept_id}", status_code=303)
+
+
+def _download_paper_pdf_from_koofr(paper):
+    parent_key = paper.zotero_key or zotero_parent_key(paper.zotero_uri)
+    attachment_key = paper.attachment_key
+    if not attachment_key:
+        if not parent_key:
+            raise RuntimeError("Missing or invalid Zotero URI.")
+        zotero_user_id = os.environ.get("ZOTERO_USER_ID", "")
+        zotero_api_key = os.environ.get("ZOTERO_API_KEY", "")
+        if not zotero_user_id or not zotero_api_key:
+            raise RuntimeError("Zotero API credentials are not configured.")
+        attachment_key = resolve_zotero_attachment_key(
+            zotero_uri=paper.zotero_uri,
+            parent_key=parent_key,
+            zotero_user_id=zotero_user_id,
+            zotero_api_key=zotero_api_key,
+        )
+        if not attachment_key:
+            raise RuntimeError("No PDF attachment found for this Zotero item.")
+
+    if not os.environ.get("KOOFR_USER") or not os.environ.get("KOOFR_APP_PASSWORD"):
+        raise RuntimeError("Koofr credentials are not configured.")
+
+    uploads = Path(os.environ.get("UPLOADS_DIR", "./uploads"))
+    resolved = download_koofr_pdf(
+        webdav=build_webdav_client(),
+        koofr_base=os.environ.get("KOOFR_PDF_PATH", "/zotero"),
+        attachment_key=attachment_key,
+        output_dir=uploads,
+        preferred_pdf_filename=paper.primary_pdf_filename or None,
+        output_stem=safe_pdf_filename(paper.id, paper.id).removesuffix(".pdf"),
+    )
+    store.update_paper(
+        paper.id,
+        zotero_key=parent_key or paper.zotero_key,
+        attachment_key=resolved.attachment_key,
+        pdf_path=str(resolved.path),
+        pdf_sha256=resolved.sha256,
+        extraction_error="",
+    )
+    return resolved
+
+
 @app.get("/papers/{paper_id}", response_class=HTMLResponse)
 def paper_detail(request: Request, paper_id: str):
     paper = store.get_paper(paper_id)
@@ -236,7 +356,7 @@ def paper_detail(request: Request, paper_id: str):
 
 @app.get("/papers/{paper_id}/pdf")
 def paper_pdf(paper_id: str):
-    """View the paper: serve an uploaded PDF inline, else redirect to arXiv/DOI."""
+    """View the paper: serve local PDFs, fetch Zotero/Koofr PDFs, else redirect."""
     paper = store.get_paper(paper_id)
     if paper is None:
         return RedirectResponse(url="/", status_code=303)
@@ -245,6 +365,15 @@ def paper_pdf(paper_id: str):
             paper.pdf_path, media_type="application/pdf",
             filename=Path(paper.pdf_path).name, content_disposition_type="inline",
         )
+    if paper.attachment_key or paper.zotero_uri:
+        try:
+            resolved = _download_paper_pdf_from_koofr(paper)
+            return FileResponse(
+                resolved.path, media_type="application/pdf",
+                filename=resolved.filename, content_disposition_type="inline",
+            )
+        except Exception as exc:
+            store.update_paper(paper_id, extraction_error=f"PDF fetch failed: {exc}")
     if paper.arxiv_id:
         return RedirectResponse(url=f"https://arxiv.org/pdf/{paper.arxiv_id}", status_code=307)
     if paper.arxiv_url:
@@ -263,6 +392,21 @@ def set_paper_status(paper_id: str, status: str = Form(...)):
 @app.post("/papers/{paper_id}/promote")
 def promote_paper(paper_id: str):
     store.promote_paper(paper_id)
+    # Edges are born here: propose them for the just-promoted concepts against the
+    # current accepted graph (now, synchronously).
+    _link_promoted_now(paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.post("/papers/{paper_id}/process")
+def process_paper_now(paper_id: str):
+    """Run the full extract→retrieve→link pipeline for this paper right now."""
+    paper = store.get_paper(paper_id)
+    if paper is not None:
+        try:
+            _process_paper_now(paper)
+        except Exception as exc:  # surface failure on the paper instead of a 500
+            store.update_paper(paper_id, extraction_error=f"Process failed: {exc}")
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
@@ -511,6 +655,71 @@ def _paper_orgs(paper_id: str) -> dict:
     }
 
 
+# ── Synchronous execution ────────────────────────────────────────────────────────
+# Buttons run their work *now*, in the request, not via a background scheduler.
+# FastAPI runs these sync handlers in a threadpool, so the request blocks until the
+# work finishes and the redirect reflects the real result.
+
+def _pipeline_config():
+    from modules.config import get_config
+    return get_config()
+
+
+def _run_parse_now(job_id: str) -> None:
+    try:
+        from modules.parsing.parse_worker import ParseWorker
+        ParseWorker(store, config=_pipeline_config()).run_job(job_id)
+    except Exception as exc:  # never 500 a button — record the failure on the job
+        store.update_parse_job(job_id, status=JobStatus.FAILED.value, error=str(exc)[:500])
+
+
+def _run_analysis_now(job_id: str) -> None:
+    try:
+        from modules.analysis.analysis_worker import AnalysisWorker
+        AnalysisWorker(store, config=_pipeline_config()).run_job(job_id)
+    except Exception as exc:
+        store.update_analysis_job(job_id, status=JobStatus.FAILED.value, error=str(exc)[:500])
+
+
+_INGESTION_ENGINE = None
+
+
+def _get_ingestion_engine():
+    """Lazily build and cache one IngestionEngine for the webapp process.
+
+    Constructing it (embedding model + Qdrant client + linker + tag registry) is
+    expensive, so we reuse a single instance across requests instead of rebuilding
+    it on every button press.
+    """
+    global _INGESTION_ENGINE
+    if _INGESTION_ENGINE is None:
+        from modules.ingestion.engine import IngestionEngine
+        from modules.vector_index import VectorIndexEngine
+
+        config = _pipeline_config()
+        vi = VectorIndexEngine(config) if config.vector_index_enabled else None
+        _INGESTION_ENGINE = IngestionEngine(vector_index=vi, config=config)
+    return _INGESTION_ENGINE
+
+
+def _process_paper_now(paper) -> None:
+    """Run the full ingestion pipeline for one paper, right now."""
+    engine = _get_ingestion_engine()
+    hubs = engine.store.hubs()
+    sb_index = engine._build_second_brain_index()
+    engine._process_paper(paper, hubs, sb_index)
+
+
+def _link_promoted_now(paper_id: str) -> None:
+    """Propose edges for a paper's just-promoted concepts against the accepted graph."""
+    try:
+        promoted = store.concepts_for_paper(paper_id, state=ConceptState.PROMOTED.value)
+        if promoted:
+            _get_ingestion_engine().link_concepts_against_brain([c.id for c in promoted])
+    except Exception as exc:  # never 500 the promote button
+        store.update_paper(paper_id, extraction_error=f"Edge proposal failed: {exc}")
+
+
 # ── Projects ─────────────────────────────────────────────────────────────────────
 
 @app.get("/projects", response_class=HTMLResponse)
@@ -722,10 +931,13 @@ def external_save(
     if action in ("save_parse", "save_triage"):
         scope = store.create_parse_scope(paper.id, name="full", purpose="triage",
                                          scope_json={"kind": "full", "page_ranges": [], "regions": []})
-        store.create_parse_job(paper_id=paper.id, parse_scope_id=scope.id)
+        job = store.create_parse_job(paper_id=paper.id, parse_scope_id=scope.id)
+        _run_parse_now(job.id)              # parse now
     if action == "save_triage":
-        # Runs once the parse produces chunks (the analysis worker defers until then).
-        store.create_analysis_job(paper_id=paper.id, analysis_type="triage_summary", chunk_ids=[])
+        chunks = store.chunks_for_paper(paper.id)
+        ajob = store.create_analysis_job(
+            paper_id=paper.id, analysis_type="triage_summary", chunk_ids=[c.id for c in chunks])
+        _run_analysis_now(ajob.id)          # triage now (parse already produced chunks)
     return RedirectResponse(url=f"/papers/{paper.id}", status_code=303)
 
 
@@ -812,10 +1024,11 @@ def create_scope_and_parse(paper_id: str, name: str = Form("scope"),
     scope = store.create_parse_scope(paper_id, name=name, purpose=purpose, scope_json=scope_json)
     selected = scope_utils.page_count(scope_json) or len(ranges)
     if enqueue == "1":
-        store.create_parse_job(
+        job = store.create_parse_job(
             paper_id=paper_id, parse_scope_id=scope.id, selected_pages=selected,
             cost_estimate=cost.estimate_marker_cost(selected, _CFG.marker_price_per_page).cost,
         )
+        _run_parse_now(job.id)   # parse immediately, not via a scheduler
     return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
 
 
@@ -850,10 +1063,11 @@ def create_region_scope(paper_id: str, name: str = Form("regions"),
     scope = store.create_parse_scope(paper_id, name=name, purpose="manual", scope_json=scope_json)
     if enqueue == "1" and (clean or ranges):
         units = scope_utils.page_count({"kind": kind, "page_ranges": ranges}) + len(clean)
-        store.create_parse_job(
+        job = store.create_parse_job(
             paper_id=paper_id, parse_scope_id=scope.id, selected_pages=units,
             cost_estimate=cost.estimate_marker_cost(units, _CFG.marker_price_per_page).cost,
         )
+        _run_parse_now(job.id)
     return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
 
 
@@ -868,12 +1082,13 @@ def enqueue_analysis(paper_id: str, analysis_type: str = Form("triage_summary"),
         input_price_per_mtok=_CFG.claude_input_price_per_mtok,
         output_price_per_mtok=_CFG.claude_output_price_per_mtok,
     )
-    store.create_analysis_job(
+    job = store.create_analysis_job(
         paper_id=paper_id, project_id=project_id or None, analysis_type=analysis_type,
         chunk_ids=chunk_ids, instruction=instruction,
         input_token_estimate=est.input_tokens, output_token_estimate=est.output_tokens,
         cost_estimate=est.cost_mid,
     )
+    _run_analysis_now(job.id)   # call Claude now, not via a scheduler
     return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
 
 
@@ -923,9 +1138,10 @@ def reject_suggestion(request: Request, suggestion_id: str):
 
 @app.post("/suggestions/{suggestion_id}/regenerate", response_class=HTMLResponse)
 def regenerate_suggestion(request: Request, suggestion_id: str, instruction: str = Form("")):
-    store.regenerate_suggestion(suggestion_id, instruction=instruction)
-    # The new version is produced asynchronously by the analysis worker; re-render
-    # the card so the reviewer sees the queued state + lineage.
+    job = store.regenerate_suggestion(suggestion_id, instruction=instruction)
+    if job is not None:
+        _run_analysis_now(job.id)   # produce the new version now
+    # Re-render the card so the reviewer immediately sees the new version + lineage.
     return _suggestion_card(request, suggestion_id)
 
 
@@ -984,6 +1200,62 @@ def math_delete(math_id: str):
     back = f"/papers/{mo.paper_id}" if mo else "/math"
     store.delete_math_object(math_id)
     return RedirectResponse(url=back, status_code=303)
+
+
+# ── Debug console ────────────────────────────────────────────────────────────────
+
+def _recent_logs(limit: int = 300) -> list[str]:
+    return list(_LOG_BUFFER.records)[-limit:][::-1]   # newest first
+
+
+@app.get("/debug", response_class=HTMLResponse)
+def debug_console(request: Request, msg: str = ""):
+    from modules import debug_ops
+    from modules.config import get_config
+
+    config = get_config()
+    return render("debug.html", _ctx(
+        request, msg=msg,
+        stats=debug_ops.system_stats(store),
+        qdrant=debug_ops.qdrant_status(config),
+        marker=debug_ops.marker_status(config),
+        logs=_recent_logs(),
+    ))
+
+
+@app.get("/debug/logs", response_class=HTMLResponse)
+def debug_logs(request: Request):
+    """HTMX-polled log tail (newest first)."""
+    return render("partials/_debug_logs.html", _ctx(request, logs=_recent_logs()))
+
+
+@app.post("/debug/qdrant/rebuild")
+def debug_rebuild_qdrant():
+    from modules import debug_ops
+    from modules.config import get_config
+
+    res = debug_ops.rebuild_qdrant_from_store(get_config(), store)
+    if res["ok"]:
+        msg = f"Qdrant rebuilt: {res['indexed']}/{res['total']} concept(s) indexed in {res['elapsed_s']}s."
+    else:
+        msg = f"Rebuild failed: {res['error']}"
+    return RedirectResponse(url=f"/debug?msg={msg}", status_code=303)
+
+
+@app.post("/debug/workers/drain")
+def debug_drain_workers():
+    from modules import debug_ops
+    from modules.config import get_config
+
+    res = debug_ops.drain_job_workers(get_config(), store)
+    msg = (f"Ran workers: {res['parse']} parse + {res['analysis']} analysis job(s)."
+           if res["ok"] else f"Worker drain failed: {res['error']}")
+    return RedirectResponse(url=f"/debug?msg={msg}", status_code=303)
+
+
+@app.post("/debug/qdrant/ping")
+def debug_ping_qdrant():
+    return RedirectResponse(url="/debug?msg=Status refreshed.", status_code=303)
 
 
 @app.get("/health")

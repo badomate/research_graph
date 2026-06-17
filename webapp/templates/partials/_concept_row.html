@@ -9,6 +9,7 @@
     {% if c.suggested_hub %}<span class="muted nowrap">{{ c.suggested_hub }}</span>{% endif %}
     {% set vm = verif_meta.get(c.verification_status) %}
     {% if vm %}<span class="pill" style="--c:{{ vm.color }}">{{ vm.label }}</span>{% endif %}
+    {% if c.graph_link_status == 'regen-pending' %}<span class="pill">edges queued</span>{% endif %}
     {% if c.ai_confidence %}<span class="conf">{{ "%.0f"|format(c.ai_confidence * 100) }}%</span>{% endif %}
   </div>
 </div>

@@ -114,6 +114,16 @@ class Config(BaseSettings):
     edge_review_flag_confidence: float = 0.65
     edge_max_candidates_to_gpt: int = 20
 
+    # ── When are edges proposed? ──────────────────────────────────────────────
+    # Edges connect concepts in the *accepted* graph. By default they are proposed
+    # at PROMOTION time (when a concept enters the Second Brain) against the
+    # current accepted graph — so an accepted concept links to everything else you
+    # have accepted, including the batch promoted alongside it. Set this True to
+    # additionally link at extraction time (the old behaviour: links a fresh inbox
+    # concept against whatever was promoted at that moment — usually stale/sparse
+    # and wasteful, since rejected concepts get linked too).
+    link_at_extraction: bool = False
+
     # ── Stage 3 batch linking (opt-in) ────────────────────────────────────────
     # When enabled, all of a paper's Stage-3 LLM linking calls are submitted as a
     # single Message Batch (50% cheaper, processed server-side in parallel) and

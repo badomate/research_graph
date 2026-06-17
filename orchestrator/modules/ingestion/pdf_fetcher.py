@@ -5,37 +5,34 @@ Handles Koofr WebDAV, Zotero API, Marker OCR, and the markdown cache.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
-import re
 import uuid
-import zipfile
 from pathlib import Path
+import re
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
-from webdav3.client import Client as WebDAVClient
+from tenacity import RetryError
 
 from ..config import Config
 from ..exceptions import KoofrError, MarkerError, ZoteroError
 from ..job_ledger import JobLedger
 from ..logging_utils import structured_log
 from ..store import Store
+from ..pdf_resolver import (
+    ZOTERO_ATTACH_RE as _ZOTERO_ATTACH_RE,
+    ZOTERO_PARENT_RE as _ZOTERO_PARENT_RE,
+    build_webdav_client,
+    extract_pdf_from_zip,
+    sha256_file,
+)
 
 logger = logging.getLogger(__name__)
 
 TMP_DIR = Path(os.environ.get("PIPELINE_TMP_DIR", "/tmp/pipeline"))
 ZOTERO_API_BASE = "https://api.zotero.org"
 EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
-
-# Accept every Zotero URI form: web profile (zotero.org/<user>/items/KEY),
-# API/library (zotero.org/users/<id>/items/KEY), and the "Copy Zotero URI"
-# select form (zotero://select/library/items/KEY).
-_ZOTERO_PARENT_RE = re.compile(r"zotero(?:\.org|://)[^?#]*?/items/([A-Z0-9]{8})(?:/|$)")
-_ZOTERO_ATTACH_RE = re.compile(
-    r"zotero(?:\.org|://)[^?#]*?/items/[A-Z0-9]{8}/attachment/([A-Z0-9]{8})"
-)
 
 _BOILERPLATE_RE = re.compile(
     r'\n#{1,3}\s*('
@@ -73,14 +70,14 @@ class PdfFetcherService:
             self._ensure_koofr_markdown_dir()
 
     @staticmethod
-    def _build_webdav_client(config: Config | None = None) -> WebDAVClient:
-        options = {
-            "webdav_hostname": "https://app.koofr.net/dav/Koofr",
-            "webdav_login": config.koofr_user if config is not None else os.environ["KOOFR_USER"],
-            "webdav_password": config.koofr_app_password if config is not None else os.environ["KOOFR_APP_PASSWORD"],
-        }
+    def _build_webdav_client(config: Config | None = None):
         try:
-            return WebDAVClient(options)
+            if config is not None:
+                return build_webdav_client(
+                    koofr_user=config.koofr_user,
+                    koofr_app_password=config.koofr_app_password,
+                )
+            return build_webdav_client()
         except TypeError:
             class _NoopWebDAV:
                 def check(self, *_args, **_kwargs):
@@ -210,30 +207,11 @@ class PdfFetcherService:
     def _extract_pdf_from_zip(
         zip_path: Path, output_path: Path, preferred: str | None = None
     ) -> None:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            pdf_entries = [e for e in zf.infolist() if e.filename.lower().endswith(".pdf")]
-            if not pdf_entries:
-                raise FileNotFoundError(f"No PDF found inside {zip_path}")
-            if preferred:
-                match = next(
-                    (e for e in pdf_entries if Path(e.filename).name == preferred), None
-                )
-                if match:
-                    output_path.write_bytes(zf.read(match.filename))
-                    return
-                logger.warning(
-                    "primary_pdf_filename '%s' not found in zip; using largest PDF.", preferred
-                )
-            largest = max(pdf_entries, key=lambda e: e.file_size)
-            output_path.write_bytes(zf.read(largest.filename))
+        extract_pdf_from_zip(zip_path, output_path, preferred=preferred)
 
     @staticmethod
     def _sha256(path: Path) -> str:
-        h = hashlib.sha256()
-        with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
+        return sha256_file(path)
 
     # -- Marker API ------------------------------------------------------------
 
@@ -244,7 +222,13 @@ class PdfFetcherService:
             json={"filepath": str(pdf_path)},
             timeout=300,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = response.text[:1000]
+            raise MarkerError(
+                f"Marker API HTTP {response.status_code} for {pdf_path}: {detail}"
+            ) from exc
         data = response.json()
         return (
             data.get("markdown")
@@ -282,8 +266,11 @@ class PdfFetcherService:
         job_id = self._ledger.start_job(paper_id, pdf_sha256, EXTRACTION_VERSION)
         try:
             markdown_text = self._call_marker(local_pdf)
+        except RetryError as exc:
+            cause = exc.last_attempt.exception() if exc.last_attempt else exc
+            raise MarkerError(f"[{run_id}] Marker OCR failed: {cause}") from exc
         except Exception as exc:
-            raise MarkerError(f"[{run_id}] Marker OCR failed") from exc
+            raise MarkerError(f"[{run_id}] Marker OCR failed: {exc}") from exc
         return self.strip_boilerplate(markdown_text), job_id
 
     def pdf_to_markdown(
@@ -338,8 +325,11 @@ class PdfFetcherService:
 
         try:
             markdown_text = self._call_marker(local_pdf)
+        except RetryError as exc:
+            cause = exc.last_attempt.exception() if exc.last_attempt else exc
+            raise MarkerError(f"[{run_id}] Marker OCR failed: {cause}") from exc
         except Exception as exc:
-            raise MarkerError(f"[{run_id}] Marker OCR failed") from exc
+            raise MarkerError(f"[{run_id}] Marker OCR failed: {exc}") from exc
         finally:
             local_pdf.unlink(missing_ok=True)
 

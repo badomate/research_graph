@@ -216,3 +216,10 @@ textarea { width:100%; font-family:ui-monospace,monospace; font-size:.8rem; }
 .compare-row { display:flex; gap:12px; overflow-x:auto; padding-bottom:8px; }
 .compare-col { min-width:280px; max-width:340px; flex:0 0 auto; }
 .compare-col .payload { max-height:340px; overflow:auto; }
+
+/* ── Debug console ── */
+.logs { background:#0b0d10; color:#cdd3da; padding:10px; border-radius:6px;
+  font-family:ui-monospace,monospace; font-size:.72rem; line-height:1.4;
+  max-height:460px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+.card .json { background:#0b0d10; color:#cdd3da; padding:6px; border-radius:5px;
+  font-size:.72rem; max-height:120px; overflow:auto; }

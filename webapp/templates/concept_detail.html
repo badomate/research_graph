@@ -14,6 +14,9 @@
   {% if paper %} · from <a href="/papers/{{ paper.id }}">{{ paper.title }}</a>{% endif %}
   · state: {{ concept.state }}
 </p>
+{% if concept.graph_link_status == 'regen-pending' %}
+  <div class="callout warn">Edge regeneration queued.</div>
+{% endif %}
 
 {% if concept.statement_latex %}<div class="field"><div class="field-label">Statement</div>
   <div class="math-block">{{ concept.statement_latex }}</div></div>{% endif %}
@@ -88,6 +91,11 @@
       <button class="btn sm" type="submit">Merge</button>
     </form>
   </details>
+
+  <form method="post" action="/concepts/{{ concept.id }}/edges/regenerate"
+        onsubmit="return confirm('Regenerate edges for this concept now?')">
+    <button class="btn sm" type="submit">Regenerate edges</button>
+  </form>
 
   <span class="grow"></span>
   <form method="post" action="/concepts/{{ concept.id }}/delete"

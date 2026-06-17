@@ -65,18 +65,21 @@ Region selection (drawing boxes) is Phase 2; page ranges are live now.</p>
     Marker est: <strong id="markerCost">$0.00</strong>
     <span class="muted">(@ ${{ '%.3f'|format(marker_price) }}/page)</span>
   </div>
-  <button class="btn btn-primary" type="submit">Create scope &amp; queue parse</button>
+  <button class="btn btn-primary" type="submit"
+          onsubmit="this.disabled=true">Create scope &amp; parse now</button>
 </form>
 
 <h2>Run Claude analysis</h2>
-<p class="muted">Analysis runs on parsed chunks only (never the raw PDF). Output lands in
-the <a href="/suggestions?paper_id={{ paper.id }}">suggestion review queue</a>, never the accepted DB.</p>
-<form class="card form-inline" action="/papers/{{ paper.id }}/analyze" method="post">
+<p class="muted">Analysis runs on parsed chunks only (never the raw PDF) and runs
+<strong>immediately</strong>. Output lands in the
+<a href="/suggestions?paper_id={{ paper.id }}">suggestion review list</a>, never the accepted DB.</p>
+<form class="card form-inline" action="/papers/{{ paper.id }}/analyze" method="post"
+      onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Running…'">
   <select name="analysis_type" aria-label="analysis type">
     {% for a in analysis_types %}<option value="{{ a }}">{{ a.replace('_',' ') }}</option>{% endfor %}
   </select>
   <input name="instruction" placeholder="optional instruction (e.g. ignore proofs)">
-  <button class="btn btn-primary" type="submit">Queue analysis</button>
+  <button class="btn btn-primary" type="submit">Run analysis now</button>
 </form>
 
 <h2>Parse jobs</h2>

@@ -89,6 +89,7 @@ services:
       MARKER_MODE: "${MARKER_MODE:-balanced}"
     volumes:
       - tmp_storage:/tmp/pipeline
+      - app_data:/data
       - .:/workspace
     ports:
       - "8080:8080"
@@ -121,6 +122,7 @@ services:
       TORCH_DEVICE: "cpu"
     volumes:
       - tmp_storage:/tmp/pipeline
+      - app_data:/data
       - marker_models:/model_cache
       - .:/workspace 
     ports:
@@ -154,6 +156,7 @@ services:
       TORCH_DEVICE: "cuda"
     volumes:
       - tmp_storage:/tmp/pipeline
+      - app_data:/data
       - marker_models:/model_cache
       - .:/workspace
     ports:
@@ -189,8 +192,20 @@ services:
     environment:
       DATABASE_URL: "sqlite:////data/app.db"
       UPLOADS_DIR: "/data/uploads"
+      # The UI now triggers edge regeneration (VectorIndexEngine), so it must reach
+      # the same Qdrant the orchestrator uses. Without this it defaults to
+      # localhost:6333 inside the webapp container → "connection refused" →
+      # silent TF-IDF fallback (which proposes a near-complete graph).
+      QDRANT_URL: "http://qdrant:6333"
+      MARKER_API_URL: "${MARKER_API_URL:-http://marker-api:8080}"
+    depends_on:
+      qdrant:
+        condition: service_started
     volumes:
       - app_data:/data
+      # The UI's edge regeneration constructs IngestionEngine, whose tag linter
+      # reads this file (else it "rejects all tags" and degrades edge quality).
+      - ./tags_registry.yaml:/tags_registry.yaml:ro
     ports:
       - "${WEBAPP_PORT:-8000}:8000"
     networks:

@@ -12,6 +12,10 @@
 <div class="page-head">
   <h1>Papers <span class="muted">{{ total }}</span></h1>
   <div class="row">
+    <form method="post" action="/edges/regenerate"
+          onsubmit="return confirm('Regenerate edges for every concept now? This may take a while.')">
+      <button class="btn sm" type="submit">Regenerate all edges</button>
+    </form>
     {% if zotero_configured %}
     <form method="post" action="/zotero/sync"><button class="btn sm" type="submit">⟳ Sync Zotero</button></form>
     {% endif %}

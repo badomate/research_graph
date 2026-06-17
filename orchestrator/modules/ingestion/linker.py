@@ -91,11 +91,14 @@ class ConceptLinker:
         if not candidates:
             return ConceptLinkResult()
 
-        has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
-        is_tfidf_path = not any(c.get("_score_obj") is not None for c in candidates)
-
-        if is_tfidf_path and not has_cross_paper:
+        # TF-IDF fallback (Qdrant unavailable): keyword overlap is too weak to
+        # justify an LLM confirmation call, so emit suggest-only edges with no
+        # Claude call. Previously this method was dead code and these candidates
+        # were (expensively, noisily) sent to the v1 prompt.
+        if all(c.get("_source") == "tfidf" for c in candidates):
             return self._tfidf_suggestions(concept, candidates)
+
+        has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
 
         try:
             if has_cross_paper:
@@ -481,11 +484,11 @@ class ConceptLinker:
             if not candidates:
                 results[ki_page_id] = ConceptLinkResult()
                 continue
-            has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
-            is_tfidf_path = not any(c.get("_score_obj") is not None for c in candidates)
-            if is_tfidf_path and not has_cross_paper:
+            # TF-IDF fallback candidates never go to the batch — no LLM call.
+            if all(c.get("_source") == "tfidf" for c in candidates):
                 results[ki_page_id] = self._tfidf_suggestions(concept, candidates)
                 continue
+            has_cross_paper = any(c.get("_concept_data") is not None for c in candidates)
             kind = "v2" if has_cross_paper else "v1"
             custom_id = f"link_{idx}"
             requests.append({

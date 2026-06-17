@@ -64,6 +64,16 @@
   {% if paper.pdf_path or paper.arxiv_id or paper.arxiv_url or paper.doi %}
     <a class="btn sm" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noopener">View PDF</a>{% endif %}
   <a class="btn sm" href="/papers/{{ paper.id }}/concepts/new">+ Concept</a>
+  <form method="post" action="/papers/{{ paper.id }}/process"
+        onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Processing…'">
+    <button class="btn sm btn-primary" type="submit" title="Run extract → retrieve → link now">Process now</button>
+  </form>
+  {% if concepts %}
+    <form method="post" action="/papers/{{ paper.id }}/edges/regenerate"
+          onsubmit="return confirm('Regenerate edges for all concepts in this paper now?')">
+      <button class="btn sm" type="submit">Regenerate edges</button>
+    </form>
+  {% endif %}
   <a class="btn sm" href="/papers/{{ paper.id }}/scope">Selective parse / analyze</a>
   <a class="btn sm" href="/suggestions?paper_id={{ paper.id }}">Suggestions{% if suggestion_count %} ({{ suggestion_count }}){% endif %}</a>
   {% if counts and counts.verified %}

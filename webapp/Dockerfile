@@ -5,8 +5,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+COPY orchestrator/requirements.txt orchestrator/requirements.txt
 COPY webapp/requirements.txt webapp/requirements.txt
-RUN pip install --no-cache-dir -r webapp/requirements.txt
+RUN pip install --no-cache-dir -r orchestrator/requirements.txt -r webapp/requirements.txt
 
 # Pipeline modules (Store + metadata) — webapp/main.py adds ./orchestrator to sys.path.
 COPY orchestrator/ orchestrator/

@@ -50,10 +50,8 @@ jinja2>=3.1,<4
 # ── Vector index (Module 7) ───────────────────────────────────────────────────
 # Qdrant client — synchronous API used throughout VectorIndexEngine.
 qdrant-client==1.12.0
-# sentence-transformers/peft are OPTIONAL: only required when
-# VECTOR_EMBEDDING_BACKEND=local (SPECTER2 / other HuggingFace models).
-# Install them in a derived image or local venv for local embedding:
-#   pip install "sentence-transformers>=2.7" peft
+sentence-transformers>=2.7
+peft
 
 # ── Fuzzy string matching (Module 7 pre-filters) ─────────────────────────────
 # Used for named-tool match and setting-containment signals in cross-paper

@@ -147,6 +147,11 @@ class Store(ResearchStoreMixin):
                 stmt = stmt.where(Concept.state == state)
             return list(s.exec(stmt.order_by(Concept.title)))
 
+    def concepts_by_graph_link_status(self, status: str) -> list[Concept]:
+        with new_session(self._engine) as s:
+            stmt = select(Concept).where(Concept.graph_link_status == status)
+            return list(s.exec(stmt.order_by(Concept.updated_at)))
+
     def second_brain_index(self) -> list[Concept]:
         """Promoted concepts + hubs — the retrieval/candidate corpus."""
         with new_session(self._engine) as s:
@@ -261,6 +266,26 @@ class Store(ResearchStoreMixin):
                 Edge.status == EdgeStatus.PROPOSED.value,
             )
             return list(s.exec(stmt))
+
+    def delete_unverified_outgoing_edges(self, source_concept_ids: list[str]) -> int:
+        """Delete outgoing generated proposals that have not been accepted."""
+        if not source_concept_ids:
+            return 0
+        deleted = 0
+        with new_session(self._engine) as s:
+            edges = list(
+                s.exec(
+                    select(Edge).where(
+                        Edge.source_concept_id.in_(source_concept_ids),
+                        Edge.status != EdgeStatus.VERIFIED.value,
+                    )
+                )
+            )
+            for edge in edges:
+                s.delete(edge)
+                deleted += 1
+            s.commit()
+        return deleted
 
     def list_edges(self, *, status: str | None = None) -> list[Edge]:
         with new_session(self._engine) as s:

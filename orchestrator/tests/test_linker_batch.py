@@ -90,8 +90,8 @@ def test_run_stage_link_batch_resolves_local_and_batched_concepts():
     linker = _linker()
 
     # Item 0: no candidates → local empty ConceptLinkResult (no batch request).
-    # Item 1: TF-IDF only → local suggest-only result (no batch request).
-    # Item 2: cross-paper → needs the batch (custom_id "link_2").
+    # Item 1: TF-IDF only -> legacy v1 batch request.
+    # Item 2: cross-paper -> v2 batch request.
     concept_candidates = [
         (_concept("c0"), "ki-0", []),
         (_concept("c1"), "ki-1", [{"id": "x", "title": "X"}]),
@@ -111,21 +111,22 @@ def test_run_stage_link_batch_resolves_local_and_batched_concepts():
 
     def fake_submit(requests, run_id):
         captured["requests"] = requests
-        return {"link_2": _tool_message({"proposals": [edge], "low_confidence_suggestions": []})}
+        return {
+            "link_1": _tool_message({}),
+            "link_2": _tool_message({"proposals": [edge], "low_confidence_suggestions": []}),
+        }
 
     linker._submit_and_poll = fake_submit  # type: ignore[assignment]
 
     results = linker.run_stage_link_batch(concept_candidates, "run-xyz")
 
-    # Only the cross-paper concept produced a batch request.
-    assert len(captured["requests"]) == 1
-    assert captured["requests"][0]["custom_id"] == "link_2"
+    assert [r["custom_id"] for r in captured["requests"]] == ["link_1", "link_2"]
 
     assert isinstance(results["ki-0"], ConceptLinkResult)
     assert results["ki-0"].depends_on == []
 
-    assert isinstance(results["ki-1"], CrossPaperLinkResult)
-    assert len(results["ki-1"].proposals) == 1  # TF-IDF suggest-only
+    assert isinstance(results["ki-1"], ConceptLinkResult)
+    assert results["ki-1"].depends_on == []
 
     assert isinstance(results["ki-2"], CrossPaperLinkResult)
     assert len(results["ki-2"].proposals) == 1

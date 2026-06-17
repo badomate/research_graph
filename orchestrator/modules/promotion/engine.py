@@ -43,6 +43,14 @@ class PromotionEngine:
         self._zotero = ZoteroSync(
             self.store, self.config.zotero_user_id, self.config.zotero_api_key
         )
+        self._ingestion = None  # lazily built IngestionEngine for edge proposal
+
+    def _linker_engine(self):
+        """Lazily build (once per run) the IngestionEngine used to propose edges."""
+        if self._ingestion is None:
+            from ..ingestion.engine import IngestionEngine
+            self._ingestion = IngestionEngine(vector_index=self._vector_index, config=self.config)
+        return self._ingestion
 
     def run(self) -> None:
         logger.info("PromotionEngine: polling for s2-read papers ...")
@@ -85,6 +93,21 @@ class PromotionEngine:
                 logger.exception(
                     "PromotionEngine: promote failed for %s; error_type=%s",
                     concept.id, type(exc).__name__,
+                )
+
+        # Propose edges for the just-promoted concepts against the accepted graph.
+        # This is where edges are born — a concept links to everything you've
+        # accepted, not a stale snapshot from extraction time.
+        promoted_ids = [
+            c.id for c in self.store.concepts_for_paper(paper_id, state=ConceptState.PROMOTED.value)
+        ]
+        if promoted_ids:
+            try:
+                self._linker_engine().link_concepts_against_brain(promoted_ids)
+            except Exception:
+                logger.warning(
+                    "PromotionEngine: edge proposal failed for %s — promoted without edges.",
+                    paper_id, exc_info=True,
                 )
 
         edges_verified = self.store.verify_auto_edges_between_promoted()

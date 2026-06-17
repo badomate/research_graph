@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Debug · paper_pipeline{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Debug console</h1>
+  <form action="/debug/qdrant/ping" method="post" class="inline">
+    <button class="btn sm" type="submit">↻ refresh status</button>
+  </form>
+</div>
+{% if msg %}<div class="callout {{ 'bad' if 'fail' in msg.lower() else 'warn' }}">{{ msg }}</div>{% endif %}
+
+<div class="grid">
+  <!-- Qdrant -->
+  <div class="card">
+    <div class="card-title">Qdrant vector DB
+      <span class="pill status-{{ 'succeeded' if qdrant.available else 'failed' }}">
+        {{ 'connected' if qdrant.available else 'unavailable' }}</span>
+    </div>
+    <div class="muted">{{ qdrant.url }} · backend {{ qdrant.backend }} · enabled {{ qdrant.enabled }}</div>
+    {% if qdrant.error %}<div class="callout bad">{{ qdrant.error }}</div>{% endif %}
+    <table class="data">
+      <tr><th>collection</th><th>points</th></tr>
+      {% for col in qdrant.collections %}
+      <tr><td>{{ col.name }}</td><td>{{ col.points if col.points is not none else '?' }}</td></tr>
+      {% else %}<tr><td colspan="2" class="muted">no collections</td></tr>{% endfor %}
+    </table>
+    <form action="/debug/qdrant/rebuild" method="post"
+          onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Rebuilding… (may take a while)'">
+      <button class="btn btn-primary" type="submit">Rebuild vector index from SQLite</button>
+    </form>
+    <p class="muted">Drops + recreates all 3 collections and re-embeds every
+      Second-Brain concept. Use after wiping the index or changing the embedding model.</p>
+  </div>
+
+  <!-- Marker -->
+  <div class="card">
+    <div class="card-title">Marker proxy
+      <span class="pill status-{{ 'succeeded' if marker.ok else 'failed' }}">
+        {{ 'ok' if marker.ok else 'down' }}</span>
+    </div>
+    <div class="muted">{{ marker.url }}</div>
+    <pre class="json">{{ marker.detail }}</pre>
+  </div>
+
+  <!-- DB stats -->
+  <div class="card">
+    <div class="card-title">Database</div>
+    <table class="data">
+      <tr><td>papers</td><td>{{ stats.papers }}</td><td class="muted">{{ stats.papers_by_status }}</td></tr>
+      <tr><td>concepts</td><td>{{ stats.concepts }}</td><td class="muted">{{ stats.concepts_by_state }}</td></tr>
+      <tr><td>edges</td><td>{{ stats.edges }}</td><td class="muted">{{ stats.edges_by_status }}</td></tr>
+      <tr><td>parse jobs</td><td></td><td class="muted">{{ stats.parse_jobs }}</td></tr>
+      <tr><td>analysis jobs</td><td></td><td class="muted">{{ stats.analysis_jobs }}</td></tr>
+      <tr><td>suggestions</td><td></td><td class="muted">{{ stats.suggestions }}</td></tr>
+      <tr><td>math objects</td><td>{{ stats.math_objects }}</td><td></td></tr>
+    </table>
+  </div>
+
+  <!-- Actions -->
+  <div class="card">
+    <div class="card-title">Actions</div>
+    <div class="meta-row">
+      <form action="/debug/workers/drain" method="post" class="inline">
+        <button class="btn" type="submit">Run parse + analysis workers now</button>
+      </form>
+    </div>
+    <div class="meta-row">
+      <form action="/edges/regenerate" method="post" class="inline"
+            onsubmit="return confirm('Regenerate edges for ALL concepts? This calls the LLM and may cost money.')">
+        <button class="btn" type="submit">Regenerate all edges</button>
+      </form>
+    </div>
+    <p class="muted">Edge regeneration + the worker drain run in this webapp process,
+      so their output appears in the log panel below.</p>
+  </div>
+</div>
+
+<h2>Logs <span class="muted">(this webapp process · newest first)</span>
+  <button class="btn sm" type="button" hx-get="/debug/logs" hx-target="#log-tail" hx-swap="innerHTML">↻ refresh logs</button>
+</h2>
+<div id="log-tail">
+  {% include "partials/_debug_logs.html" %}
+</div>
+<p class="muted">Orchestrator (scheduler) logs are in its own container:
+  <code>docker compose logs -f orchestrator</code>.</p>
+{% endblock %}

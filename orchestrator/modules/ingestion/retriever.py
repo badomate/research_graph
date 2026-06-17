@@ -70,16 +70,23 @@ class CandidateRetriever:
         k: int | None = None,
         current_page_id: str | None = None,
         same_paper_ids: set | None = None,
+        restrict_to_ids: set | None = None,
     ) -> list[dict]:
         """
         Return top-k candidate concepts for linking.
 
         Uses Qdrant + pre-filter scoring when available; falls back to TF-IDF.
         Same-paper candidates bypass the pre-filter.
+
+        ``restrict_to_ids`` (when given) limits candidates to those concept ids —
+        SQLite is the source of truth for the *accepted* graph, so promotion-time
+        linking passes the promoted+hub ids here rather than trusting the vector
+        DB's (possibly stale) verified flag.
         """
         k = k or self._retrieve_candidates_k
         if not (self._vector_index and self._vector_index.available):
-            return self._tfidf_retrieve(concept, sb_index, k)
+            cands = self._tfidf_retrieve(concept, sb_index, k)
+            return self._restrict(cands, restrict_to_ids)
 
         hints = self._vector_index.retrieve_candidates(concept, verified_only=False)
         if current_page_id:
@@ -141,7 +148,21 @@ class CandidateRetriever:
             cross_paper_dicts = [d for _, d in scored[:self._edge_max_candidates_to_gpt]]
 
         same_paper_dicts = [h.to_dict() for h in same_paper_hints]
-        return same_paper_dicts + cross_paper_dicts
+        return self._restrict(same_paper_dicts + cross_paper_dicts, restrict_to_ids)
+
+    @staticmethod
+    def _cand_id(c: dict) -> str:
+        cd = c.get("_concept_data")
+        if cd is not None:
+            return getattr(cd, "notion_page_id", "") or c.get("id", "")
+        return c.get("id", "")
+
+    @classmethod
+    def _restrict(cls, candidates: list[dict], restrict_to_ids: set | None) -> list[dict]:
+        """Keep only candidates whose concept id is in the allowed set (SQLite truth)."""
+        if not restrict_to_ids:
+            return candidates
+        return [c for c in candidates if cls._cand_id(c) in restrict_to_ids]
 
     def _tfidf_retrieve(
         self, concept: MathObject, sb_index: list[dict], k: int = RETRIEVE_CANDIDATES_K
@@ -159,12 +180,23 @@ class CandidateRetriever:
         for record in sb_index:
             bag = record.get("keywords_bag", set())
             overlap = len(concept_tokens & bag)
-            score = overlap / math.log(1.0 + len(bag))
+            # Require real keyword overlap. Without this gate every concept (even
+            # those sharing zero tokens) was returned as a candidate, so the linker
+            # proposed edges between everything → a near-complete graph whenever
+            # Qdrant was unavailable. A same-hub bonus is only a tie-breaker among
+            # genuine matches, never a reason to link unrelated concepts.
+            if overlap == 0:
+                continue
+            score = overlap / math.log(1.0 + len(bag)) if bag else float(overlap)
             if record.get("hub") and record["hub"] == concept.suggested_hub:
                 score += 0.2
             scored.append((score, record))
 
         scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            logger.debug(
+                "TF-IDF fallback: no keyword-overlapping candidates for '%s'.", concept.title
+            )
         return [
             {
                 "id": r["id"],
@@ -172,6 +204,9 @@ class CandidateRetriever:
                 "hub": r.get("hub", ""),
                 "summary": r.get("summary", ""),
                 "score": round(float(score), 4),
+                # Tag so the linker can route these to the no-LLM suggest path:
+                # TF-IDF keyword overlap is too weak to spend an LLM call confirming.
+                "_source": "tfidf",
             }
             for score, r in scored[:k]
         ]

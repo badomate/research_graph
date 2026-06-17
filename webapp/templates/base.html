@@ -25,6 +25,7 @@
       <a href="/math" {% if request.url.path.startswith('/math') %}class="active"{% endif %}>Math</a>
       <a href="/brain" {% if request.url.path == '/brain' %}class="active"{% endif %}>Brain</a>
       <a href="/graph" {% if request.url.path == '/graph' %}class="active"{% endif %}>Graph</a>
+      <a href="/debug" {% if request.url.path.startswith('/debug') %}class="active"{% endif %}>Debug</a>
     </nav>
     <form class="nav-search" action="/search" method="get" role="search">
       <input name="q" placeholder="Search concepts…" value="{{ q if request.url.path == '/search' else '' }}"

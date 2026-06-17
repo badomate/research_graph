@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 EXTRACTION_VERSION: str = os.environ.get("EXTRACTION_VERSION", "v3")
+EDGE_REGEN_PENDING = "regen-pending"
 
 
 def _now():
@@ -85,11 +86,12 @@ class IngestionEngine:
         logger.info("Ingestion: polling for s1-skim and s2-reextract papers ...")
         pages = self.store.get_papers_by_status(PaperStatus.S1_SKIM.value)
         pages_to_reextract = self.store.get_papers_by_status(PaperStatus.S2_REEXTRACT.value)
+        edge_regen = self.store.concepts_by_graph_link_status(EDGE_REGEN_PENDING)
         logger.info(
-            "Ingestion: found %d paper(s) to extract, %d to re-extract.",
-            len(pages), len(pages_to_reextract),
+            "Ingestion: found %d paper(s) to extract, %d to re-extract, %d concept(s) queued for edge regeneration.",
+            len(pages), len(pages_to_reextract), len(edge_regen),
         )
-        if not pages and not pages_to_reextract:
+        if not pages and not pages_to_reextract and not edge_regen:
             return
 
         hubs = self.store.hubs()
@@ -110,27 +112,58 @@ class IngestionEngine:
                 logger.exception(
                     "Failed re-extraction for paper %s; error_type=%s", paper.id, type(exc).__name__
                 )
+        if edge_regen:
+            self._regenerate_edges(edge_regen, sb_index)
 
     # -- Index helpers ---------------------------------------------------------
 
     def _build_second_brain_index(self) -> list[dict]:
         records: list[dict] = []
         for c in self.store.second_brain_index():
-            bag: set = set()
-            bag |= _tokenise(c.effective_title)
-            for kw in (c.canonical_keywords or []):
-                bag |= _tokenise(kw)
-            for tag in (c.setting or []):
-                bag |= _tokenise(tag)
-            records.append({
-                "id": c.id,
-                "title": c.effective_title,
-                "hub": c.suggested_hub or "",
-                "summary": c.conclusion or "",
-                "tags": list(c.setting or []),
-                "keywords_bag": bag,
-            })
+            records.append(self._concept_index_record(c))
         return records
+
+    @staticmethod
+    def _concept_index_record(c) -> dict:
+        bag: set = set()
+        bag |= _tokenise(c.effective_title)
+        for kw in (c.canonical_keywords or []):
+            bag |= _tokenise(kw)
+        for tag in (c.setting or []):
+            bag |= _tokenise(tag)
+        return {
+            "id": c.id,
+            "title": c.effective_title,
+            "hub": c.suggested_hub or "",
+            "summary": c.conclusion or "",
+            "tags": list(c.setting or []),
+            "keywords_bag": bag,
+        }
+
+    @staticmethod
+    def _math_object_from_concept(c) -> MathObject:
+        return MathObject(
+            type=c.type or "Definition",
+            title=c.effective_title or c.title or "Untitled concept",
+            statement_latex=c.statement_latex or c.conclusion or c.interpretation or "",
+            assumptions=c.assumptions or "None explicitly stated.",
+            variables=c.variables or "",
+            conclusion=c.conclusion or "",
+            source_pages=list(c.source_pages or []),
+            source_quotes=c.source_quote or None,
+            confidence=c.ai_confidence or 1.0,
+            suggested_hub=c.suggested_hub or "Uncategorized",
+            interpretation=c.interpretation or "",
+            proof_idea=c.proof_idea or "",
+            source_anchors=c.source_anchors or "",
+            named_tools=list(c.named_tools or []),
+            setting=list(c.setting or []),
+            result_category=c.result_category or "",
+            canonical_keywords=list(c.canonical_keywords or []),
+            prereq_keywords=list(c.prereq_keywords or []),
+            downstream_keywords=list(c.downstream_keywords or []),
+            aliases=c.aliases or "",
+        )
 
     # -- Per-paper pipeline ----------------------------------------------------
 
@@ -185,25 +218,29 @@ class IngestionEngine:
                 logger.warning("Ingestion: all concepts rejected for %s.", paper_id)
                 return
 
-            self._inject_concepts_into_index(ki_pages, sb_index)
+            # Edges are proposed at PROMOTION time against the accepted graph (see
+            # link_concepts_against_brain), not here — a fresh inbox concept would
+            # otherwise be linked against a stale/sparse Second Brain and waste LLM
+            # calls on concepts that may be rejected. Opt back in with
+            # LINK_AT_EXTRACTION=true.
+            if self.config.link_at_extraction:
+                self._inject_concepts_into_index(ki_pages, sb_index)
+                structured_log(logger, "info", "Stage 2: retrieving candidates", run_id=run_id)
+                all_ids = {cid for _, cid in ki_pages}
+                concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
+                for concept, cid in ki_pages:
+                    candidates = self._retriever.retrieve_candidates_for_concept(
+                        concept, sb_index, current_page_id=cid, same_paper_ids=all_ids - {cid},
+                    )
+                    concept_candidates.append((concept, cid, candidates))
+                if job_id is not None:
+                    self._ledger.update_status(job_id, "retrieve_done")
 
-            # Stage 2: retrieve
-            structured_log(logger, "info", "Stage 2: retrieving candidates", run_id=run_id)
-            all_ids = {cid for _, cid in ki_pages}
-            concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
-            for concept, cid in ki_pages:
-                candidates = self._retriever.retrieve_candidates_for_concept(
-                    concept, sb_index, current_page_id=cid, same_paper_ids=all_ids - {cid},
-                )
-                concept_candidates.append((concept, cid, candidates))
+                structured_log(logger, "info", "Stage 3: LLM linking", run_id=run_id)
+                self._run_link_stage(concept_candidates, run_id)
+                if job_id is not None:
+                    self._ledger.update_status(job_id, "link_done")
             if job_id is not None:
-                self._ledger.update_status(job_id, "retrieve_done")
-
-            # Stage 3: link
-            structured_log(logger, "info", "Stage 3: LLM linking", run_id=run_id)
-            self._run_link_stage(concept_candidates, run_id)
-            if job_id is not None:
-                self._ledger.update_status(job_id, "link_done")
                 self._ledger.update_status(job_id, "notion_done")
                 self._ledger.finish_job(job_id)
 
@@ -324,6 +361,84 @@ class IngestionEngine:
                 self._concept_writer.write_edges(cid, link_result)
             except Exception:
                 logger.exception("[%s] Link stage failed for '%s'.", run_id, concept.title)
+
+    def _regenerate_edges(self, concepts, sb_index: list[dict]) -> None:
+        run_id = uuid.uuid4().hex[:8]
+        concept_ids = [c.id for c in concepts]
+        deleted = self.store.delete_unverified_outgoing_edges(concept_ids)
+        logger.info(
+            "[%s] Edge regeneration: %d concept(s), deleted %d unverified outgoing edge(s).",
+            run_id, len(concepts), deleted,
+        )
+
+        index_by_id = {r["id"]: r for r in sb_index}
+        for c in self.store.list_concepts():
+            index_by_id.setdefault(c.id, self._concept_index_record(c))
+        regen_index = list(index_by_id.values())
+
+        concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
+        concepts_by_paper: dict[str, set[str]] = {}
+        for c in concepts:
+            if c.paper_id and c.paper_id not in concepts_by_paper:
+                concepts_by_paper[c.paper_id] = {
+                    pc.id for pc in self.store.concepts_for_paper(c.paper_id)
+                }
+            same_paper_ids = concepts_by_paper.get(c.paper_id or "", set()) - {c.id}
+            math_object = self._math_object_from_concept(c)
+            candidates = self._retriever.retrieve_candidates_for_concept(
+                math_object,
+                regen_index,
+                current_page_id=c.id,
+                same_paper_ids=same_paper_ids,
+            )
+            concept_candidates.append((math_object, c.id, candidates))
+
+        self._run_link_stage(concept_candidates, run_id)
+        for c in concepts:
+            refreshed = self.store.get_concept(c.id)
+            if refreshed and refreshed.graph_link_status == EDGE_REGEN_PENDING:
+                self.store.update_concept(c.id, graph_link_status="unlinked")
+
+    def link_concepts_against_brain(self, concept_ids: list[str]) -> int:
+        """Propose edges for the given (just-promoted) concepts against the accepted
+        graph — promoted + hub concepts, plus the batch being promoted together.
+
+        This is the authoritative edge-proposal step: it runs when a concept enters
+        the Second Brain, so it links to everything you've actually accepted (not a
+        stale snapshot from extraction time). It first clears the concepts' stale
+        unverified outgoing edges, restricts candidates to the accepted graph using
+        SQLite as the source of truth, and writes fresh proposed edges. Returns the
+        number of concepts linked.
+        """
+        concepts = [c for cid in concept_ids if (c := self.store.get_concept(cid)) is not None]
+        if not concepts:
+            return 0
+        run_id = uuid.uuid4().hex[:8]
+
+        self.store.delete_unverified_outgoing_edges([c.id for c in concepts])
+
+        sb_index = self._build_second_brain_index()          # promoted + hub
+        accepted_ids = {r["id"] for r in sb_index}
+        batch_ids = {c.id for c in concepts}
+        # The batch is part of the accepted graph for this pass (cross-link within it).
+        accepted_ids |= batch_ids
+
+        concept_candidates: list[tuple[MathObject, str, list[dict]]] = []
+        for c in concepts:
+            mo = self._math_object_from_concept(c)
+            candidates = self._retriever.retrieve_candidates_for_concept(
+                mo, sb_index, current_page_id=c.id,
+                same_paper_ids=batch_ids - {c.id},   # batch-mates bypass the pre-filter
+                restrict_to_ids=accepted_ids,        # accepted graph only (SQLite truth)
+            )
+            concept_candidates.append((mo, c.id, candidates))
+
+        logger.info(
+            "[%s] Promotion linking: %d concept(s) against %d accepted node(s).",
+            run_id, len(concepts), len(accepted_ids),
+        )
+        self._run_link_stage(concept_candidates, run_id)
+        return len(concepts)
 
     def _inject_concepts_into_index(self, ki_pages, sb_index: list[dict]) -> None:
         for concept, cid in ki_pages:
