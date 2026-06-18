@@ -5,17 +5,13 @@
   <div class="callout {% if imported == '-1' %}bad{% else %}warn{% endif %}">
     {% if imported == '-1' %}Zotero sync failed — check ZOTERO_USER_ID / ZOTERO_API_KEY and the logs.
     {% elif imported == '0' %}Zotero sync: no new papers.
-    {% else %}Imported {{ imported }} new paper(s) from Zotero (now in Inbox — set them to Queued to process).{% endif %}
+    {% else %}Imported {{ imported }} new paper(s) from Zotero — they're in <strong>Inbox</strong>; press <strong>Process</strong>.{% endif %}
   </div>
 {% endif %}
 
 <div class="page-head">
   <h1>Papers <span class="muted">{{ total }}</span></h1>
   <div class="row">
-    <form method="post" action="/edges/regenerate"
-          onsubmit="return confirm('Regenerate edges for every concept now? This may take a while.')">
-      <button class="btn sm" type="submit">Regenerate all edges</button>
-    </form>
     {% if zotero_configured %}
     <form method="post" action="/zotero/sync"><button class="btn sm" type="submit">⟳ Sync Zotero</button></form>
     {% endif %}
@@ -23,8 +19,18 @@
       <input name="q" value="{{ q }}" placeholder="Filter papers…" autocomplete="off">
       <button class="btn sm" type="submit">Filter</button>
     </form>
+    <a class="btn sm btn-primary" href="/papers/new">+ Add</a>
   </div>
 </div>
+
+{# ── How it works (the workflow, always in view) ── #}
+<ol class="workflow">
+  <li><strong>Add</strong> a paper</li>
+  <li><strong>Process</strong> — extract concepts</li>
+  <li><strong>Review</strong> &amp; accept concepts</li>
+  <li><strong>Promote</strong> — builds the edges</li>
+  <li>explore in <a href="/graph">Graph</a> / <a href="/brain">Brain</a></li>
+</ol>
 
 {% if not columns %}
   <div class="empty">No papers{% if q %} match "{{ q }}"{% endif %}. <a href="/papers/new">Add one</a>.</div>
@@ -32,9 +38,11 @@
 
 {% for col in columns %}
 <div class="section-h"><span class="dot" style="--c:{{ col.meta.color }}"></span>
-  {{ col.meta.label }} <span class="muted">{{ col.papers|length }}</span></div>
+  {{ col.meta.label }} <span class="muted">{{ col.papers|length }}</span>
+  <span class="stage-blurb">{{ col.meta.blurb }}</span></div>
 <div class="rows">
-  {% for p in col.papers %}
+  {% for item in col.papers %}
+  {% set p = item.p %}
   <div class="drow">
     <div class="main">
       <a class="title" href="/papers/{{ p.id }}">{{ p.title }}</a>
@@ -44,10 +52,15 @@
       {% if p.pdf_path or p.arxiv_id or p.arxiv_url or p.doi %}
         <a class="btn sm" href="/papers/{{ p.id }}/pdf" target="_blank" rel="noopener" title="view PDF">PDF</a>{% endif %}
       {% if p.extraction_count %}<span class="muted nowrap">{{ p.extraction_count }} concepts</span>{% endif %}
-      {% if p.status == 's2-extracted' %}
-        <a class="btn sm btn-primary" href="/papers/{{ p.id }}/review">Review</a>
-      {% elif p.status == 'blocked-extraction' %}
-        <span class="pill bad-pill">blocked</span>
+      {% if item.next %}
+        {% if item.next.method == 'post' %}
+          <form method="post" action="{{ item.next.href }}"
+                onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='…'">
+            <button class="btn sm btn-primary" type="submit">{{ item.next.label }}</button>
+          </form>
+        {% else %}
+          <a class="btn sm btn-primary" href="{{ item.next.href }}">{{ item.next.label }}</a>
+        {% endif %}
       {% endif %}
     </div>
   </div>

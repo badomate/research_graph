@@ -223,3 +223,41 @@ textarea { width:100%; font-family:ui-monospace,monospace; font-size:.8rem; }
   max-height:460px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
 .card .json { background:#0b0d10; color:#cdd3da; padding:6px; border-radius:5px;
   font-size:.72rem; max-height:120px; overflow:auto; }
+
+/* ── Workflow guide + stages + next-step ── */
+.workflow { display:flex; flex-wrap:wrap; gap:6px 10px; list-style:none; padding:8px 12px;
+  margin:10px 0 16px; counter-reset:step; border:1px dashed var(--border); border-radius:8px;
+  background:var(--surface); font-size:.82rem; }
+.workflow li { counter-increment:step; color:var(--muted,#8a8f98); }
+.workflow li::before { content:counter(step); display:inline-grid; place-items:center;
+  width:1.2rem; height:1.2rem; margin-right:5px; border-radius:50%; background:var(--border);
+  color:var(--text); font-size:.7rem; }
+.workflow li strong { color:var(--text); }
+.stage-blurb { font-size:.78rem; color:var(--muted,#8a8f98); font-weight:400; margin-left:8px; }
+.next-step { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:10px 0;
+  padding:10px 14px; border-left:3px solid var(--ok); border-radius:6px;
+  background:color-mix(in srgb, var(--ok) 8%, transparent); }
+.more-panel { display:flex; flex-direction:column; gap:10px; margin-top:8px; padding:10px;
+  border:1px solid var(--border); border-radius:6px; }
+.more-row { display:flex; flex-direction:column; gap:4px; font-size:.8rem; color:var(--muted,#8a8f98); }
+.more-row .inp { min-width:240px; }
+
+/* ── Toast (flash feedback) ── */
+.toast { position:fixed; right:16px; bottom:16px; z-index:60; max-width:min(420px,calc(100vw - 32px));
+  display:flex; align-items:flex-start; gap:10px; padding:11px 12px 11px 14px; border-radius:8px;
+  background:var(--surface); color:var(--text); border:1px solid var(--border);
+  border-left:4px solid var(--accent); box-shadow:0 6px 24px rgba(0,0,0,.18);
+  font-size:.86rem; line-height:1.35; animation:toast-in .22s ease-out; }
+.toast-ok   { border-left-color:var(--ok); }
+.toast-warn { border-left-color:var(--warn); }
+.toast-bad  { border-left-color:var(--bad); }
+.toast-x { background:none; border:none; color:var(--muted); font-size:1.1rem; line-height:1;
+  cursor:pointer; padding:0 2px; }
+.toast-out { animation:toast-out .55s ease-in forwards; }
+@keyframes toast-in { from { transform:translateY(12px); opacity:0; } to { transform:none; opacity:1; } }
+@keyframes toast-out { to { transform:translateY(12px); opacity:0; } }
+@media (max-width:640px) { .toast { left:16px; right:16px; max-width:none; } }
+
+/* ── Nav utility (Debug gear) ── */
+.nav-util { font-size:1rem; opacity:.7; }
+.nav-util:hover, .nav-util.active { opacity:1; text-decoration:none; }

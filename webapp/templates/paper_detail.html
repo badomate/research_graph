@@ -6,13 +6,28 @@
 </div>
 
 <h1>{{ paper.title }}</h1>
-{% set sm = status_meta.get(paper.status, {"label": paper.status, "color": "#888"}) %}
 <div class="row">
-  <span class="pill" style="--c:{{ sm.color }}">{{ sm.label }}</span>
+  <span class="pill" style="--c:{{ stage.color }}">{{ stage.label }}</span>
   {% if paper.authors %}<span class="muted">{{ paper.authors }}</span>{% endif %}
   {% if paper.arxiv_id %}<a class="muted" href="https://arxiv.org/abs/{{ paper.arxiv_id }}" target="_blank" rel="noopener">arXiv:{{ paper.arxiv_id }}</a>{% endif %}
   {% if paper.doi %}<a class="muted" href="https://doi.org/{{ paper.doi }}" target="_blank" rel="noopener">doi</a>{% endif %}
 </div>
+
+{# ── Next step: the one thing to do now ── #}
+{% if next_action %}
+<div class="next-step">
+  <span class="muted">{{ stage.blurb }}</span>
+  {% if next_action.method == 'post' %}
+    <form method="post" action="{{ next_action.href }}"
+          onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Working…'">
+      <button class="btn btn-primary" type="submit">{{ next_action.label }}</button>
+    </form>
+  {% else %}
+    <a class="btn btn-primary" href="{{ next_action.href }}">{{ next_action.label }}</a>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if paper.one_liner %}<p class="lead">{{ paper.one_liner }}</p>{% endif %}
 {% if paper.extraction_error %}<div class="callout bad">{{ paper.extraction_error }}</div>{% endif %}
 
@@ -58,54 +73,47 @@
   </details>
 </div>
 
-{# ── Action bar ── #}
+{# ── Secondary actions (the primary one is the Next-step button above) ── #}
 <div class="toolbar">
-  {% if concepts %}<a class="btn sm btn-primary" href="/papers/{{ paper.id }}/review">Review ({{ concepts|length }})</a>{% endif %}
   {% if paper.pdf_path or paper.arxiv_id or paper.arxiv_url or paper.doi %}
     <a class="btn sm" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noopener">View PDF</a>{% endif %}
+  <a class="btn sm" href="/papers/{{ paper.id }}/scope">Parse / analyze pages</a>
+  <a class="btn sm" href="/suggestions?paper_id={{ paper.id }}">Suggestions{% if suggestion_count %} ({{ suggestion_count }}){% endif %}</a>
   <a class="btn sm" href="/papers/{{ paper.id }}/concepts/new">+ Concept</a>
-  <form method="post" action="/papers/{{ paper.id }}/process"
-        onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Processing…'">
-    <button class="btn sm btn-primary" type="submit" title="Run extract → retrieve → link now">Process now</button>
-  </form>
   {% if concepts %}
     <form method="post" action="/papers/{{ paper.id }}/edges/regenerate"
-          onsubmit="return confirm('Regenerate edges for all concepts in this paper now?')">
-      <button class="btn sm" type="submit">Regenerate edges</button>
-    </form>
-  {% endif %}
-  <a class="btn sm" href="/papers/{{ paper.id }}/scope">Selective parse / analyze</a>
-  <a class="btn sm" href="/suggestions?paper_id={{ paper.id }}">Suggestions{% if suggestion_count %} ({{ suggestion_count }}){% endif %}</a>
-  {% if counts and counts.verified %}
-    <form method="post" action="/papers/{{ paper.id }}/promote"
-          onsubmit="return confirm('Promote {{ counts.verified }} verified concept(s)?')">
-      <button class="btn sm btn-primary" type="submit">Promote {{ counts.verified }} →</button>
+          onsubmit="return confirm('Re-propose edges for this paper now?')">
+      <button class="btn sm" type="submit">Refresh edges</button>
     </form>
   {% endif %}
   <span class="grow"></span>
   {% if counts and counts.total %}
-    <span class="muted nowrap">{{ counts.verified }}/{{ counts.total }} verified</span>
+    <span class="muted nowrap">{{ counts.verified }}/{{ counts.total }} accepted</span>
     <span class="progress"><i style="width: {{ 100 * counts.verified / counts.total }}%"></i></span>
   {% endif %}
-  <details><summary class="btn sm">Status…</summary>
-    <form class="row" method="post" action="/papers/{{ paper.id }}/status" style="margin-top:6px">
-      <select name="status" aria-label="set status">
-        {% for s, m in status_meta.items() %}
-        <option value="{{ s }}" {% if s == paper.status %}selected{% endif %}>{{ m.label }} ({{ s }})</option>{% endfor %}
-      </select>
-      <button class="btn sm" type="submit">Set</button>
-    </form>
-  </details>
-  <details><summary class="btn sm">Zotero link…</summary>
-    <form class="row" method="post" action="/papers/{{ paper.id }}/link" style="margin-top:6px">
-      <input class="inp" name="zotero_uri" value="{{ paper.zotero_uri }}"
-             placeholder="https://www.zotero.org/users/…/items/XXXXXXXX" aria-label="Zotero URI" style="flex:1;min-width:240px">
-      <button class="btn sm" type="submit">Link</button>
-    </form>
+  <details><summary class="btn sm">More…</summary>
+    <div class="more-panel">
+      <label class="more-row">Zotero link
+        <form class="row" method="post" action="/papers/{{ paper.id }}/link">
+          <input class="inp" name="zotero_uri" value="{{ paper.zotero_uri }}"
+                 placeholder="https://www.zotero.org/…/items/XXXXXXXX" aria-label="Zotero URI">
+          <button class="btn sm" type="submit">Link</button>
+        </form>
+      </label>
+      <label class="more-row">Force stage <span class="muted">(rarely needed)</span>
+        <form class="row" method="post" action="/papers/{{ paper.id }}/status">
+          <select name="status" aria-label="set stage">
+            {% for s, m in status_meta.items() %}
+            <option value="{{ s }}" {% if s == paper.status %}selected{% endif %}>{{ m.label }}</option>{% endfor %}
+          </select>
+          <button class="btn sm" type="submit">Set</button>
+        </form>
+      </label>
+    </div>
   </details>
 </div>
 {% if paper.extraction_error and 'Zotero URI' in paper.extraction_error %}
-  <p class="muted">Tip: in Zotero, right-click the item → <em>Copy Zotero URI</em>, paste it in “Zotero link”, then set status to Queued. The PDF must also be synced to Koofr.</p>
+  <p class="muted">Tip: in Zotero, right-click the item → <em>Copy Zotero URI</em>, paste it under “More… → Zotero link”, then press <strong>Process now</strong>. The PDF must also be synced to Koofr.</p>
 {% endif %}
 
 <div class="section-h">Concepts <span class="muted">{{ concepts|length }}</span></div>

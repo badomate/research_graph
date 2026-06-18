@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 _ORCH = (Path(__file__).resolve().parent.parent / "orchestrator").resolve()
@@ -103,6 +104,27 @@ def render(name: str, ctx: dict):
     """
     return _template_response(ctx["request"], name, ctx)
 
+
+def _redirect(url: str, msg: str = "", kind: str = "ok"):
+    """303 redirect that drops a one-shot flash message (shown as a toast on the
+    next page). ``kind`` ∈ {ok, warn, bad}. The cookie is cleared after display."""
+    resp = RedirectResponse(url=url, status_code=303)
+    if msg:
+        resp.set_cookie("flash", urllib.parse.quote(f"{kind}|{msg}"),
+                        max_age=30, path="/", httponly=False, samesite="lax")
+    return resp
+
+
+def _read_flash(request: Request) -> dict | None:
+    raw = request.cookies.get("flash")
+    if not raw:
+        return None
+    try:
+        kind, _, text = urllib.parse.unquote(raw).partition("|")
+        return {"kind": kind or "ok", "text": text} if text else None
+    except Exception:
+        return None
+
 app = FastAPI(title="paper_pipeline")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
@@ -136,6 +158,50 @@ VERIF_META = {
 }
 
 
+# ── User-facing workflow stages ──────────────────────────────────────────────────
+# The pipeline has 9 internal statuses (s0-inbox … s3-distilled) — Notion-era
+# bookkeeping. The UI only ever shows these 4 stages, in order, each with the one
+# action that moves a paper forward. Internal statuses map onto them here.
+
+STAGES: list[tuple[str, dict]] = [
+    ("inbox",     {"label": "Inbox",     "color": "#8d99ae", "blurb": "Added — not processed yet."}),
+    ("attention", {"label": "Needs you", "color": "#c98a4b", "blurb": "Needs a PDF or a re-run."}),
+    ("review",    {"label": "To review", "color": "#4a8fbf", "blurb": "Concepts extracted — review, then promote."}),
+    ("done",      {"label": "In your brain", "color": "#5aa469", "blurb": "Promoted; edges proposed."}),
+]
+STAGE_META = dict(STAGES)
+STAGE_ORDER = [k for k, _ in STAGES]
+_STATUS_TO_STAGE = {
+    "s0-inbox": "inbox", "s1-skim": "inbox", "s1-processing": "inbox",
+    "s1b-waiting-attachment": "attention", "blocked-extraction": "attention",
+    "s2-extracted": "review", "s2-reextract": "review", "s2-read": "review",
+    "s3-distilled": "done",
+}
+
+
+def paper_stage(status: str) -> str:
+    return _STATUS_TO_STAGE.get(status, "inbox")
+
+
+def paper_next_action(paper) -> dict | None:
+    """The single 'what's next' call-to-action for a paper, by stage. Returns
+    {label, href, method} or None when nothing is pending."""
+    stage = paper_stage(paper.status)
+    pid = paper.id
+    if stage == "inbox":
+        return {"label": "Process now", "href": f"/papers/{pid}/process", "method": "post"}
+    if stage == "attention":
+        if paper.status == "s1b-waiting-attachment":
+            return {"label": "Add PDF / Zotero link", "href": f"/papers/{pid}", "method": "get"}
+        return {"label": "Re-run", "href": f"/papers/{pid}/process", "method": "post"}
+    if stage == "review":
+        n = store.paper_review_counts(pid)
+        if n.get("verified"):
+            return {"label": f"Promote {n['verified']} →", "href": f"/papers/{pid}/promote", "method": "post"}
+        return {"label": "Review concepts", "href": f"/papers/{pid}/review", "method": "get"}
+    return None
+
+
 PAPER_ROLES = [r.value for r in PaperRole]
 ANALYSIS_TYPES = [a.value for a in AnalysisType]
 SCOPE_PURPOSES = [p.value for p in ScopePurpose]
@@ -165,9 +231,11 @@ def _ctx(request: Request, **extra) -> dict:
     ))
     base = {
         "request": request, "status_meta": STATUS_META, "verif_meta": VERIF_META,
+        "stage_meta": STAGE_META, "stage_order": STAGE_ORDER,
         "pending_review": pending, "concept_types": CONCEPT_TYPES, "relation_types": RELATION_TYPES,
         "pending_suggestions": len(store.list_suggestions(status=SuggestionStatus.PENDING.value)),
         "paper_roles": PAPER_ROLES, "analysis_types": ANALYSIS_TYPES, "scope_purposes": SCOPE_PURPOSES,
+        "flash": _read_flash(request),
     }
     base.update(extra)
     return base
@@ -196,12 +264,15 @@ def dashboard(request: Request, q: str = "", imported: str = ""):
     if q.strip():
         ql = q.lower()
         papers = [p for p in papers if ql in p.title.lower() or ql in (p.authors or "").lower()]
-    by_status: dict[str, list] = {}
+    by_stage: dict[str, list] = {}
     for p in papers:
-        by_status.setdefault(p.status, []).append(p)
+        by_stage.setdefault(paper_stage(p.status), []).append(p)
     columns = [
-        {"status": s, "meta": STATUS_META.get(s, {"label": s, "color": "#888"}), "papers": by_status.get(s, [])}
-        for s in STATUS_ORDER if by_status.get(s)
+        {
+            "stage": k, "meta": STAGE_META[k],
+            "papers": [{"p": p, "next": paper_next_action(p)} for p in by_stage[k]],
+        }
+        for k in STAGE_ORDER if by_stage.get(k)
     ]
     zotero_configured = bool(os.environ.get("ZOTERO_USER_ID") and os.environ.get("ZOTERO_API_KEY"))
     return render("papers.html", _ctx(
@@ -349,6 +420,7 @@ def paper_detail(request: Request, paper_id: str):
     concepts = store.concepts_for_paper(paper_id)
     return render("paper_detail.html", _ctx(
         request, paper=paper, concepts=concepts, counts=store.paper_review_counts(paper_id),
+        stage=STAGE_META[paper_stage(paper.status)], next_action=paper_next_action(paper),
         orgs=_paper_orgs(paper_id), all_tags=store.list_tags(),
         all_collections=store.list_collections(), all_projects=store.list_projects(),
         suggestion_count=len(store.list_suggestions(paper_id=paper_id, status=SuggestionStatus.PENDING.value))))
@@ -391,23 +463,37 @@ def set_paper_status(paper_id: str, status: str = Form(...)):
 
 @app.post("/papers/{paper_id}/promote")
 def promote_paper(paper_id: str):
-    store.promote_paper(paper_id)
+    res = store.promote_paper(paper_id)
     # Edges are born here: propose them for the just-promoted concepts against the
     # current accepted graph (now, synchronously).
     _link_promoted_now(paper_id)
-    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+    n = res.get("promoted", 0)
+    if n:
+        return _redirect(f"/papers/{paper_id}",
+                         f"Promoted {n} concept(s) to your brain and proposed their edges. "
+                         f"See them in Graph.", "ok")
+    return _redirect(f"/papers/{paper_id}", "Nothing to promote — accept some concepts first.", "warn")
 
 
 @app.post("/papers/{paper_id}/process")
 def process_paper_now(paper_id: str):
-    """Run the full extract→retrieve→link pipeline for this paper right now."""
+    """Extract concepts from this paper right now."""
     paper = store.get_paper(paper_id)
-    if paper is not None:
-        try:
-            _process_paper_now(paper)
-        except Exception as exc:  # surface failure on the paper instead of a 500
-            store.update_paper(paper_id, extraction_error=f"Process failed: {exc}")
-    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+    if paper is None:
+        return _redirect("/", "Paper not found.", "bad")
+    try:
+        _process_paper_now(paper)
+    except Exception as exc:  # surface failure instead of a 500
+        store.update_paper(paper_id, extraction_error=f"Process failed: {exc}")
+        return _redirect(f"/papers/{paper_id}", f"Processing failed: {exc}", "bad")
+    fresh = store.get_paper(paper_id)
+    if fresh and fresh.extraction_count:
+        return _redirect(
+            f"/papers/{paper_id}",
+            f"Extracted {fresh.extraction_count} concept(s). Review & accept them, then Promote.", "ok")
+    if fresh and fresh.extraction_error:
+        return _redirect(f"/papers/{paper_id}", f"Couldn't process: {fresh.extraction_error[:160]}", "bad")
+    return _redirect(f"/papers/{paper_id}", "Processing finished (no concepts extracted).", "warn")
 
 
 # ── Manual concept authoring ────────────────────────────────────────────────────
@@ -635,10 +721,10 @@ def graph_json(verified_only: bool = True):
     return JSONResponse(store.graph_data(verified_only=verified_only))
 
 
-@app.get("/search", response_class=HTMLResponse)
-def search(request: Request, q: str = ""):
-    results = store.query_concepts(q=q, sort="confidence") if q.strip() else []
-    return render("search.html", _ctx(request, q=q, results=results))
+@app.get("/search")
+def search(q: str = ""):
+    # Consolidated into the unified search at /find (papers + concepts).
+    return RedirectResponse(url=f"/find?q={urllib.parse.quote(q)}", status_code=307)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -858,7 +944,7 @@ def organize_paper(paper_id: str, kind: str = Form(...), target_id: str = Form("
         proj_id = target_id or (store.create_project(new_name).id if new_name else "")
         if proj_id:
             store.add_paper_to_project(paper_id, proj_id, role=role)
-    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+    return _redirect(f"/papers/{paper_id}", f"Added to {kind}.", "ok")
 
 
 @app.post("/papers/{paper_id}/organize/remove")
@@ -878,14 +964,16 @@ def organize_remove(paper_id: str, kind: str = Form(...), target_id: str = Form(
 def find_page(request: Request, q: str = "", mode: str = "exact"):
     results: list = []
     sem_results: list = []
+    concepts: list = []
     if q.strip():
         if mode == "semantic":
             from modules.semantic_search import semantic_search
             sem_results = semantic_search(store, q)
         else:
             results = store.search_papers(q)
+            concepts = store.query_concepts(q=q, sort="confidence")[:20]
     return render("find.html", _ctx(
-        request, q=q, mode=mode, results=results, sem_results=sem_results))
+        request, q=q, mode=mode, results=results, sem_results=sem_results, concepts=concepts))
 
 
 # ── External search (arXiv / Semantic Scholar / Crossref) ────────────────────────
@@ -938,7 +1026,8 @@ def external_save(
         ajob = store.create_analysis_job(
             paper_id=paper.id, analysis_type="triage_summary", chunk_ids=[c.id for c in chunks])
         _run_analysis_now(ajob.id)          # triage now (parse already produced chunks)
-    return RedirectResponse(url=f"/papers/{paper.id}", status_code=303)
+    verb = {"save": "Saved", "save_parse": "Saved & parsed", "save_triage": "Saved & triaged"}.get(action, "Saved")
+    return _redirect(f"/papers/{paper.id}", f"{verb}: {paper.title[:80]}", "ok")
 
 
 # ── Cost estimate (AJAX for the scope builder) ───────────────────────────────────
@@ -1023,13 +1112,20 @@ def create_scope_and_parse(paper_id: str, name: str = Form("scope"),
                   "page_ranges": ranges, "regions": []}
     scope = store.create_parse_scope(paper_id, name=name, purpose=purpose, scope_json=scope_json)
     selected = scope_utils.page_count(scope_json) or len(ranges)
-    if enqueue == "1":
-        job = store.create_parse_job(
-            paper_id=paper_id, parse_scope_id=scope.id, selected_pages=selected,
-            cost_estimate=cost.estimate_marker_cost(selected, _CFG.marker_price_per_page).cost,
-        )
-        _run_parse_now(job.id)   # parse immediately, not via a scheduler
-    return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
+    if enqueue != "1":
+        return _redirect(f"/papers/{paper_id}/scope", "Scope saved (not parsed).", "ok")
+    job = store.create_parse_job(
+        paper_id=paper_id, parse_scope_id=scope.id, selected_pages=selected,
+        cost_estimate=cost.estimate_marker_cost(selected, _CFG.marker_price_per_page).cost,
+    )
+    _run_parse_now(job.id)   # parse immediately, not via a scheduler
+    fresh = store.get_parse_job(job.id)
+    if fresh and fresh.status == JobStatus.SUCCEEDED.value:
+        spent = fresh.cost_actual if fresh.cost_actual is not None else fresh.cost_estimate
+        return _redirect(f"/papers/{paper_id}/scope",
+                         f"Parsed {fresh.selected_pages} page(s) (~${spent:.3f}). Now run an analysis.", "ok")
+    return _redirect(f"/papers/{paper_id}/scope",
+                     f"Parse failed: {(fresh.error if fresh else 'unknown error')[:160]}", "bad")
 
 
 @app.get("/papers/{paper_id}/regions", response_class=HTMLResponse)
@@ -1082,6 +1178,9 @@ def enqueue_analysis(paper_id: str, analysis_type: str = Form("triage_summary"),
         input_price_per_mtok=_CFG.claude_input_price_per_mtok,
         output_price_per_mtok=_CFG.claude_output_price_per_mtok,
     )
+    if not chunk_ids:
+        return _redirect(f"/papers/{paper_id}/scope",
+                         "Nothing to analyze yet — parse some pages first.", "warn")
     job = store.create_analysis_job(
         paper_id=paper_id, project_id=project_id or None, analysis_type=analysis_type,
         chunk_ids=chunk_ids, instruction=instruction,
@@ -1089,7 +1188,14 @@ def enqueue_analysis(paper_id: str, analysis_type: str = Form("triage_summary"),
         cost_estimate=est.cost_mid,
     )
     _run_analysis_now(job.id)   # call Claude now, not via a scheduler
-    return RedirectResponse(url=f"/papers/{paper_id}/scope", status_code=303)
+    fresh = store.get_analysis_job(job.id)
+    if fresh and fresh.status == JobStatus.SUCCEEDED.value:
+        n = len(store.list_suggestions(paper_id=paper_id, analysis_job_id=job.id))
+        spent = fresh.cost_actual if fresh.cost_actual is not None else fresh.cost_estimate
+        return _redirect(f"/suggestions?paper_id={paper_id}",
+                         f"Analysis done — {n} suggestion(s) to review (~${spent:.3f}).", "ok")
+    return _redirect(f"/papers/{paper_id}/scope",
+                     f"Analysis failed: {(fresh.error if fresh else 'unknown error')[:160]}", "bad")
 
 
 # ── AI suggestion review (quarantine) + regeneration ─────────────────────────────

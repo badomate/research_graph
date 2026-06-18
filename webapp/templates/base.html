@@ -25,14 +25,26 @@
       <a href="/math" {% if request.url.path.startswith('/math') %}class="active"{% endif %}>Math</a>
       <a href="/brain" {% if request.url.path == '/brain' %}class="active"{% endif %}>Brain</a>
       <a href="/graph" {% if request.url.path == '/graph' %}class="active"{% endif %}>Graph</a>
-      <a href="/debug" {% if request.url.path.startswith('/debug') %}class="active"{% endif %}>Debug</a>
+      <a class="nav-util{% if request.url.path.startswith('/debug') %} active{% endif %}" href="/debug" title="Status &amp; maintenance">⚙</a>
     </nav>
-    <form class="nav-search" action="/search" method="get" role="search">
-      <input name="q" placeholder="Search concepts…" value="{{ q if request.url.path == '/search' else '' }}"
-             autocomplete="off" aria-label="Search concepts">
+    <form class="nav-search" action="/find" method="get" role="search">
+      <input name="q" placeholder="Search papers & concepts…" value="{{ q if request.url.path == '/find' else '' }}"
+             autocomplete="off" aria-label="Search papers and concepts">
     </form>
     <a class="btn btn-primary add" href="/papers/new">+ Add</a>
   </header>
+
+  {% if flash %}
+  <div class="toast toast-{{ flash.kind }}" id="toast" role="status">
+    <span>{{ flash.text }}</span>
+    <button type="button" class="toast-x" onclick="document.getElementById('toast').remove()" aria-label="dismiss">×</button>
+  </div>
+  <script>
+    document.cookie = "flash=; Max-Age=0; path=/";
+    setTimeout(() => { const t = document.getElementById('toast'); if (t) t.classList.add('toast-out'); }, 5000);
+    setTimeout(() => { const t = document.getElementById('toast'); if (t) t.remove(); }, 5600);
+  </script>
+  {% endif %}
 
   <main class="{% block main_class %}wrap{% endblock %}">
     {% block content %}{% endblock %}

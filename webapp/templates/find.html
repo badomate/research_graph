@@ -33,7 +33,19 @@
 <p class="muted">No semantic matches. Papers must be parsed first (chunks are the index).</p>
 {% endfor %}
 {% elif q %}
-<p class="muted">{{ results|length }} result(s) for “{{ q }}”.</p>
+{% if concepts %}
+<h2>Concepts <span class="muted">{{ concepts|length }}</span></h2>
+{% for c in concepts %}
+<div class="card result">
+  <div class="card-title"><a href="/concepts/{{ c.id }}">{{ c.effective_title }}</a>
+    <span class="pill">{{ c.type }}</span>
+    {% if c.suggested_hub %}<span class="pill">{{ c.suggested_hub }}</span>{% endif %}</div>
+  {% if c.statement_latex %}<div class="why"><em>{{ c.statement_latex[:160] }}</em></div>{% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
+<h2>Papers <span class="muted">{{ results|length }}</span></h2>
 {% for r in results %}
 <div class="card result">
   <div class="card-title"><a href="/papers/{{ r.paper.id }}">{{ r.paper.title }}</a></div>
